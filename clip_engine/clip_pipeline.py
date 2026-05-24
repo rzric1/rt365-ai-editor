@@ -19,6 +19,8 @@ from clip_engine.clip_expand import ClipExpansionSettings, finalize_clips_after_
 from clip_engine.clip_metadata import ground_all_clips_metadata
 from clip_engine.clip_split import split_long_clips
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
+from clip_engine.clip_signals import apply_signal_boosts_to_clips
+from clip_engine.speaker_signals import apply_speaker_signals_to_clips
 from clip_engine.token_tracking import TokenTracker, get_tracker, reset_tracker
 
 logger = logging.getLogger("clip_engine.clip_pipeline")
@@ -147,6 +149,8 @@ def run_full_clip_pipeline(
     min_gap_seconds: float = 60.0,
     similarity_threshold: float = 0.45,
     video_filename: str = "",
+    enable_signal_boosts: bool = True,
+    enable_speaker_signals: bool = True,
 ) -> tuple[list[dict], PipelineStats, TokenTracker]:
     """
     Full clip pipeline:
@@ -340,6 +344,14 @@ def run_full_clip_pipeline(
             continue
         grounded.append(c)
     selected = grounded
+
+    # Local heuristic signal boosts (no LLM calls)
+    selected = apply_signal_boosts_to_clips(
+        selected, segments, enabled=enable_signal_boosts,
+    )
+    selected = apply_speaker_signals_to_clips(
+        selected, segments, enabled=enable_speaker_signals,
+    )
 
     stats.final_clips = len(selected)
 

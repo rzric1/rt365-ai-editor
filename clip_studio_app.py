@@ -43,6 +43,7 @@ from clip_engine.clip_metadata import (  # noqa: E402
 )
 from clip_engine.token_tracking import get_tracker  # noqa: E402
 from clip_engine.export_vertical import export_vertical_clip_with_captions  # noqa: E402
+from clip_engine.export_vertical import export_clip_preview  # noqa: E402
 from clip_engine.media_probe import get_media_duration_seconds  # noqa: E402
 from clip_engine.captions import CAPTION_PRESETS, CaptionPreset  # noqa: E402
 from clip_engine.export_vertical import EXPORT_MODE_LABELS  # noqa: E402
@@ -71,6 +72,7 @@ from clip_engine.cuda_diagnostics import (  # noqa: E402
     invalidate_cuda_runtime_probe_cache,
     log_ai_acceleration_startup,
 )
+from clip_engine.dependency_status import get_dependency_report, render_status_markdown  # noqa: E402
 from ui_helpers import open_folder  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -79,7 +81,11 @@ ensure_ffmpeg_on_path(log=True)
 log_nvenc_probe_command_explicit()
 log_ai_acceleration_startup()
 
-CAPTION_PRESET_OPTIONS: list[CaptionPreset] = ["Clean", "Bold Viral", "Podcast", "Minimal"]
+CAPTION_PRESET_OPTIONS: list[CaptionPreset] = [
+    "Clean", "Bold Viral", "Podcast", "Minimal",
+    "Viral", "Podcast Pro", "Documentary", "Gaming", "Cinematic",
+]
+PREVIEW_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "previews"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +115,11 @@ def _init_state() -> None:
         "cs_similarity_threshold": 45,
         "cs_clip_style": "Balanced",
         "cs_pipeline_stats": {},
+        "cs_enable_signal_boosts": True,
+        "cs_enable_advanced_captions": True,
+        "cs_enable_dynamic_smart_crop": True,
+        "cs_enable_preview_rendering": True,
+        "cs_previews": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -209,6 +220,8 @@ def _run_clip_analysis(
         min_gap_seconds=min_gap_seconds,
         similarity_threshold=similarity_threshold,
         video_filename=video_filename,
+        enable_signal_boosts=bool(st.session_state.get("cs_enable_signal_boosts", True)),
+        enable_speaker_signals=bool(st.session_state.get("cs_enable_signal_boosts", True)),
     )
 
     st.session_state.cs_token_tracker = tracker.to_export_dict(
@@ -273,15 +286,41 @@ def _render_clip_map(clips: list[dict], media_duration: float) -> None:
 
 def _render_score_breakdown(c: dict) -> None:
     scores = c.get("scores", {})
-    if not scores:
-        return
+    signal_scores = c.get("signal_scores", {})
+    speaker_signals = c.get("speaker_signals", {})
     with st.expander("Score breakdown", expanded=False):
-        cols = st.columns(3)
-        for i, (dim, val) in enumerate(scores.items()):
-            label = dim.replace("_", " ").title()
-            cols[i % 3].metric(label, f"{val}/100")
+        if scores:
+            cols = st.columns(3)
+            for i, (dim, val) in enumerate(scores.items()):
+                label = dim.replace("_", " ").title()
+                cols[i % 3].metric(label, f"{val}/100")
         composite = int(c.get("composite_score", 0))
+        orig = c.get("original_composite_score")
+        if orig and orig != composite:
+            st.caption(f"GPT score: {orig}/100 → boosted: {composite}/100")
         st.progress(composite / 100, text=f"Composite: {composite}/100")
+
+        if signal_scores:
+            st.markdown("**AI signal scores** (local heuristics, no extra tokens)")
+            sig_cols = st.columns(5)
+            for i, key in enumerate(
+                ("emotion_spike", "pacing", "curiosity_gap", "scroll_stopping_hook", "audience_reaction")
+            ):
+                val = signal_scores.get(key, 0)
+                sig_cols[i].metric(key.replace("_", " ").title(), f"{val}/100")
+            boost = signal_scores.get("signal_boost", 0)
+            if boost:
+                st.caption(f"Signal boost: +{boost} | {signal_scores.get('reason', '')}")
+
+        if speaker_signals:
+            st.markdown("**Speaker / debate signals**")
+            sp_cols = st.columns(3)
+            sp_cols[0].metric("Speaker energy", f"{speaker_signals.get('speaker_energy', 0)}/100")
+            sp_cols[1].metric("Interruption", f"{speaker_signals.get('interruption_score', 0)}/100")
+            sp_cols[2].metric("Debate", f"{speaker_signals.get('debate_score', 0)}/100")
+            sp_boost = c.get("speaker_boost", 0)
+            if sp_boost:
+                st.caption(f"Speaker boost: +{sp_boost} | {speaker_signals.get('reason', '')}")
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +380,33 @@ def main() -> None:
             CAPTION_PRESET_OPTIONS,
             key="cs_default_caption_preset",
         )
+
+        st.divider()
+        st.subheader("AI editing intelligence")
+        st.checkbox(
+            "Enable AI signal boosts",
+            key="cs_enable_signal_boosts",
+            help="Local heuristic scoring for emotion, pacing, hooks — no extra LLM calls.",
+        )
+        st.checkbox(
+            "Enable advanced captions",
+            key="cs_enable_advanced_captions",
+            help="Per-word karaoke highlighting when pysubs2 is installed; phrase fallback otherwise.",
+        )
+        st.checkbox(
+            "Enable dynamic smart crop",
+            key="cs_enable_dynamic_smart_crop",
+            help="Smooth camera movement in smart crop mode (YOLO or OpenCV).",
+        )
+        st.checkbox(
+            "Enable preview rendering",
+            key="cs_enable_preview_rendering",
+            help="Show 'Generate preview' size button on each clip card.",
+        )
+
+        dep_report = get_dependency_report()
+        with st.expander("Optional dependency status", expanded=False):
+            st.markdown(render_status_markdown(dep_report))
 
         # GPU status
         st.divider()
@@ -704,6 +770,13 @@ def main() -> None:
                 e1, e2, e3, e4 = st.columns([2, 1, 1, 1])
                 with e1:
                     st.text_input("Hook / title", value=str(c.get("hook_title", "") or ""), key=f"hook_{wid}")
+                    grounded_hook = st.session_state.get(f"grounded_hook_{wid}")
+                    user_hook = st.session_state.get(f"hook_{wid}", c.get("hook_title", ""))
+                    if grounded_hook and str(grounded_hook).strip() != str(user_hook).strip():
+                        st.caption(
+                            f"Last export used grounded title: **{grounded_hook}** "
+                            f"(widget value unchanged — edit manually if desired)"
+                        )
                 with e2:
                     st.number_input(
                         "Start (s)",
@@ -774,7 +847,52 @@ def main() -> None:
                         for w in warnings:
                             st.warning(w)
 
+                signal_scores = c.get("signal_scores", {})
+                speaker_signals = c.get("speaker_signals", {})
+                if signal_scores or speaker_signals:
+                    sig_row = st.columns(6)
+                    if signal_scores:
+                        sig_row[0].caption(f"Emotion **{signal_scores.get('emotion_spike', 0)}**")
+                        sig_row[1].caption(f"Pacing **{signal_scores.get('pacing', 0)}**")
+                        sig_row[2].caption(f"Curiosity **{signal_scores.get('curiosity_gap', 0)}**")
+                        sig_row[3].caption(f"Hook **{signal_scores.get('scroll_stopping_hook', 0)}**")
+                    if speaker_signals:
+                        sig_row[4].caption(f"Debate **{speaker_signals.get('debate_score', 0)}**")
+                    reason = signal_scores.get("reason") or speaker_signals.get("reason", "")
+                    if reason:
+                        sig_row[5].caption(f"Boost: {reason[:60]}")
+
                 _render_score_breakdown(c)
+
+                if st.session_state.get("cs_enable_preview_rendering", True) and st.session_state.cs_video_path:
+                    preview_key = f"preview_{wid}"
+                    if st.button("Generate preview", key=f"btn_{preview_key}"):
+                        PREVIEW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                        preview_path = PREVIEW_OUTPUT_DIR / f"{wid}_preview.mp4"
+                        export_mode_label = str(st.session_state.get("cs_export_mode_label", "Full frame fit with blurred background"))
+                        export_mode = EXPORT_MODE_LABELS.get(export_mode_label, "full_fit")
+                        preset = str(st.session_state.get(f"preset_{wid}", c.get("caption_preset", "Clean")))
+                        try:
+                            with st.spinner("Rendering preview..."):
+                                export_clip_preview(
+                                    Path(st.session_state.cs_video_path),
+                                    preview_path,
+                                    t0_val, t1_val,
+                                    st.session_state.get("cs_segments") or [],
+                                    caption_preset=preset,
+                                    export_mode=export_mode,
+                                    advanced_captions=bool(st.session_state.get("cs_enable_advanced_captions", True)),
+                                    dynamic_smart_crop=bool(st.session_state.get("cs_enable_dynamic_smart_crop", True)),
+                                    prefer_gpu=bool(st.session_state.get("cs_gpu_acceleration", True)),
+                                    allow_cpu_fallback=bool(st.session_state.get("cs_allow_cpu_fallback", True)),
+                                )
+                            st.session_state.cs_previews[wid] = str(preview_path)
+                            st.success("Preview ready")
+                        except Exception as e:
+                            st.error(f"Preview failed: {e}")
+                    saved_preview = st.session_state.get("cs_previews", {}).get(wid)
+                    if saved_preview and Path(saved_preview).is_file():
+                        st.video(saved_preview)
 
     # ------------------------------------------------------------------ EXPORT
     st.subheader("4. Export vertical (9:16) + captions")
@@ -818,17 +936,20 @@ def main() -> None:
 
                     for idx, c in enumerate(to_export):
                         wid = c.get("_wid", str(idx))
-                        hook = st.session_state.get(f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}"))
+                        user_hook = str(
+                            st.session_state.get(f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}"))
+                        )
                         t0 = float(st.session_state.get(f"start_{wid}", c.get("start_seconds", c.get("start", 0))))
                         t1 = float(st.session_state.get(f"end_{wid}", c.get("end_seconds", c.get("end", 0))))
                         preset = str(st.session_state.get(f"preset_{wid}", c.get("caption_preset", "Clean")))
-                        base = f"{idx+1:02d}_{_slug(str(hook))}"
-                        out = session / f"{base}_9x16.mp4"
 
                         export_clip = dict(c)
                         export_clip["start_seconds"] = t0
                         export_clip["end_seconds"] = t1
-                        export_clip["hook_title"] = str(hook)
+                        export_clip["hook_title"] = user_hook
+                        export_clip["export_title"] = user_hook
+                        export_title = user_hook
+
                         if api_key:
                             export_clip = ground_clip_metadata_against_window(
                                 export_clip,
@@ -837,19 +958,24 @@ def main() -> None:
                                 tracker=tracker,
                                 force_regenerate=True,
                             )
-                            hook = export_clip.get("hook_title", hook)
-                            if export_clip.get("_wid"):
-                                st.session_state[f"hook_{export_clip['_wid']}"] = hook
-                            base = f"{idx+1:02d}_{_slug(str(hook))}"
-                            out = session / f"{base}_9x16.mp4"
-                            tid = export_clip.get("_wid", "")
+                            corrected_title = str(export_clip.get("hook_title", user_hook)).strip() or user_hook
+                            export_clip["hook_title"] = corrected_title
+                            export_clip["grounded_hook_title"] = corrected_title
+                            export_clip["export_title"] = corrected_title
+                            export_title = corrected_title
+                            if corrected_title != user_hook.strip():
+                                st.session_state[f"grounded_hook_{wid}"] = corrected_title
+                            tid = export_clip.get("_wid", wid)
                             if tid and tid in tracker.per_clip:
                                 export_clip["_token_usage"] = tracker.per_clip[tid]
+
+                        base = f"{idx+1:02d}_{_slug(export_title)}"
+                        out = session / f"{base}_9x16.mp4"
 
                         write_clip_audit_json(export_clip, session / f"clip_{idx+1:02d}_audit.json", index=idx + 1)
                         audit_clips.append(export_clip)
 
-                        status_area.info(f"Exporting {idx+1}/{len(to_export)}: {hook}...")
+                        status_area.info(f"Exporting {idx+1}/{len(to_export)}: {export_title}...")
                         try:
                             result = export_vertical_clip_with_captions(
                                 video, out, t0, t1, segs,
@@ -859,6 +985,8 @@ def main() -> None:
                                 caption_preset=preset,
                                 export_mode=export_mode,
                                 write_sidecars=write_sidecars,
+                                advanced_captions=bool(st.session_state.get("cs_enable_advanced_captions", True)),
+                                dynamic_smart_crop=bool(st.session_state.get("cs_enable_dynamic_smart_crop", True)),
                             )
                             exported += 1
                             logger.info(

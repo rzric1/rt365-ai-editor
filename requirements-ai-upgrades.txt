@@ -1,0 +1,33 @@
+# RT365 AI Clip Studio — optional AI editing upgrades
+# Install incrementally: py -m pip install -r requirements-ai-upgrades.txt
+#
+# IMPORTANT: Do NOT install these if they conflict with your working CUDA/Torch stack.
+# Verify imports after each install. Skip pyannote.audio if Torch/CUDA mismatch.
+
+# Smart crop — YOLO person detection (requires opencv-python-headless)
+# Falls back to OpenCV Haar faces or full-frame fit if missing.
+ultralytics>=8.0.0
+opencv-python-headless>=4.8.0
+
+# Advanced ASS captions with karaoke-style per-word highlighting
+# Falls back to built-in ASS generator if missing.
+pysubs2>=1.6.0
+
+# Optional audio feature analysis (future pacing from audio waveform)
+# Current pacing uses transcript heuristics only.
+librosa>=0.10.0
+
+# Optional semantic similarity (future dedup enhancement)
+# Current dedup uses Jaccard word-set similarity.
+sentence-transformers>=2.2.0
+
+# Optional NLP models (not required — signal scoring uses local heuristics)
+transformers>=4.36.0
+
+# Speaker diarization — ONLY install if compatible with your Torch/CUDA stack.
+# Requires HuggingFace token for some models. Skipped by default.
+# pyannote.audio>=3.1.0
+
+# Torch — only needed for ultralytics/YOLO and pyannote.
+# Install CUDA-mes matching your driver; do NOT downgrade working installs.
+# torch>=2.1.0
