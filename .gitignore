@@ -38,3 +38,16 @@ cache/
 # Windows
 Thumbs.db
 .DS_Store
+
+# Node / frontend
+node_modules/
+
+# Build output
+dist/
+
+# Transcripts
+transcripts/
+
+# Optional AI/temp
+*.tmp
+*.cache
