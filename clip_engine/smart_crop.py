@@ -2,7 +2,7 @@
 clip_engine/smart_crop.py
 Three export modes for vertical (9:16) output:
   1. full_fit   — full 16:9 frame scaled to 1080 wide, blurred background fills 1080x1920
-  2. smart_crop — face/people detection, crop window keeps everyone in frame
+  2. smart_crop — face/people detection (YOLO if available, else OpenCV), optional dynamic crop
   3. center_crop — simple center 9:16 crop (user-selected fallback)
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -30,7 +31,18 @@ class CropRegion(NamedTuple):
     y: int
     w: int
     h: int
-    method: str   # "face" | "center" | "full_fit"
+    method: str   # "yolo" | "face" | "center" | "full_fit"
+
+
+@dataclass
+class SmartCropResult:
+    filter_string: str
+    uses_complex: bool
+    backend: str = "full_fit"
+    confidence: float = 0.0
+    fallback_reason: str = ""
+    dynamic: bool = False
+    metadata: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +53,10 @@ def build_vf_filter(
     video_path: Path,
     mode: ExportMode = "full_fit",
     ass_path: Path | None = None,
+    *,
+    clip_start: float = 0.0,
+    clip_end: float | None = None,
+    dynamic_crop: bool = True,
 ) -> tuple[str, bool]:
     """
     Return (filter_string, uses_complex) for the chosen export mode.
@@ -48,15 +64,24 @@ def build_vf_filter(
     uses_complex=True -> caller must pass -filter_complex and -map [vout].
     uses_complex=False -> caller must pass -vf (simple filter chain).
     """
+    crop_meta: SmartCropResult | None = None
     if mode == "full_fit":
         vf = _full_fit_filter()
         uses_complex = True
+        crop_meta = SmartCropResult(vf, True, backend="full_fit")
     elif mode == "smart_crop":
-        vf = _smart_crop_filter(video_path)
-        uses_complex = "split=" in vf
+        crop_meta = _smart_crop_filter(
+            video_path,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            dynamic_crop=dynamic_crop,
+        )
+        vf = crop_meta.filter_string
+        uses_complex = crop_meta.uses_complex
     else:
         vf = _center_crop_filter(video_path)
         uses_complex = False
+        crop_meta = SmartCropResult(vf, False, backend="center_crop")
 
     if ass_path:
         safe = str(ass_path).replace("\\", "/").replace(":", "\\:")
@@ -68,6 +93,14 @@ def build_vf_filter(
     elif uses_complex:
         vf = f"{vf}[vout]"
 
+    if crop_meta:
+        logger.info(
+            "Smart crop backend=%s confidence=%.2f dynamic=%s fallback=%s",
+            crop_meta.backend,
+            crop_meta.confidence,
+            crop_meta.dynamic,
+            crop_meta.fallback_reason or "none",
+        )
     logger.info("vf filter [mode=%s complex=%s]: %s", mode, uses_complex, vf[:200])
     return vf, uses_complex
 
