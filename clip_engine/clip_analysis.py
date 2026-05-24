@@ -1,0 +1,527 @@
+"""
+clip_engine/clip_analysis.py
+Improved clip intelligence:
+- Multi-region transcript chunking (forces full timeline coverage)
+- Large candidate pool (60 candidates -> filtered to target)
+- Strict JSON schema with retry logic
+- Validation pass + sentence-boundary snapping
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from clip_engine.token_tracking import TokenTracker, get_tracker, reset_tracker
+
+logger = logging.getLogger("clip_engine.clip_analysis")
+
+PASS_DEFINITIONS: tuple[tuple[str, str], ...] = (
+    (
+        "primary",
+        "Find the best story, emotional, educational, and high-retention clips.",
+    ),
+    (
+        "gems",
+        "Find hidden gems: short quotes, funny moments, hot takes, and surprising one-liners.",
+    ),
+    (
+        "micro",
+        "Find strong standalone MICRO-clips: one powerful idea, sharp hook, clean ending, 30-75 seconds preferred.",
+    ),
+)
+
+EXPANSION_PASS = (
+    "expansion",
+    "Find additional unique clips in underrepresented moments. Avoid topics already covered in excluded clips.",
+)
+
+
+def get_session_tokens() -> dict:
+    return get_tracker().to_session_dict()
+
+
+def reset_session_tokens() -> None:
+    reset_tracker()
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClipPromptSettings:
+    min_clip_seconds: float = 25.0
+    max_clip_seconds: float = 160.0
+    ideal_min_seconds: float = 45.0
+    ideal_max_seconds: float = 120.0
+    max_clips: int = 8           # per region chunk (total = max_clips * n_chunks)
+    min_score: int = 55
+    retry_attempts: int = 3
+    retry_delay_seconds: float = 1.5
+    n_transcript_chunks: int = 5  # divide transcript into this many regions
+
+
+SCORE_DIMENSIONS = [
+    "hook_strength",
+    "emotional_intensity",
+    "controversy_debate",
+    "educational_value",
+    "story_arc",
+    "quote_worthiness",
+    "standalone_clarity",
+    "retention_potential",
+    "ending_strength",
+]
+
+
+# ---------------------------------------------------------------------------
+# Transcript chunking
+# ---------------------------------------------------------------------------
+
+def _chunk_transcript(transcript: str, n_chunks: int) -> list[tuple[str, str]]:
+    """
+    Split transcript into n_chunks roughly equal parts (line-based fallback).
+    Returns list of (region_label, text) tuples.
+    """
+    lines = [l for l in transcript.splitlines() if l.strip()]
+    if not lines:
+        return [("full", transcript)]
+
+    chunk_size = max(1, math.ceil(len(lines) / n_chunks))
+    region_names = ["beginning", "early_middle", "middle", "late_middle", "ending"]
+    chunks = []
+    for i in range(n_chunks):
+        start = i * chunk_size
+        end = min(start + chunk_size, len(lines))
+        region = region_names[i] if i < len(region_names) else f"region_{i+1}"
+        chunk_text = "\n".join(lines[start:end])
+        if chunk_text.strip():
+            chunks.append((region, chunk_text))
+    return chunks
+
+
+def _chunk_transcript_by_time(
+    segments: list[dict],
+    media_duration: float,
+    n_chunks: int,
+) -> list[tuple[str, str]]:
+    """Split transcript into equal TIME regions using segment timestamps."""
+    from clip_engine.transcription_utils import segments_to_prompt_transcript
+
+    if not segments or media_duration <= 0:
+        return [("full", segments_to_prompt_transcript(segments))]
+
+    region_names = ["beginning", "early_middle", "middle", "late_middle", "ending"]
+    chunk_dur = media_duration / n_chunks
+    chunks: list[tuple[str, str]] = []
+
+    for i in range(n_chunks):
+        t_start = i * chunk_dur
+        t_end = (i + 1) * chunk_dur if i < n_chunks - 1 else media_duration + 0.001
+        region = region_names[i] if i < len(region_names) else f"region_{i+1}"
+        region_segs = [
+            s for s in segments
+            if float(s.get("end", 0)) > t_start and float(s.get("start", 0)) < t_end
+        ]
+        if not region_segs:
+            continue
+        text = segments_to_prompt_transcript(region_segs)
+        if text.strip():
+            chunks.append((region, text))
+
+    return chunks or [("full", segments_to_prompt_transcript(segments))]
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+
+def _build_system_prompt(
+    settings: ClipPromptSettings,
+    region_label: str,
+    optional_note: str | None,
+    pass_focus: str = "",
+    excluded_summary: str = "",
+) -> str:
+    dim_list = "\n".join(f"  - {d}" for d in SCORE_DIMENSIONS)
+    note_block = f"\nCreator note: {optional_note}\n" if optional_note else ""
+    focus_block = f"\nPASS FOCUS: {pass_focus}\n" if pass_focus else ""
+    exclude_block = f"\nALREADY SELECTED (avoid similar moments):\n{excluded_summary}\n" if excluded_summary else ""
+    return f"""You are an expert short-form video editor for TikTok, YouTube Shorts, and Instagram Reels.
+You are analyzing the {region_label.upper()} section of a longer video.
+{note_block}{focus_block}{exclude_block}
+Find up to {settings.max_clips} of the BEST clip moments in THIS section.
+
+RULES:
+- Each clip MUST have a clear hook at the start, a clear point, and a clean ending.
+- Do NOT pick clips that start or end mid-sentence.
+- STRONGLY prefer clips between {settings.ideal_min_seconds}s and {settings.ideal_max_seconds}s.
+- Never suggest clips shorter than {settings.min_clip_seconds}s or longer than {settings.max_clip_seconds}s.
+- One powerful idea per clip. Avoid broad multi-topic windows.
+- Use the EXACT timestamps from the transcript - do not guess or interpolate.
+- hook_title MUST describe content actually spoken in that exact time range.
+- Score each clip across these dimensions (0-100 each):
+{dim_list}
+- Compute composite_score = weighted average (weight hook_strength and ending_strength 1.5x).
+- Only return clips with composite_score >= {settings.min_score}.
+- For caption_style choose one of: Clean | Bold Viral | Podcast | Minimal
+- For platform_fit list applicable: TikTok | YouTube Shorts | Instagram Reels | LinkedIn
+
+OUTPUT: Respond with ONLY valid JSON, no markdown, no explanation outside JSON.
+Schema:
+{{
+  "clips": [
+    {{
+      "rank": 1,
+      "start_seconds": 12.4,
+      "end_seconds": 67.1,
+      "hook_title": "Short punchy title under 8 words",
+      "composite_score": 82,
+      "scores": {{
+        "hook_strength": 85,
+        "emotional_intensity": 70,
+        "controversy_debate": 60,
+        "educational_value": 90,
+        "story_arc": 80,
+        "quote_worthiness": 75,
+        "standalone_clarity": 88,
+        "retention_potential": 83,
+        "ending_strength": 79
+      }},
+      "dominant_signal": "educational",
+      "selection_reason": "One sentence max.",
+      "ai_context_reason": "One sentence on why this window works.",
+      "caption_style": "Bold Viral",
+      "platform_fit": ["TikTok", "YouTube Shorts"],
+      "warnings": []
+    }}
+  ]
+}}"""
+
+
+def _build_user_prompt(region_label: str, chunk_text: str) -> str:
+    MAX_CHARS = 10_000
+    if len(chunk_text) > MAX_CHARS:
+        chunk_text = chunk_text[:MAX_CHARS] + "\n[section truncated]"
+    return f"TRANSCRIPT SECTION ({region_label}):\n{chunk_text}"
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing
+# ---------------------------------------------------------------------------
+
+def _extract_json(raw: str) -> dict:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE).strip()
+    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object found in model response.")
+    return json.loads(raw[start:end + 1])
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _validate_clip(c: dict, settings: ClipPromptSettings) -> list[str]:
+    issues = []
+    t0 = float(c.get("start_seconds", 0))
+    t1 = float(c.get("end_seconds", 0))
+    dur = t1 - t0
+    if dur < settings.min_clip_seconds:
+        issues.append(f"Too short: {dur:.1f}s")
+    if dur > settings.max_clip_seconds:
+        issues.append(f"Too long: {dur:.1f}s")
+    if t0 < 0:
+        issues.append("Negative start")
+    if t1 <= t0:
+        issues.append("end <= start")
+    if int(c.get("composite_score", 0)) < settings.min_score:
+        issues.append(f"Score {c.get('composite_score')} < {settings.min_score}")
+    if not str(c.get("hook_title", "")).strip():
+        issues.append("Missing hook_title")
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Sentence-boundary snapping
+# ---------------------------------------------------------------------------
+
+def _snap_to_boundaries(clips: list[dict], segments: list[dict], tol: float = 2.5) -> list[dict]:
+    if not segments:
+        return clips
+    seg_starts = [float(s.get("start", 0)) for s in segments]
+    seg_ends = [float(s.get("end", 0)) for s in segments]
+
+    def nearest(candidates: list[float], target: float) -> float:
+        best = min(candidates, key=lambda x: abs(x - target))
+        return best if abs(best - target) <= tol else target
+
+    snapped = []
+    for c in clips:
+        c = dict(c)
+        ns = nearest(seg_starts, float(c["start_seconds"]))
+        ne = nearest(seg_ends, float(c["end_seconds"]))
+        if ne > ns:
+            if ns != c["start_seconds"] or ne != c["end_seconds"]:
+                c.setdefault("warnings", [])
+                c["warnings"].append(f"Snapped: {c['start_seconds']:.1f}->{ns:.1f}s / {c['end_seconds']:.1f}->{ne:.1f}s")
+            c["start_seconds"] = ns
+            c["end_seconds"] = ne
+        snapped.append(c)
+    return snapped
+
+
+# ---------------------------------------------------------------------------
+# Single-region API call
+# ---------------------------------------------------------------------------
+
+def _analyze_region(
+    client,
+    region_label: str,
+    chunk_text: str,
+    settings: ClipPromptSettings,
+    optional_note: str | None,
+    *,
+    pass_name: str = "primary",
+    pass_focus: str = "",
+    excluded_summary: str = "",
+    tracker: TokenTracker | None = None,
+) -> list[dict]:
+    """Call OpenAI for one transcript region. Returns validated clips."""
+    tracker = tracker or get_tracker()
+    stage = f"clip_analysis_{pass_name}_{region_label}"
+    system_prompt = _build_system_prompt(
+        settings, region_label, optional_note, pass_focus, excluded_summary
+    )
+    user_prompt = _build_user_prompt(region_label, chunk_text)
+
+    raw_response = None
+    last_error = None
+
+    for attempt in range(1, settings.retry_attempts + 1):
+        try:
+            logger.info(
+                "Region '%s' pass '%s' attempt %d/%d",
+                region_label, pass_name, attempt, settings.retry_attempts,
+            )
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=3500,
+                response_format={"type": "json_object"},
+            )
+            raw_response = response.choices[0].message.content or ""
+            tracker.record_openai_usage(stage, response.usage)
+            data = _extract_json(raw_response)
+            clips_raw = data.get("clips", [])
+            if not isinstance(clips_raw, list):
+                raise ValueError("'clips' not a list")
+            break
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            logger.warning(
+                "Region '%s' pass '%s' parse failed attempt %d: %s",
+                region_label, pass_name, attempt, e,
+            )
+            if attempt < settings.retry_attempts:
+                time.sleep(settings.retry_delay_seconds)
+    else:
+        logger.error(
+            "Region '%s' pass '%s' failed after %d attempts: %s",
+            region_label, pass_name, settings.retry_attempts, last_error,
+        )
+        return []
+
+    validated = []
+    for c in clips_raw:
+        c = dict(c)
+        c["_region"] = region_label
+        c["_pass"] = pass_name
+        issues = _validate_clip(c, settings)
+        if issues:
+            logger.debug("Clip rejected in region '%s': %s", region_label, issues)
+            c.setdefault("warnings", [])
+            c["warnings"].extend(issues)
+        else:
+            validated.append(c)
+
+    logger.info(
+        "Region '%s' pass '%s': %d raw -> %d valid clips",
+        region_label, pass_name, len(clips_raw), len(validated),
+    )
+    return validated
+
+
+# ---------------------------------------------------------------------------
+# Candidate deduplication
+# ---------------------------------------------------------------------------
+
+def _clip_time_range(c: dict) -> tuple[float, float]:
+    t0 = float(c.get("start_seconds", c.get("start", 0)))
+    t1 = float(c.get("end_seconds", c.get("end", t0)))
+    return t0, t1
+
+
+def _ranges_overlap(a: tuple[float, float], b: tuple[float, float], gap: float = 0.0) -> bool:
+    return a[0] < b[1] + gap and b[0] < a[1] + gap
+
+
+def dedupe_candidates_by_time(candidates: list[dict], min_gap_seconds: float = 15.0) -> list[dict]:
+    """Remove overlapping candidates, keeping highest composite_score."""
+    sorted_c = sorted(candidates, key=lambda x: int(x.get("composite_score", 0)), reverse=True)
+    kept: list[dict] = []
+    for c in sorted_c:
+        r = _clip_time_range(c)
+        if any(_ranges_overlap(r, _clip_time_range(k), min_gap_seconds) for k in kept):
+            continue
+        kept.append(c)
+    return kept
+
+
+def _summarize_excluded_clips(clips: list[dict], max_items: int = 12) -> str:
+    lines = []
+    for c in clips[:max_items]:
+        t0, t1 = _clip_time_range(c)
+        lines.append(f"- {t0:.0f}s-{t1:.0f}s: {c.get('hook_title', '')}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass candidate collection
+# ---------------------------------------------------------------------------
+
+def _duration_sort_key(c: dict, ideal_min: float, ideal_max: float) -> tuple:
+    """Prefer clips in ideal duration band, then by score."""
+    t0, t1 = _clip_time_range(c)
+    dur = t1 - t0
+    in_band = ideal_min <= dur <= ideal_max
+    over_ideal = max(0.0, dur - ideal_max)
+    return (0 if in_band else 1, over_ideal, -int(c.get("composite_score", 0)))
+
+
+def collect_candidates_multipass(
+    transcript: str,
+    api_key: str,
+    optional_content_note: str | None = None,
+    prompt_settings: ClipPromptSettings | None = None,
+    segments: list[dict] | None = None,
+    media_duration: float = 0.0,
+    pool_target: int = 60,
+    tracker: TokenTracker | None = None,
+    passes: tuple[str, ...] | None = None,
+    exclude_clips: list[dict] | None = None,
+    *,
+    region_filter: tuple[str, ...] | None = None,
+    max_pass_rounds: int = 1,
+) -> list[dict]:
+    """Run analysis passes until candidate pool reaches pool_target (or rounds exhausted)."""
+    import openai
+
+    settings = prompt_settings or ClipPromptSettings()
+    tracker = tracker or get_tracker()
+    client = openai.OpenAI(api_key=api_key)
+
+    if segments and media_duration > 0:
+        chunks = _chunk_transcript_by_time(segments, media_duration, settings.n_transcript_chunks)
+    else:
+        chunks = _chunk_transcript(transcript, settings.n_transcript_chunks)
+
+    if region_filter:
+        chunks = [(r, t) for r, t in chunks if r in region_filter] or chunks
+
+    pass_map = {name: focus for name, focus in PASS_DEFINITIONS}
+    pass_map[EXPANSION_PASS[0]] = EXPANSION_PASS[1]
+
+    if passes:
+        pass_list = [(p, pass_map.get(p, "")) for p in passes if p in pass_map]
+    else:
+        pass_list = list(PASS_DEFINITIONS)
+
+    excluded_summary = _summarize_excluded_clips(exclude_clips or [])
+    all_candidates: list[dict] = []
+
+    for _round in range(max(1, max_pass_rounds)):
+        if len(all_candidates) >= pool_target and passes:
+            break
+        for pass_name, pass_focus in pass_list:
+            for region_label, chunk_text in chunks:
+                region_clips = _analyze_region(
+                    client,
+                    region_label,
+                    chunk_text,
+                    settings,
+                    optional_content_note,
+                    pass_name=pass_name,
+                    pass_focus=pass_focus,
+                    excluded_summary=excluded_summary if pass_name == "expansion" else "",
+                    tracker=tracker,
+                )
+                all_candidates.extend(region_clips)
+                all_candidates = dedupe_candidates_by_time(all_candidates, min_gap_seconds=10.0)
+            # Only skip remaining passes when pool is well above target (default 3-pass mode)
+            if not passes and len(all_candidates) >= pool_target * 2:
+                break
+        if len(all_candidates) >= pool_target:
+            break
+
+    if segments and all_candidates:
+        all_candidates = _snap_to_boundaries(all_candidates, segments)
+
+    all_candidates.sort(
+        key=lambda x: _duration_sort_key(
+            x, settings.ideal_min_seconds, settings.ideal_max_seconds
+        ),
+    )
+    logger.info("Multipass candidates collected: %d (target pool=%d)", len(all_candidates), pool_target)
+    return all_candidates
+
+
+# ---------------------------------------------------------------------------
+# Main entry point (backward compatible)
+# ---------------------------------------------------------------------------
+
+def suggest_clips_from_transcript(
+    transcript: str,
+    api_key: str,
+    optional_content_note: str | None = None,
+    prompt_settings: ClipPromptSettings | None = None,
+    segments: list[dict] | None = None,
+    target_count: int = 20,
+    media_duration: float = 0.0,
+) -> list[dict]:
+    """
+    Analyze transcript in multiple regions, collect large candidate pool,
+    validate, snap to boundaries, and return all candidates for diversity pipeline.
+    """
+    reset_tracker()
+    settings = prompt_settings or ClipPromptSettings()
+    pool_target = max(target_count * 3, 45)
+
+    all_candidates = collect_candidates_multipass(
+        transcript,
+        api_key,
+        optional_content_note=optional_content_note,
+        prompt_settings=settings,
+        segments=segments,
+        media_duration=media_duration,
+        pool_target=pool_target,
+    )
+
+    if not all_candidates:
+        logger.warning("No clips found across all regions.")
+        return []
+
+    return all_candidates

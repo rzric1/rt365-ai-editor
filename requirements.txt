@@ -1,0 +1,11 @@
+# RT365 AI Editor + AI Clip Studio (Streamlit)
+# Install: py -m pip install -r requirements.txt
+#
+# Clip export also requires ffmpeg on your PATH:
+#   https://ffmpeg.org/download.html
+
+openai>=1.59.0
+python-dotenv>=1.0.0
+streamlit>=1.31.0
+# Local GPU Whisper (CUDA via CTranslate2). Install CUDA-enabled PyTorch/ctranslate2 per NVIDIA docs if needed.
+faster-whisper>=1.0.3

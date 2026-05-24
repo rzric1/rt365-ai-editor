@@ -1,0 +1,5 @@
+# AI Clip Studio — large local video uploads (MP4/MOV)
+# maxUploadSize is in megabytes (4096 MB = 4 GiB per Streamlit docs).
+
+[server]
+maxUploadSize = 4096

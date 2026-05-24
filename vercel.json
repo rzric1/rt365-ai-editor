@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/claims-intelligence.js": {
+      "maxDuration": 60
+    }
+  }
+}

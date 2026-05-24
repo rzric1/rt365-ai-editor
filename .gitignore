@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Virtual env
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Env files
+.env
+.env.local
+
+# Outputs
+outputs/
+uploads/
+tmp/
+cache/
+
+# AI generated
+*.mp4
+*.mov
+*.wav
+*.srt
+*.ass
+
+# Logs
+*.log
+
+# Cursor
+.cursor/
+
+# Windows
+Thumbs.db
+.DS_Store

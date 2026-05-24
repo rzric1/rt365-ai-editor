@@ -1,0 +1,905 @@
+"""
+AI Clip Studio - general short-form clip generator (Streamlit).
+
+Upload MP4/MOV -> Whisper transcript -> GPT clip picks -> export 9:16 + captions (ffmpeg).
+
+Run: streamlit run clip_studio_app.py
+Requires: ffmpeg (auto-detected or FFMPEG_BINARY in .env), OPENAI_API_KEY for cloud Whisper + clip AI
+Optional: faster-whisper + CUDA for local GPU transcription when "GPU acceleration" is ON.
+         opencv-python-headless for face-detection smart crop.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import streamlit as st
+from dotenv import load_dotenv
+
+_ROOT = Path(__file__).resolve().parent
+load_dotenv(_ROOT / ".env")
+
+from config import (  # noqa: E402
+    CLIP_STUDIO_MAX_UPLOAD_BYTES,
+    CLIP_STUDIO_MAX_UPLOAD_MB,
+    CLIP_STUDIO_OUTPUT_DIR,
+    ENV_FFMPEG_BINARY,
+    ENV_OPENAI_API_KEY,
+    PROJECT_ROOT,
+    UPLOADS_DIR,
+    ensure_directories,
+)
+from clip_engine.clip_analysis import get_session_tokens  # noqa: E402
+from clip_engine.clip_pipeline import run_full_clip_pipeline  # noqa: E402
+from clip_engine.clip_style import CLIP_STYLE_OPTIONS, ClipStyle  # noqa: E402
+from clip_engine.clip_metadata import (  # noqa: E402
+    ground_clip_metadata_against_window,
+    write_clip_audit_json,
+)
+from clip_engine.token_tracking import get_tracker  # noqa: E402
+from clip_engine.export_vertical import export_vertical_clip_with_captions  # noqa: E402
+from clip_engine.media_probe import get_media_duration_seconds  # noqa: E402
+from clip_engine.captions import CAPTION_PRESETS, CaptionPreset  # noqa: E402
+from clip_engine.export_vertical import EXPORT_MODE_LABELS  # noqa: E402
+from clip_engine.ffmpeg_gpu import (  # noqa: E402
+    faster_whisper_cuda_available,
+    get_gpu_acceleration_status,
+    get_last_nvenc_probe_log,
+    log_nvenc_probe_command_explicit,
+    should_attempt_nvenc_on_export,
+)
+from clip_engine.transcription import (  # noqa: E402
+    transcribe_video,
+)
+from clip_engine.transcription_utils import (  # noqa: E402
+    extract_transcript_excerpt,
+    merge_segments_into_sentences,
+    segments_to_prompt_transcript,
+)
+from clip_engine.ffmpeg_resolve import (  # noqa: E402
+    ensure_ffmpeg_on_path,
+    get_ffmpeg_version_line,
+)
+from clip_engine.cuda_diagnostics import (  # noqa: E402
+    CUDA_STACK_REFERENCE,
+    collect_ai_acceleration_diagnostics,
+    invalidate_cuda_runtime_probe_cache,
+    log_ai_acceleration_startup,
+)
+from ui_helpers import open_folder  # noqa: E402
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("clip_studio")
+ensure_ffmpeg_on_path(log=True)
+log_nvenc_probe_command_explicit()
+log_ai_acceleration_startup()
+
+CAPTION_PRESET_OPTIONS: list[CaptionPreset] = ["Clean", "Bold Viral", "Podcast", "Minimal"]
+
+
+# ---------------------------------------------------------------------------
+# Session state init
+# ---------------------------------------------------------------------------
+
+def _init_state() -> None:
+    ensure_directories()
+    defaults = {
+        "cs_video_path": None,
+        "cs_segments": [],
+        "cs_formatted": "",
+        "cs_clips": [],
+        "cs_session_dir": None,
+        "cs_status": "Upload a video to begin.",
+        "cs_gpu_acceleration": True,
+        "cs_whisper_model": "base",
+        "cs_media_duration": 0.0,
+        "cs_force_gpu_export": False,
+        "cs_allow_cpu_fallback": True,
+        "cs_smart_crop": True,
+        "cs_export_mode_label": "Full frame fit with blurred background",
+        "cs_write_sidecars": True,
+        "cs_default_caption_preset": "Clean",
+        "cs_target_clips": 20,
+        "cs_min_gap_seconds": 60,
+        "cs_similarity_threshold": 45,
+        "cs_clip_style": "Balanced",
+        "cs_pipeline_stats": {},
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _uploaded_file_size_bytes(upload) -> int:
+    try:
+        return int(upload.size)
+    except Exception:
+        return len(upload.getbuffer())
+
+
+def _format_size(n: int) -> str:
+    if n >= 1024**3:
+        return f"{n / (1024**3):.2f} GB"
+    if n >= 1024**2:
+        return f"{n / (1024**2):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} bytes"
+
+
+def _save_upload_chunked(upload, dest: Path, progress_bar) -> None:
+    buf = upload.getbuffer()
+    total = len(buf)
+    chunk = 32 * 1024 * 1024
+    written = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as f:
+        offset = 0
+        while offset < total:
+            piece = buf[offset : offset + chunk]
+            f.write(piece)
+            offset += len(piece)
+            written += len(piece)
+            if total > 0:
+                pct = min(1.0, written / total)
+                try:
+                    progress_bar.progress(pct, text=f"Saving: {_format_size(written)} / {_format_size(total)}")
+                except TypeError:
+                    progress_bar.progress(pct)
+
+
+def _save_upload(upload, *, progress_bar) -> Path:
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    ext = Path(upload.name).suffix.lower()
+    if ext not in (".mp4", ".mov", ".m4v"):
+        ext = ".mp4"
+    dest = UPLOADS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    _save_upload_chunked(upload, dest, progress_bar)
+    return dest
+
+
+def _slug(s: str, max_len: int = 48) -> str:
+    s = re.sub(r"[^\w\s\-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"[\s_]+", "_", s.strip())[:max_len]
+    return s or "clip"
+
+
+def _run_clip_analysis(
+    formatted: str,
+    api_key: str,
+    segments: list[dict],
+    creator_note: str,
+    min_c: float,
+    max_c: float,
+    ctx_b: float,
+    ctx_a: float,
+    allow_over: bool,
+    media_dur: float,
+    target_count: int = 20,
+    min_gap_seconds: float = 60.0,
+    similarity_threshold: float = 0.45,
+    clip_style: ClipStyle = "Balanced",
+    video_filename: str = "",
+) -> tuple[list[dict], dict]:
+    """Run full clip pipeline. Returns (clips, pipeline_stats_dict)."""
+    note = creator_note.strip() or None
+
+    clips, stats, tracker = run_full_clip_pipeline(
+        formatted,
+        api_key,
+        segments,
+        media_duration=media_dur,
+        creator_note=note,
+        clip_style=clip_style,
+        user_min_seconds=min_c,
+        user_max_seconds=max_c,
+        context_before=ctx_b,
+        context_after=ctx_a,
+        allow_exceed_max=allow_over,
+        target_count=target_count,
+        min_gap_seconds=min_gap_seconds,
+        similarity_threshold=similarity_threshold,
+        video_filename=video_filename,
+    )
+
+    st.session_state.cs_token_tracker = tracker.to_export_dict(
+        target_clips=target_count,
+        final_clip_count=len(clips),
+    )
+
+    for c in clips:
+        if not c.get("_wid"):
+            c["_wid"] = uuid.uuid4().hex
+        if "caption_preset" not in c:
+            c["caption_preset"] = str(st.session_state.get("cs_default_caption_preset", "Clean"))
+        tid = c.get("_wid", "")
+        if tid and tid in tracker.per_clip:
+            c["_token_usage"] = tracker.per_clip[tid]
+
+    return clips, stats.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Score breakdown widget
+# ---------------------------------------------------------------------------
+
+def _render_clip_map(clips: list[dict], media_duration: float) -> None:
+    """Render a visual timeline showing where clips are distributed."""
+    if not clips or media_duration <= 0:
+        return
+    with st.expander("Clip map - timeline coverage", expanded=False):
+        BAR_W = 600
+        rows = []
+        for i, c in enumerate(clips):
+            t0 = float(c.get("start_seconds", 0))
+            t1 = float(c.get("end_seconds", t0 + 60))
+            x_start = int((t0 / media_duration) * BAR_W)
+            x_end = max(x_start + 4, int((t1 / media_duration) * BAR_W))
+            score = int(c.get("composite_score", 50))
+            hook = c.get("hook_title", "").replace('"', "")
+            rows.append(
+                f'<div title="#{i+1} {hook} | {t0:.0f}s-{t1:.0f}s | score={score}" '
+                f'style="position:absolute;left:{x_start}px;width:{x_end-x_start}px;height:18px;'
+                f'background:hsl({score*1.2},80%,55%);border-radius:3px;opacity:0.85;"></div>'
+            )
+        region_labels = ["early-mid", "mid", "late-mid", "end"]
+        region_divs = ""
+        for i in range(1, 5):
+            x = int((i / 5) * BAR_W)
+            lbl = region_labels[i - 1]
+            region_divs += (
+                f'<div style="position:absolute;left:{x}px;top:0;height:100%;border-left:1px dashed #555;"></div>'
+                f'<div style="position:absolute;left:{x+2}px;top:2px;font-size:9px;color:#888">{lbl}</div>'
+            )
+        html = (
+            f'<div style="position:relative;width:{BAR_W}px;height:28px;'
+            f'background:#1a1a2e;border-radius:4px;margin:8px 0;">'
+            f'{region_divs}{"".join(rows)}</div>'
+            f'<div style="font-size:11px;color:#888;margin-top:4px;">'
+            f'0s --- {media_duration/2:.0f}s --- {media_duration:.0f}s &nbsp;|&nbsp; '
+            f'{len(clips)} clips &nbsp;|&nbsp; color = score (green=high)</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_score_breakdown(c: dict) -> None:
+    scores = c.get("scores", {})
+    if not scores:
+        return
+    with st.expander("Score breakdown", expanded=False):
+        cols = st.columns(3)
+        for i, (dim, val) in enumerate(scores.items()):
+            label = dim.replace("_", " ").title()
+            cols[i % 3].metric(label, f"{val}/100")
+        composite = int(c.get("composite_score", 0))
+        st.progress(composite / 100, text=f"Composite: {composite}/100")
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    _init_state()
+    ensure_ffmpeg_on_path(log=False)
+
+    st.set_page_config(page_title="AI Clip Studio", layout="wide", initial_sidebar_state="expanded")
+    st.title("AI Clip Studio")
+    st.caption(
+        "Topic-agnostic short-form clips for TikTok, YouTube Shorts, and Reels - "
+        "transcribe, score moments, edit titles, export vertical 9:16 with burned-in captions."
+    )
+
+    api_key = os.environ.get(ENV_OPENAI_API_KEY, "").strip()
+    ffmpeg_path = ensure_ffmpeg_on_path()
+    ffmpeg_ver = get_ffmpeg_version_line()
+    gpu_status = get_gpu_acceleration_status()
+    cuda_whisper = faster_whisper_cuda_available()
+    ai_diag = collect_ai_acceleration_diagnostics()
+
+    # ------------------------------------------------------------------ SIDEBAR
+    with st.sidebar:
+        st.header("Settings")
+
+        # GPU / export
+        st.checkbox(
+            "GPU acceleration (NVENC exports + local Whisper)",
+            key="cs_gpu_acceleration",
+        )
+        gpu_on = bool(st.session_state.get("cs_gpu_acceleration", True))
+        force_gpu_export = bool(st.session_state.get("cs_force_gpu_export", False))
+        will_try_nvenc = should_attempt_nvenc_on_export(prefer_gpu=gpu_on, force_gpu_mode=force_gpu_export)
+
+        st.checkbox("Force GPU export (bypass NVENC probe gate)", key="cs_force_gpu_export")
+        st.checkbox("Allow CPU fallback for exports", key="cs_allow_cpu_fallback")
+
+        # Export mode
+        st.divider()
+        st.subheader("Crop & captions")
+        st.selectbox(
+            "Export mode",
+            list(EXPORT_MODE_LABELS.keys()),
+            key="cs_export_mode_label",
+            help=(
+                "Full frame fit: preserves entire 16:9 frame with blurred background. Safe default.\n"
+                "Smart crop: detects faces and keeps all people in frame (requires opencv-python-headless).\n"
+                "Center crop: simple 9:16 center cut."
+            ),
+        )
+        st.checkbox("Write SRT/ASS sidecar files", key="cs_write_sidecars")
+        st.selectbox(
+            "Default caption preset",
+            CAPTION_PRESET_OPTIONS,
+            key="cs_default_caption_preset",
+        )
+
+        # GPU status
+        st.divider()
+        st.caption("**Video export hardware**")
+        if not gpu_on:
+            st.info("CPU fallback active - libx264.")
+        elif will_try_nvenc and gpu_status.nvenc_probe_ok:
+            st.success("GPU export active - h264_nvenc probe passed.")
+        elif will_try_nvenc and not gpu_status.nvenc_probe_ok:
+            st.warning("GPU export will be attempted - NVENC self-test did not pass.")
+        else:
+            st.info("CPU fallback active - NVENC not listed.")
+
+        st.caption(f"ffmpeg lists h264_nvenc: **{gpu_status.ffmpeg_nvenc_listed}**")
+        st.caption(f"NVENC runtime probe: **{gpu_status.nvenc_probe_ok}**")
+        with st.expander('Why "listed=True, probe=False"?', expanded=False):
+            st.markdown(
+                "- **listed** = ffmpeg advertises the encoder.\n"
+                "- **probe** = a tiny real NVENC encode was attempted. Failure usually means GPU busy, old driver, or remote desktop session.\n"
+                "- Try **Force GPU export** or set `FORCE_NVENC_EXPORT=1` in `.env`."
+            )
+        with st.expander("Last NVENC probe log", expanded=False):
+            st.code(get_last_nvenc_probe_log() or "(no probe run yet)", language=None)
+
+        # CUDA / Whisper
+        st.divider()
+        st.caption("**Transcription backend**")
+        if gpu_on and ai_diag.cuda_runtime_probe_ok and cuda_whisper:
+            st.success("faster-whisper on CUDA")
+        elif gpu_on and ai_diag.ctranslate2_cuda_devices > 0 and not ai_diag.cuda_runtime_probe_ok:
+            st.info("faster-whisper CPU (int8) - CUDA skipped")
+        elif gpu_on:
+            st.caption("Install faster-whisper + ctranslate2 (CUDA) or use OPENAI_API_KEY.")
+        else:
+            st.caption("GPU mode off - OpenAI Whisper API used.")
+
+        with st.expander("AI acceleration diagnostics", expanded=False):
+            if st.button("Refresh CUDA / NVENC probes", use_container_width=True, key="cs_ai_diag_refresh"):
+                invalidate_cuda_runtime_probe_cache()
+                from clip_engine.ffmpeg_gpu import invalidate_nvenc_cache
+                invalidate_nvenc_cache()
+                st.rerun()
+            st.markdown(ai_diag.to_detail_markdown())
+            with st.expander("CUDA reference"):
+                st.markdown(CUDA_STACK_REFERENCE)
+
+        _sizes = ["tiny", "base", "small", "medium", "large-v3"]
+        st.selectbox("faster-whisper model size", _sizes, key="cs_whisper_model")
+
+        if not api_key:
+            st.warning("Set `OPENAI_API_KEY` in `.env` for cloud Whisper + clip analysis.")
+
+        # Clip duration
+        st.divider()
+        st.subheader("Clip duration")
+        st.number_input("Minimum clip length (core, s)", min_value=5, max_value=600, value=25, step=1, key="cs_min_clip_seconds")
+        st.number_input("Maximum clip length (cap, s)", min_value=10, max_value=600, value=160, step=1, key="cs_max_clip_seconds")
+        st.number_input("Context before clip (s)", min_value=0, max_value=120, value=8, step=1, key="cs_context_before")
+        st.number_input("Context after clip (s)", min_value=0, max_value=120, value=12, step=1, key="cs_context_after")
+        st.checkbox("Allow final clip to exceed max length", value=False, key="cs_allow_exceed_max")
+
+        st.divider()
+        st.subheader("Diversity & coverage")
+        st.selectbox(
+            "Clip style",
+            CLIP_STYLE_OPTIONS,
+            key="cs_clip_style",
+            help=(
+                "Micro clips: 30-75s sharp moments. "
+                "Balanced: 45-100s. Long story: 90-160s narrative arcs."
+            ),
+        )
+        st.number_input("Target number of clips", min_value=5, max_value=50, step=5, key="cs_target_clips",
+            help="How many unique clips to find across the full video.")
+        st.number_input("Min gap between clips (s)", min_value=10, max_value=300, step=10, key="cs_min_gap_seconds",
+            help="Clips must be at least this many seconds apart.")
+        st.slider("Duplicate similarity threshold (%)", min_value=20, max_value=80, step=5, key="cs_similarity_threshold",
+            help="Clips more similar than this % are considered duplicates and removed.")
+
+        # FFmpeg
+        st.divider()
+        st.caption("**FFmpeg**")
+        if ffmpeg_path:
+            st.code(ffmpeg_path, language=None)
+            st.caption(ffmpeg_ver or "version: (unknown)")
+        else:
+            st.error(f"FFmpeg not found. Set **{ENV_FFMPEG_BINARY}** in `.env` or install FFmpeg.")
+
+        if st.button("Open exports folder", use_container_width=True):
+            ensure_directories()
+            open_folder(CLIP_STUDIO_OUTPUT_DIR)
+            st.toast("Opened outputs/clips")
+
+    # ------------------------------------------------------------------ UPLOAD
+    st.subheader("1. Upload video")
+    st.caption(
+        f"**Upload limit:** up to **{CLIP_STUDIO_MAX_UPLOAD_MB} MB (~4 GB)** per file. "
+        "Large files take time in browser before Save appears."
+    )
+    with st.expander("Upload troubleshooting"):
+        st.markdown(
+            f"- Server cap: `maxUploadSize = {CLIP_STUDIO_MAX_UPLOAD_MB}` (MB) in `.streamlit/config.toml`\n"
+            "- Restart Streamlit after changing `config.toml`\n"
+            "- Reverse proxies (nginx, Cloudflare) may impose a smaller body limit\n"
+            "- Keep browser tab open during upload"
+        )
+
+    up = st.file_uploader("MP4 / MOV / M4V", type=["mp4", "mov", "m4v"], key="cs_upload")
+    if up is not None:
+        sz = _uploaded_file_size_bytes(up)
+        if sz > CLIP_STUDIO_MAX_UPLOAD_BYTES:
+            st.error(
+                f"File is **{_format_size(sz)}** - exceeds limit of **{CLIP_STUDIO_MAX_UPLOAD_MB} MB**. "
+                "Compress with `compress_video.bat` or raise `maxUploadSize` in `config.toml`."
+            )
+        else:
+            st.success(f"Ready: **{up.name}** - {_format_size(sz)}. Click **Save** to continue.")
+        if st.button("Save upload to project", type="primary", disabled=sz > CLIP_STUDIO_MAX_UPLOAD_BYTES):
+            bar = st.progress(0.0, text="Preparing to save...")
+            try:
+                path = _save_upload(up, progress_bar=bar)
+                st.session_state.cs_video_path = path
+                st.session_state.cs_segments = []
+                st.session_state.cs_formatted = ""
+                st.session_state.cs_clips = []
+                st.session_state.cs_session_dir = None
+                st.session_state.cs_media_duration = 0.0
+                try:
+                    st.session_state.cs_media_duration = get_media_duration_seconds(path)
+                except Exception:
+                    logger.exception("ffprobe duration failed")
+                st.session_state.cs_status = f"Saved: `{path.relative_to(PROJECT_ROOT)}` ({_format_size(sz)})"
+                try:
+                    bar.progress(1.0, text="Saved.")
+                except TypeError:
+                    bar.progress(1.0)
+                st.rerun()
+            except OSError as exc:
+                st.error(f"Could not write file (disk full or permissions?): {exc}")
+            finally:
+                bar.empty()
+
+    if st.session_state.cs_video_path:
+        st.success(str(st.session_state.cs_video_path.relative_to(PROJECT_ROOT)))
+
+    # ------------------------------------------------------------------ TRANSCRIBE
+    st.subheader("2. Transcript")
+    can_transcribe = bool(
+        st.session_state.cs_video_path
+        and (api_key or bool(st.session_state.get("cs_gpu_acceleration", True)))
+    )
+    if not st.session_state.cs_video_path:
+        st.info("Save a video first.")
+    elif not can_transcribe:
+        st.warning("Enable **GPU acceleration** (local Whisper) or add **OPENAI_API_KEY** for cloud Whisper.")
+    else:
+        whisper_lang = st.text_input(
+            "Whisper language (optional ISO code)",
+            placeholder="e.g. en - leave empty for auto",
+        )
+        if st.button("Transcribe", type="primary"):
+            work = CLIP_STUDIO_OUTPUT_DIR / "_work"
+            work.mkdir(parents=True, exist_ok=True)
+            lang = whisper_lang.strip() or None
+            model_sz = str(st.session_state.get("cs_whisper_model", "base"))
+            prefer_gpu = bool(st.session_state.get("cs_gpu_acceleration", True))
+            with st.spinner("Transcribing (may take a while for long videos)"):
+                try:
+                    segs, full = transcribe_video(
+                        st.session_state.cs_video_path,
+                        api_key,
+                        work_dir=work,
+                        language=lang,
+                        prefer_gpu=prefer_gpu,
+                        faster_whisper_model=model_sz,
+                    )
+                    # Merge into sentence groups for better LLM context
+                    merged = merge_segments_into_sentences(segs)
+                    st.session_state.cs_segments = merged if merged else segs
+                    st.session_state.cs_formatted = segments_to_prompt_transcript(
+                        st.session_state.cs_segments
+                    )
+                    st.session_state.cs_clips = []
+                    st.session_state.cs_status = (
+                        f"Transcribed {len(segs)} raw segments -> "
+                        f"{len(st.session_state.cs_segments)} sentence groups."
+                    )
+                except Exception as e:
+                    logger.exception("Transcribe failed")
+                    st.error(f"Transcription failed: {e}")
+
+    if st.session_state.get("cs_status"):
+        st.caption(st.session_state.cs_status)
+
+    if st.session_state.cs_segments:
+        with st.expander("Transcript preview", expanded=False):
+            st.text_area(
+                "Timestamped transcript",
+                st.session_state.cs_formatted[:50_000]
+                + ("..." if len(st.session_state.cs_formatted) > 50_000 else ""),
+                height=200,
+                disabled=True,
+            )
+
+    # ------------------------------------------------------------------ CLIP AI
+    st.subheader("3. AI clip suggestions")
+
+    creator_note = st.text_area(
+        "Optional creator note",
+        placeholder="e.g. audience is beginners; brand is playful - leave blank for topic-agnostic",
+        height=68,
+    )
+
+    col_analyze, col_rescore, col_more = st.columns([2, 1, 1])
+
+    def _get_analysis_params() -> dict:
+        min_c = float(st.session_state.get("cs_min_clip_seconds", 25))
+        max_c = float(st.session_state.get("cs_max_clip_seconds", 160))
+        if min_c > max_c:
+            min_c, max_c = max_c, min_c
+        return dict(
+            formatted=st.session_state.cs_formatted,
+            api_key=api_key,
+            segments=st.session_state.cs_segments,
+            creator_note=creator_note,
+            min_c=min_c,
+            max_c=max_c,
+            ctx_b=float(st.session_state.get("cs_context_before", 8)),
+            ctx_a=float(st.session_state.get("cs_context_after", 12)),
+            allow_over=bool(st.session_state.get("cs_allow_exceed_max", False)),
+            media_dur=float(st.session_state.get("cs_media_duration") or 0.0),
+            target_count=int(st.session_state.get("cs_target_clips", 20)),
+            min_gap_seconds=float(st.session_state.get("cs_min_gap_seconds", 60)),
+            similarity_threshold=float(st.session_state.get("cs_similarity_threshold", 45)) / 100.0,
+            clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
+            video_filename=str(st.session_state.cs_video_path.name if st.session_state.cs_video_path else ""),
+        )
+
+    with col_analyze:
+        can_analyze = bool(st.session_state.cs_formatted and api_key)
+        if st.button("Analyze for high-retention clips", type="primary", disabled=not can_analyze, use_container_width=True):
+            with st.spinner("Scoring clips (GPT-4o, multi-pass - may take 30-90s)"):
+                try:
+                    clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
+                    st.session_state.cs_clips = clips
+                    st.session_state.cs_pipeline_stats = pipe_stats
+                    st.session_state.cs_status = f"Suggested {len(clips)} clips."
+                except Exception as e:
+                    logger.exception("Clip analysis failed")
+                    st.error(f"Clip analysis failed: {e}")
+            if not api_key:
+                st.info("Add **OPENAI_API_KEY** to `.env` to run clip analysis.")
+
+    with col_rescore:
+        if st.session_state.cs_clips:
+            if st.button("Re-score clips", use_container_width=True, disabled=not can_analyze):
+                with st.spinner("Re-scoring..."):
+                    try:
+                        clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
+                        st.session_state.cs_clips = clips
+                        st.session_state.cs_pipeline_stats = pipe_stats
+                        st.session_state.cs_status = f"Re-scored: {len(clips)} clips."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Re-score failed: {e}")
+
+    with col_more:
+        if st.session_state.cs_clips:
+            if st.button("Find more clips", use_container_width=True, disabled=not can_analyze):
+                with st.spinner("Finding more..."):
+                    try:
+                        extra, extra_stats = _run_clip_analysis(**_get_analysis_params())
+                        existing_ranges = {
+                            (c.get("start_seconds"), c.get("end_seconds"))
+                            for c in st.session_state.cs_clips
+                        }
+                        new_clips = [
+                            c for c in extra
+                            if (c.get("start_seconds"), c.get("end_seconds")) not in existing_ranges
+                        ]
+                        st.session_state.cs_clips.extend(new_clips)
+                        st.session_state.cs_pipeline_stats = extra_stats
+                        st.session_state.cs_status = f"Added {len(new_clips)} new clips ({len(st.session_state.cs_clips)} total)."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Find more failed: {e}")
+
+    # ------------------------------------------------------------------ CLIP CARDS
+    clips: list = st.session_state.get("cs_clips") or []
+    if clips:
+        media_dur_for_map = float(st.session_state.get("cs_media_duration") or 0.0)
+        pipe_stats = st.session_state.get("cs_pipeline_stats") or {}
+        target_req = int(pipe_stats.get("target_clips", st.session_state.get("cs_target_clips", 20)))
+        st.success(f"**{len(clips)} clips** selected (target: {target_req}) - check Export to include in batch.")
+
+        if pipe_stats:
+            st.caption(
+                f"Pipeline: **{pipe_stats.get('raw_candidates', '?')}** raw candidates | "
+                f"**{pipe_stats.get('removed_overlap', 0)}** removed (overlap) | "
+                f"**{pipe_stats.get('removed_duplicates', 0)}** removed (duplicates) | "
+                f"**{pipe_stats.get('final_clips', len(clips))}** final"
+                + (
+                    f" | **{pipe_stats.get('expansion_pass_count', 0)}** expansion pass(es)"
+                    if pipe_stats.get("expansion_pass_ran")
+                    else ""
+                )
+                + (
+                    f" | **{pipe_stats.get('rejected_ungrounded', 0)}** rejected (metadata)"
+                    if pipe_stats.get("rejected_ungrounded")
+                    else ""
+                )
+            )
+            for w in pipe_stats.get("warnings", []):
+                st.warning(w)
+
+        tok = get_session_tokens()
+        if tok["total"] > 0:
+            cost = tok.get("estimated_cost_usd") or (
+                (tok["prompt"] * 2.50 + tok["completion"] * 10.00) / 1_000_000
+            )
+            st.caption(
+                f"Session tokens: **{tok['total']:,}** "
+                f"(prompt: {tok['prompt']:,} / completion: {tok['completion']:,}) | "
+                f"Est. cost: **${cost:.4f}** (GPT-4o)"
+            )
+            tracker_export = st.session_state.get("cs_token_tracker") or {}
+            per_stage = tracker_export.get("per_stage") or {}
+            if per_stage:
+                with st.expander("Token usage by stage", expanded=False):
+                    for stage, usage in per_stage.items():
+                        st.caption(
+                            f"**{stage}**: {usage.get('total_tokens', 0):,} tokens "
+                            f"({usage.get('call_count', 0)} calls)"
+                        )
+
+        _render_clip_map(clips, media_dur_for_map)
+
+        for i, c in enumerate(clips):
+            wid = c.get("_wid") or str(i)
+            fs_default = float(c.get("start_seconds", c.get("start", 0)))
+            fe_default = float(c.get("end_seconds", c.get("end", 0)))
+            o_s = float(c.get("original_start", fs_default))
+            o_e = float(c.get("original_end", fe_default))
+            score = int(c.get("composite_score", 0))
+            platforms = c.get("platform_fit", [])
+            platform_str = " | ".join(platforms) if platforms else "n/a"
+            warnings = c.get("warnings", [])
+
+            with st.container(border=True):
+                header_col, score_col, export_col = st.columns([4, 1, 1])
+                with header_col:
+                    st.markdown(f"### #{i+1} - {c.get('hook_title', 'Untitled clip')}")
+                    st.caption(f"Platform: **{platform_str}** | Signal: `{c.get('dominant_signal', 'n/a')}` | Style: `{c.get('caption_style', 'n/a')}`")
+                with score_col:
+                    color = "High" if score >= 80 else ("Mid" if score >= 65 else "Low")
+                    st.metric(f"{color} Score", f"{score}/100")
+                with export_col:
+                    st.checkbox("Export", value=bool(c.get("export", True)), key=f"ex_{wid}")
+
+                # Editable fields row
+                e1, e2, e3, e4 = st.columns([2, 1, 1, 1])
+                with e1:
+                    st.text_input("Hook / title", value=str(c.get("hook_title", "") or ""), key=f"hook_{wid}")
+                with e2:
+                    st.number_input(
+                        "Start (s)",
+                        value=fs_default,
+                        min_value=0.0,
+                        step=0.5,
+                        format="%.1f",
+                        key=f"start_{wid}",
+                    )
+                with e3:
+                    st.number_input(
+                        "End (s)",
+                        value=fe_default,
+                        min_value=0.0,
+                        step=0.5,
+                        format="%.1f",
+                        key=f"end_{wid}",
+                    )
+                with e4:
+                    preset_default = str(c.get("caption_preset", st.session_state.get("cs_default_caption_preset", "Clean")))
+                    preset_idx = CAPTION_PRESET_OPTIONS.index(preset_default) if preset_default in CAPTION_PRESET_OPTIONS else 0
+                    st.selectbox("Caption preset", CAPTION_PRESET_OPTIONS, index=preset_idx, key=f"preset_{wid}")
+
+                # Computed duration from editable fields
+                t0_val = float(st.session_state.get(f"start_{wid}", fs_default))
+                t1_val = float(st.session_state.get(f"end_{wid}", fe_default))
+                dur_val = max(0.0, t1_val - t0_val)
+                st.caption(f"Duration: **{dur_val:.1f}s** | AI core: {o_s:.1f}s - {o_e:.1f}s ({max(0.0, o_e-o_s):.1f}s)")
+
+                grounding = int(c.get("grounding_confidence", 0))
+                if grounding > 0:
+                    g_label = "Strong" if grounding >= 50 else ("Weak" if grounding >= 25 else "Poor")
+                    st.caption(f"Metadata grounding: **{grounding}%** ({g_label})")
+                if grounding < 25 or any("Metadata may not match" in str(w) for w in warnings):
+                    st.warning("Metadata may not match final clip window.")
+
+                excerpt = extract_transcript_excerpt(
+                    st.session_state.get("cs_segments") or [],
+                    t0_val,
+                    t1_val,
+                    max_chars=900,
+                ) or c.get("grounded_transcript_excerpt", "")
+                if excerpt:
+                    with st.expander("Transcript used for this clip", expanded=False):
+                        st.text(excerpt)
+
+                tok_clip = c.get("_token_usage")
+                if tok_clip and tok_clip.get("total", 0) > 0:
+                    st.caption(
+                        f"Clip tokens: **{tok_clip['total']:,}** "
+                        f"(prompt {tok_clip.get('prompt', 0):,} / completion {tok_clip.get('completion', 0):,})"
+                    )
+
+                # Reason / context
+                reason_col, context_col = st.columns(2)
+                with reason_col:
+                    st.markdown("**Why this clip**")
+                    st.write(c.get("selection_reason", c.get("reason", "n/a")))
+                with context_col:
+                    st.markdown("**Why this framing**")
+                    st.write(c.get("ai_context_reason", c.get("context_reason", "n/a")))
+
+                if c.get("expansion_note"):
+                    st.caption(f"Note: {c['expansion_note'].strip()}")
+
+                if warnings:
+                    with st.expander("Warnings", expanded=False):
+                        for w in warnings:
+                            st.warning(w)
+
+                _render_score_breakdown(c)
+
+    # ------------------------------------------------------------------ EXPORT
+    st.subheader("4. Export vertical (9:16) + captions")
+    st.caption(
+        "Each MP4 uses the **edited** start/end times from the clip cards above. "
+        "SRT and ASS sidecar files are written alongside each clip when enabled."
+    )
+
+    if not st.session_state.cs_video_path:
+        st.info("Save a video upload first.")
+    elif not clips:
+        st.info("Run clip analysis to get exportable segments.")
+    else:
+        if st.button("Export selected clips", type="primary"):
+            try:
+                session = CLIP_STUDIO_OUTPUT_DIR / datetime.now().strftime("session_%Y%m%d_%H%M%S")
+                session.mkdir(parents=True, exist_ok=True)
+                st.session_state.cs_session_dir = session
+                video = Path(st.session_state.cs_video_path)
+                segs = st.session_state.cs_segments
+                prefer_gpu = bool(st.session_state.get("cs_gpu_acceleration", True))
+                force_gpu = bool(st.session_state.get("cs_force_gpu_export", False))
+                allow_cpu = bool(st.session_state.get("cs_allow_cpu_fallback", True))
+                export_mode_label = str(st.session_state.get("cs_export_mode_label", "Full frame fit with blurred background"))
+                export_mode = EXPORT_MODE_LABELS.get(export_mode_label, "full_fit")
+                write_sidecars = bool(st.session_state.get("cs_write_sidecars", True))
+
+                to_export = [
+                    c for c in clips
+                    if st.session_state.get(f"ex_{c.get('_wid', '')}", c.get("export", True))
+                ]
+                if not to_export:
+                    st.warning("No clips selected for export. Check at least one 'Export' checkbox.")
+                else:
+                    exported = 0
+                    failed = 0
+                    prog = st.progress(0.0)
+                    status_area = st.empty()
+                    tracker = get_tracker()
+                    audit_clips: list[dict] = []
+
+                    for idx, c in enumerate(to_export):
+                        wid = c.get("_wid", str(idx))
+                        hook = st.session_state.get(f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}"))
+                        t0 = float(st.session_state.get(f"start_{wid}", c.get("start_seconds", c.get("start", 0))))
+                        t1 = float(st.session_state.get(f"end_{wid}", c.get("end_seconds", c.get("end", 0))))
+                        preset = str(st.session_state.get(f"preset_{wid}", c.get("caption_preset", "Clean")))
+                        base = f"{idx+1:02d}_{_slug(str(hook))}"
+                        out = session / f"{base}_9x16.mp4"
+
+                        export_clip = dict(c)
+                        export_clip["start_seconds"] = t0
+                        export_clip["end_seconds"] = t1
+                        export_clip["hook_title"] = str(hook)
+                        if api_key:
+                            export_clip = ground_clip_metadata_against_window(
+                                export_clip,
+                                segs,
+                                api_key,
+                                tracker=tracker,
+                                force_regenerate=True,
+                            )
+                            hook = export_clip.get("hook_title", hook)
+                            if export_clip.get("_wid"):
+                                st.session_state[f"hook_{export_clip['_wid']}"] = hook
+                            base = f"{idx+1:02d}_{_slug(str(hook))}"
+                            out = session / f"{base}_9x16.mp4"
+                            tid = export_clip.get("_wid", "")
+                            if tid and tid in tracker.per_clip:
+                                export_clip["_token_usage"] = tracker.per_clip[tid]
+
+                        write_clip_audit_json(export_clip, session / f"clip_{idx+1:02d}_audit.json", index=idx + 1)
+                        audit_clips.append(export_clip)
+
+                        status_area.info(f"Exporting {idx+1}/{len(to_export)}: {hook}...")
+                        try:
+                            result = export_vertical_clip_with_captions(
+                                video, out, t0, t1, segs,
+                                prefer_gpu=prefer_gpu,
+                                force_gpu_export=force_gpu,
+                                allow_cpu_fallback=allow_cpu,
+                                caption_preset=preset,
+                                export_mode=export_mode,
+                                write_sidecars=write_sidecars,
+                            )
+                            exported += 1
+                            logger.info(
+                                "Exported %s - mode=%s encoder=%s res=%s",
+                                out.name,
+                                result.get("export_mode"),
+                                result.get("encoder_used"),
+                                result.get("resolution"),
+                            )
+                        except Exception as e:
+                            failed += 1
+                            st.warning(f"Skipped **{base}**: {e}")
+                            logger.exception("Export failed for %s", base)
+
+                        prog.progress((idx + 1) / len(to_export))
+
+                    status_area.empty()
+                    prog.empty()
+
+                    tracker.write_json(
+                        session / "token_usage.json",
+                        target_clips=int(st.session_state.get("cs_target_clips", 20)),
+                        final_clip_count=exported,
+                    )
+
+                    if exported:
+                        st.success(f"Exported **{exported}** clip(s) to `{session.relative_to(PROJECT_ROOT)}`")
+                    if failed:
+                        st.error(f"{failed} clip(s) failed - check warnings above.")
+
+            except Exception as e:
+                logger.exception("Export batch failed")
+                st.error(f"Export failed: {e}")
+
+    out_dir = st.session_state.get("cs_session_dir")
+    if out_dir and Path(out_dir).is_dir():
+        st.markdown("**Latest export folder**")
+        st.code(str(Path(out_dir).relative_to(PROJECT_ROOT)), language=None)
+        if st.button("Open latest export in Explorer"):
+            open_folder(Path(out_dir))
+
+
+if __name__ == "__main__":
+    main()
