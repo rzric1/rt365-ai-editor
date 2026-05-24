@@ -35,7 +35,10 @@ from config import (  # noqa: E402
     ensure_directories,
 )
 from clip_engine.clip_analysis import get_session_tokens  # noqa: E402
-from clip_engine.clip_pipeline import run_full_clip_pipeline  # noqa: E402
+from clip_engine.clip_pipeline import run_full_clip_pipeline, PipelineOpenAIConfig  # noqa: E402
+from clip_engine.openai_resilience import OpenAIRateLimitError, estimate_pipeline_tokens, token_saver_pass_config  # noqa: E402
+from clip_engine.analysis_cache import clear_all_analysis_cache  # noqa: E402
+from config import get_openai_model, get_openai_model_fast  # noqa: E402
 from clip_engine.clip_style import CLIP_STYLE_OPTIONS, ClipStyle  # noqa: E402
 from clip_engine.clip_metadata import (  # noqa: E402
     ground_clip_metadata_against_window,
@@ -120,6 +123,12 @@ def _init_state() -> None:
         "cs_enable_dynamic_smart_crop": True,
         "cs_enable_preview_rendering": True,
         "cs_previews": {},
+        "cs_token_saver_mode": True,
+        "cs_rate_limit_safe": True,
+        "cs_use_analysis_cache": True,
+        "cs_max_tokens_budget": 60_000,
+        "cs_openai_call_delay": 0.75,
+        "cs_openai_status": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -200,9 +209,34 @@ def _run_clip_analysis(
     similarity_threshold: float = 0.45,
     clip_style: ClipStyle = "Balanced",
     video_filename: str = "",
+    status_callback=None,
 ) -> tuple[list[dict], dict]:
     """Run full clip pipeline. Returns (clips, pipeline_stats_dict)."""
     note = creator_note.strip() or None
+
+    token_saver = bool(st.session_state.get("cs_token_saver_mode", True))
+    style_name = str(clip_style)
+    n_passes, max_rounds, _ = token_saver_pass_config(style_name)
+    if not token_saver:
+        n_passes = 3
+        max_rounds = 2
+    est = estimate_pipeline_tokens(
+        formatted,
+        target_count=target_count,
+        n_passes=n_passes,
+        max_pass_rounds=max_rounds,
+        token_saver_mode=token_saver,
+    )
+    st.session_state.cs_token_estimate = est.to_dict()
+
+    openai_config = PipelineOpenAIConfig(
+        token_saver_mode=token_saver,
+        rate_limit_safe=bool(st.session_state.get("cs_rate_limit_safe", True)),
+        use_cache=bool(st.session_state.get("cs_use_analysis_cache", True)),
+        max_tokens_budget=int(st.session_state.get("cs_max_tokens_budget", 60_000)),
+        call_delay_seconds=float(st.session_state.get("cs_openai_call_delay", 0.75)),
+        status_callback=status_callback,
+    )
 
     clips, stats, tracker = run_full_clip_pipeline(
         formatted,
@@ -222,12 +256,18 @@ def _run_clip_analysis(
         video_filename=video_filename,
         enable_signal_boosts=bool(st.session_state.get("cs_enable_signal_boosts", True)),
         enable_speaker_signals=bool(st.session_state.get("cs_enable_signal_boosts", True)),
+        openai_config=openai_config,
     )
 
-    st.session_state.cs_token_tracker = tracker.to_export_dict(
+    export_dict = tracker.to_export_dict(
         target_clips=target_count,
         final_clip_count=len(clips),
+        model=get_openai_model(),
     )
+    export_dict["model_fast"] = get_openai_model_fast()
+    export_dict["model_quality"] = get_openai_model()
+    export_dict["token_estimate"] = est.to_dict()
+    st.session_state.cs_token_tracker = export_dict
 
     for c in clips:
         if not c.get("_wid"):
@@ -469,6 +509,42 @@ def main() -> None:
         st.checkbox("Allow final clip to exceed max length", value=False, key="cs_allow_exceed_max")
 
         st.divider()
+        st.subheader("OpenAI usage & safety")
+        st.checkbox(
+            "Token Saver Mode",
+            key="cs_token_saver_mode",
+            help="Fewer GPT passes, smaller candidate pool, skip strong grounding regen.",
+        )
+        st.checkbox(
+            "Rate Limit Safe Mode",
+            key="cs_rate_limit_safe",
+            help="Exponential backoff on 429 errors with retry/resume.",
+        )
+        st.checkbox(
+            "Use cached analysis if available",
+            key="cs_use_analysis_cache",
+        )
+        st.number_input(
+            "Max tokens per analysis run",
+            min_value=10_000,
+            max_value=500_000,
+            step=5_000,
+            key="cs_max_tokens_budget",
+        )
+        st.slider(
+            "Delay between OpenAI calls (sec)",
+            min_value=0.0,
+            max_value=3.0,
+            step=0.25,
+            key="cs_openai_call_delay",
+        )
+        st.caption(f"Fast model: `{get_openai_model_fast()}`")
+        st.caption(f"Quality model: `{get_openai_model()}`")
+        if st.button("Clear analysis cache", use_container_width=True):
+            n = clear_all_analysis_cache()
+            st.success(f"Cleared {n} cached analysis entries.")
+
+        st.divider()
         st.subheader("Diversity & coverage")
         st.selectbox(
             "Clip style",
@@ -610,6 +686,29 @@ def main() -> None:
                 height=200,
                 disabled=True,
             )
+        if api_key and st.session_state.cs_formatted:
+            _style = str(st.session_state.get("cs_clip_style", "Balanced"))
+            _n, _r, _ = token_saver_pass_config(_style)
+            if not st.session_state.get("cs_token_saver_mode", True):
+                _n, _r = 3, 2
+            _pre = estimate_pipeline_tokens(
+                st.session_state.cs_formatted,
+                target_count=int(st.session_state.get("cs_target_clips", 20)),
+                n_passes=_n,
+                max_pass_rounds=_r,
+                token_saver_mode=bool(st.session_state.get("cs_token_saver_mode", True)),
+            )
+            _budget = int(st.session_state.get("cs_max_tokens_budget", 60_000))
+            if _pre.estimated_total_tokens > _budget:
+                st.warning(
+                    f"This run may use approximately **{_pre.estimated_total_tokens:,}** tokens. "
+                    f"Budget is **{_budget:,}**. Token Saver Mode will be enforced."
+                )
+            else:
+                st.caption(
+                    f"Estimated analysis tokens: ~{_pre.estimated_total_tokens:,} "
+                    f"(budget {_budget:,}) | ~{_pre.estimated_calls} API calls"
+                )
 
     # ------------------------------------------------------------------ CLIP AI
     st.subheader("3. AI clip suggestions")
@@ -647,13 +746,53 @@ def main() -> None:
 
     with col_analyze:
         can_analyze = bool(st.session_state.cs_formatted and api_key)
+        est_data = st.session_state.get("cs_token_estimate") or {}
+        if est_data:
+            budget = int(st.session_state.get("cs_max_tokens_budget", 60_000))
+            st.caption(
+                f"Est. tokens: **~{est_data.get('estimated_total_tokens', 0):,}** "
+                f"(budget {budget:,}) | ~{est_data.get('estimated_calls', 0)} API calls"
+            )
+        openai_status = st.session_state.get("cs_openai_status", "")
+        if openai_status:
+            st.info(openai_status)
         if st.button("Analyze for high-retention clips", type="primary", disabled=not can_analyze, use_container_width=True):
-            with st.spinner("Scoring clips (GPT-4o, multi-pass - may take 30-90s)"):
+            status_slot = st.empty()
+
+            def _status_cb(msg: str) -> None:
+                st.session_state.cs_openai_status = msg
+                status_slot.info(msg)
+
+            with st.spinner("Scoring clips (multi-pass — may take 30-120s on long podcasts)"):
                 try:
-                    clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
+                    params = _get_analysis_params()
+                    if st.session_state.cs_formatted:
+                        style = str(st.session_state.get("cs_clip_style", "Balanced"))
+                        n_passes, max_rounds, _ = token_saver_pass_config(style)
+                        if not st.session_state.get("cs_token_saver_mode", True):
+                            n_passes, max_rounds = 3, 2
+                        pre_est = estimate_pipeline_tokens(
+                            st.session_state.cs_formatted,
+                            target_count=int(st.session_state.get("cs_target_clips", 20)),
+                            n_passes=n_passes,
+                            max_pass_rounds=max_rounds,
+                            token_saver_mode=bool(st.session_state.get("cs_token_saver_mode", True)),
+                        )
+                        st.session_state.cs_token_estimate = pre_est.to_dict()
+                    clips, pipe_stats = _run_clip_analysis(**params, status_callback=_status_cb)
                     st.session_state.cs_clips = clips
                     st.session_state.cs_pipeline_stats = pipe_stats
-                    st.session_state.cs_status = f"Suggested {len(clips)} clips."
+                    if pipe_stats.get("cache_hit"):
+                        st.session_state.cs_status = "Loaded cached analysis — no OpenAI tokens used."
+                    else:
+                        st.session_state.cs_status = f"Suggested {len(clips)} clips."
+                    st.session_state.cs_openai_status = ""
+                except OpenAIRateLimitError as e:
+                    logger.exception("Clip analysis rate limited")
+                    st.error(
+                        f"OpenAI rate limit at **{e.stage}** (model `{e.model}`). "
+                        f"{e.mitigation} Partial progress saved — click Analyze again to resume."
+                    )
                 except Exception as e:
                     logger.exception("Clip analysis failed")
                     st.error(f"Clip analysis failed: {e}")
@@ -709,6 +848,16 @@ def main() -> None:
                 f"**{pipe_stats.get('removed_duplicates', 0)}** removed (duplicates) | "
                 f"**{pipe_stats.get('final_clips', len(clips))}** final"
                 + (
+                    f" | models: `{pipe_stats.get('model_fast', 'n/a')}` / `{pipe_stats.get('model_quality', 'n/a')}`"
+                )
+                + (
+                    f" | est. ~{pipe_stats.get('estimated_tokens', 0):,} tokens"
+                    if pipe_stats.get("estimated_tokens")
+                    else ""
+                )
+                + (" | **cache hit**" if pipe_stats.get("cache_hit") else "")
+                + (" | **resumed**" if pipe_stats.get("resumed_from_progress") else "")
+                + (
                     f" | **{pipe_stats.get('expansion_pass_count', 0)}** expansion pass(es)"
                     if pipe_stats.get("expansion_pass_ran")
                     else ""
@@ -733,6 +882,10 @@ def main() -> None:
                 f"Est. cost: **${cost:.4f}** (GPT-4o)"
             )
             tracker_export = st.session_state.get("cs_token_tracker") or {}
+            if tracker_export.get("tokens_avoided_cache"):
+                st.caption(f"Tokens avoided by cache: **{tracker_export['tokens_avoided_cache']:,}**")
+            if tracker_export.get("retry_tokens"):
+                st.caption(f"Retry tokens (est.): **{tracker_export['retry_tokens']:,}**")
             per_stage = tracker_export.get("per_stage") or {}
             if per_stage:
                 with st.expander("Token usage by stage", expanded=False):

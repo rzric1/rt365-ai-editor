@@ -19,6 +19,7 @@ TRANSCRIPTS_DIR: Path = PROJECT_ROOT / "transcripts"
 LOGS_DIR: Path = PROJECT_ROOT / "logs"
 UPLOADS_DIR: Path = PROJECT_ROOT / "uploads"
 CLIP_STUDIO_OUTPUT_DIR: Path = PROJECT_ROOT / "outputs" / "clips"
+ANALYSIS_CACHE_DIR: Path = PROJECT_ROOT / "outputs" / "cache" / "analysis"
 # Must match .streamlit/config.toml [server] maxUploadSize (megabytes)
 CLIP_STUDIO_MAX_UPLOAD_MB: int = 4096
 CLIP_STUDIO_MAX_UPLOAD_BYTES: int = CLIP_STUDIO_MAX_UPLOAD_MB * 1024 * 1024
@@ -35,6 +36,7 @@ DEFAULT_JSON_PATH: Path = TRANSCRIPTS_DIR / "input.json"
 
 ENV_OPENAI_API_KEY: str = "OPENAI_API_KEY"
 ENV_OPENAI_MODEL: str = "OPENAI_MODEL"
+ENV_OPENAI_MODEL_FAST: str = "OPENAI_MODEL_FAST"
 
 # Optional absolute path to ffmpeg (or ffmpeg.exe on Windows). Loaded via .env / process env.
 ENV_FFMPEG_BINARY: str = "FFMPEG_BINARY"
@@ -79,11 +81,20 @@ def ensure_directories() -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     CLIP_STUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ANALYSIS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_openai_model() -> str:
-    """Model name from environment, with a safe default."""
+    """Quality model for grounding and final metadata (OPENAI_MODEL)."""
     return os.environ.get(ENV_OPENAI_MODEL, DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+
+
+def get_openai_model_fast() -> str:
+    """Fast/cheap model for candidate generation and splits (OPENAI_MODEL_FAST)."""
+    fast = os.environ.get(ENV_OPENAI_MODEL_FAST, "").strip()
+    if fast:
+        return fast
+    return get_openai_model()
 
 
 def get_transcript_bracket_fps() -> float:

@@ -43,6 +43,8 @@ class TokenTracker:
     video_filename: str = ""
     stages: dict[str, StageUsage] = field(default_factory=dict)
     per_clip: dict[str, dict[str, int]] = field(default_factory=dict)
+    retry_tokens: int = 0
+    tokens_avoided_cache: int = 0
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def record(
@@ -70,6 +72,15 @@ class TokenTracker:
             "Tokens [%s]: +%d (prompt=%d completion=%d)",
             stage, total, prompt_tokens, completion_tokens,
         )
+
+    def record_retry(self, stage: str, estimated_tokens: int = 0, *, model: str = DEFAULT_MODEL) -> None:
+        """Track tokens attributed to rate-limit retries (estimate when usage unavailable)."""
+        self.retry_tokens += estimated_tokens
+        retry_stage = f"{stage}_retry"
+        self.record(retry_stage, prompt_tokens=estimated_tokens, completion_tokens=0, model=model)
+
+    def record_cache_hit(self, tokens_avoided: int) -> None:
+        self.tokens_avoided_cache += tokens_avoided
 
     def record_openai_usage(self, stage: str, usage: Any, *, model: str = DEFAULT_MODEL, clip_id: str | None = None) -> None:
         if usage is None:
@@ -124,6 +135,8 @@ class TokenTracker:
             "total_prompt_tokens": self.prompt_tokens,
             "total_completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
+            "retry_tokens": self.retry_tokens,
+            "tokens_avoided_cache": self.tokens_avoided_cache,
             "estimated_cost_usd": round(self.estimated_cost_usd(), 6),
             "per_stage": {
                 name: {

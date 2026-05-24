@@ -12,6 +12,8 @@ from typing import Any
 
 from clip_engine.transcription_utils import detect_pauses, segments_to_prompt_transcript
 from clip_engine.token_tracking import TokenTracker, get_tracker
+from clip_engine.openai_resilience import call_openai_with_backoff, estimate_tokens_rough, get_call_context
+from config import get_openai_model_fast
 
 logger = logging.getLogger("clip_engine.clip_split")
 
@@ -108,8 +110,10 @@ def _split_one_clip(
         return [clip]
 
     ts_transcript = segments_to_prompt_transcript(window_segs)
-    if len(ts_transcript) > 12_000:
-        ts_transcript = ts_transcript[:12_000] + "\n[truncated]"
+    ctx = get_call_context()
+    max_chars = 8_000 if ctx.token_saver_mode else 12_000
+    if len(ts_transcript) > max_chars:
+        ts_transcript = ts_transcript[:max_chars] + "\n[truncated]"
 
     sub_max = min(sub_clip_max, max_duration)
     system = f"""You split one long podcast clip into 2-3 shorter standalone micro-clips.
@@ -125,20 +129,30 @@ Output ONLY JSON:
 {{"sub_clips": [{{"start_seconds": 0, "end_seconds": 0, "hook_title": "", "composite_score": 70, "selection_reason": "", "dominant_signal": "educational"}}]}}"""
 
     user = f"TRANSCRIPT INSIDE LONG CLIP:\n{ts_transcript}"
+    model = get_openai_model_fast()
+    prompt_estimate = estimate_tokens_rough(system + user)
+
+    clip_id = str(clip.get("_wid") or f"split-{t0:.0f}")
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.25,
-            max_tokens=1800,
-            response_format={"type": "json_object"},
+        response = call_openai_with_backoff(
+            client,
+            create_kwargs={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.25,
+                "max_tokens": 1800,
+                "response_format": {"type": "json_object"},
+            },
+            stage="clip_split",
+            model=model,
+            tracker=tracker,
+            prompt_estimate=prompt_estimate,
+            clip_id=clip_id,
         )
-        clip_id = str(clip.get("_wid") or f"split-{t0:.0f}")
-        tracker.record_openai_usage("clip_split", response.usage, clip_id=clip_id)
         data = _extract_json(response.choices[0].message.content or "{}")
         subs = data.get("sub_clips", [])
         if not isinstance(subs, list) or len(subs) < 2:

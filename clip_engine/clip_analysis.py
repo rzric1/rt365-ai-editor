@@ -16,8 +16,17 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from clip_engine.token_tracking import TokenTracker, get_tracker, reset_tracker
+from clip_engine.openai_resilience import (
+    OpenAICallContext,
+    call_openai_with_backoff,
+    estimate_tokens_rough,
+    get_call_context,
+    truncate_text_safe,
+)
+from config import get_openai_model_fast
 
 logger = logging.getLogger("clip_engine.clip_analysis")
 
@@ -205,10 +214,10 @@ Schema:
 }}"""
 
 
-def _build_user_prompt(region_label: str, chunk_text: str) -> str:
-    MAX_CHARS = 10_000
-    if len(chunk_text) > MAX_CHARS:
-        chunk_text = chunk_text[:MAX_CHARS] + "\n[section truncated]"
+def _build_user_prompt(region_label: str, chunk_text: str, max_chars: int | None = None) -> str:
+    ctx = get_call_context()
+    limit = max_chars if max_chars is not None else ctx.max_chunk_chars
+    chunk_text, _ = truncate_text_safe(chunk_text, limit, label=f"region_{region_label}")
     return f"TRANSCRIPT SECTION ({region_label}):\n{chunk_text}"
 
 
@@ -295,36 +304,56 @@ def _analyze_region(
     pass_focus: str = "",
     excluded_summary: str = "",
     tracker: TokenTracker | None = None,
+    model: str | None = None,
+    progress: Any | None = None,
+    cache_key: str = "",
 ) -> list[dict]:
     """Call OpenAI for one transcript region. Returns validated clips."""
+    from clip_engine.analysis_cache import AnalysisProgress, save_progress
+
     tracker = tracker or get_tracker()
+    model = model or get_openai_model_fast()
     stage = f"clip_analysis_{pass_name}_{region_label}"
+
+    if progress and isinstance(progress, AnalysisProgress):
+        if progress.is_done(pass_name, region_label):
+            logger.info("Skipping completed step: %s / %s", pass_name, region_label)
+            return []
+
     system_prompt = _build_system_prompt(
         settings, region_label, optional_note, pass_focus, excluded_summary
     )
     user_prompt = _build_user_prompt(region_label, chunk_text)
+    prompt_estimate = estimate_tokens_rough(system_prompt + user_prompt)
 
     raw_response = None
     last_error = None
+    create_kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 3500,
+        "response_format": {"type": "json_object"},
+    }
 
     for attempt in range(1, settings.retry_attempts + 1):
         try:
             logger.info(
-                "Region '%s' pass '%s' attempt %d/%d",
-                region_label, pass_name, attempt, settings.retry_attempts,
+                "Region '%s' pass '%s' attempt %d/%d model=%s est_tokens=%d",
+                region_label, pass_name, attempt, settings.retry_attempts, model, prompt_estimate,
             )
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=3500,
-                response_format={"type": "json_object"},
+            response = call_openai_with_backoff(
+                client,
+                create_kwargs=create_kwargs,
+                stage=stage,
+                model=model,
+                tracker=tracker,
+                prompt_estimate=prompt_estimate,
             )
             raw_response = response.choices[0].message.content or ""
-            tracker.record_openai_usage(stage, response.usage)
             data = _extract_json(raw_response)
             clips_raw = data.get("clips", [])
             if not isinstance(clips_raw, list):
@@ -357,6 +386,14 @@ def _analyze_region(
             c["warnings"].extend(issues)
         else:
             validated.append(c)
+
+    if progress and isinstance(progress, AnalysisProgress) and cache_key:
+        progress.mark_done(pass_name, region_label)
+        progress.partial_candidates.extend(validated)
+        progress.partial_candidates = dedupe_candidates_by_time(
+            progress.partial_candidates, min_gap_seconds=10.0,
+        )
+        save_progress(progress)
 
     logger.info(
         "Region '%s' pass '%s': %d raw -> %d valid clips",
@@ -426,6 +463,9 @@ def collect_candidates_multipass(
     *,
     region_filter: tuple[str, ...] | None = None,
     max_pass_rounds: int = 1,
+    progress: Any | None = None,
+    cache_key: str = "",
+    model: str | None = None,
 ) -> list[dict]:
     """Run analysis passes until candidate pool reaches pool_target (or rounds exhausted)."""
     import openai
@@ -433,6 +473,8 @@ def collect_candidates_multipass(
     settings = prompt_settings or ClipPromptSettings()
     tracker = tracker or get_tracker()
     client = openai.OpenAI(api_key=api_key)
+    model = model or get_openai_model_fast()
+    ctx = get_call_context()
 
     if segments and media_duration > 0:
         chunks = _chunk_transcript_by_time(segments, media_duration, settings.n_transcript_chunks)
@@ -448,10 +490,16 @@ def collect_candidates_multipass(
     if passes:
         pass_list = [(p, pass_map.get(p, "")) for p in passes if p in pass_map]
     else:
-        pass_list = list(PASS_DEFINITIONS)
+        if ctx.token_saver_mode:
+            pass_list = list(PASS_DEFINITIONS[:2])  # primary + gems
+        else:
+            pass_list = list(PASS_DEFINITIONS)
 
     excluded_summary = _summarize_excluded_clips(exclude_clips or [])
     all_candidates: list[dict] = []
+
+    if progress and getattr(progress, "partial_candidates", None):
+        all_candidates = list(progress.partial_candidates)
 
     for _round in range(max(1, max_pass_rounds)):
         if len(all_candidates) >= pool_target and passes:
@@ -468,11 +516,13 @@ def collect_candidates_multipass(
                     pass_focus=pass_focus,
                     excluded_summary=excluded_summary if pass_name == "expansion" else "",
                     tracker=tracker,
+                    model=model,
+                    progress=progress,
+                    cache_key=cache_key,
                 )
                 all_candidates.extend(region_clips)
                 all_candidates = dedupe_candidates_by_time(all_candidates, min_gap_seconds=10.0)
-            # Only skip remaining passes when pool is well above target (default 3-pass mode)
-            if not passes and len(all_candidates) >= pool_target * 2:
+            if not passes and len(all_candidates) >= pool_target * (1 if ctx.token_saver_mode else 2):
                 break
         if len(all_candidates) >= pool_target:
             break

@@ -12,6 +12,13 @@ from typing import Any
 
 from clip_engine.transcription_utils import extract_transcript_excerpt, extract_transcript_window
 from clip_engine.token_tracking import TokenTracker, get_tracker
+from clip_engine.openai_resilience import (
+    call_openai_with_backoff,
+    estimate_tokens_rough,
+    get_call_context,
+    truncate_text_safe,
+)
+from config import get_openai_model
 
 logger = logging.getLogger("clip_engine.clip_metadata")
 
@@ -95,19 +102,29 @@ Output ONLY valid JSON with keys:
 hook_title, selection_reason, ai_context_reason, dominant_signal, platform_fit, grounding_confidence"""
 
     user = f"FINAL CLIP TRANSCRIPT (only source of truth):\n{window_text[:8000]}"
+    user, _ = truncate_text_safe(user, 8200, label="grounding_window")
+    prompt_estimate = estimate_tokens_rough(system + user)
+    model = get_openai_model()
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-            max_tokens=600,
-            response_format={"type": "json_object"},
+        response = call_openai_with_backoff(
+            client,
+            create_kwargs={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 600,
+                "response_format": {"type": "json_object"},
+            },
+            stage="metadata_grounding",
+            model=model,
+            tracker=tracker,
+            prompt_estimate=prompt_estimate,
+            clip_id=clip_id,
         )
-        tracker.record_openai_usage("metadata_grounding", response.usage, clip_id=clip_id)
         raw = response.choices[0].message.content or "{}"
         start = raw.find("{")
         end = raw.rfind("}")
@@ -168,6 +185,9 @@ def ground_clip_metadata_against_window(
         or score < min_confidence
         or len(window_text.split()) < 8
     )
+    ctx = get_call_context()
+    if ctx.token_saver_mode and not force_regenerate and score >= min_confidence and not timing_shifted:
+        needs_regen = False
 
     clip_id = str(c.get("_wid") or f"{t0:.1f}-{t1:.1f}")
 
@@ -236,13 +256,16 @@ def ground_all_clips_metadata(
     *,
     tracker: TokenTracker | None = None,
     force_regenerate: bool = False,
+    skip_strong_grounding: bool = False,
 ) -> list[dict]:
     """Ground metadata for every clip in the list."""
     tracker = tracker or get_tracker()
+    ctx = get_call_context()
+    effective_force = force_regenerate and not (ctx.token_saver_mode and skip_strong_grounding)
     out: list[dict] = []
     for c in clips:
         grounded = ground_clip_metadata_against_window(
-            c, segments, api_key, tracker=tracker, force_regenerate=force_regenerate
+            c, segments, api_key, tracker=tracker, force_regenerate=effective_force
         )
         out.append(grounded)
     logger.info("Grounded metadata for %d clips", len(out))
