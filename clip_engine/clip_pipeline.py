@@ -48,6 +48,14 @@ class PipelineOpenAIConfig:
 class PipelineStats:
     target_clips: int = 20
     raw_candidates: int = 0
+    raw_ai_candidates: int = 0
+    valid_after_schema: int = 0
+    rescued_candidates: int = 0
+    local_fallback_candidates: int = 0
+    rejected_invalid_time: int = 0
+    rejected_duration: int = 0
+    rejected_empty_transcript: int = 0
+    rejected_overlap_early: int = 0
     removed_overlap: int = 0
     removed_duplicates: int = 0
     after_diversity: int = 0
@@ -56,6 +64,7 @@ class PipelineStats:
     expansion_pass_ran: bool = False
     expansion_pass_count: int = 0
     rejected_ungrounded: int = 0
+    discovery_mode: bool = False
     warnings: list[str] = field(default_factory=list)
     cache_hit: bool = False
     resumed_from_progress: bool = False
@@ -67,6 +76,14 @@ class PipelineStats:
         return {
             "target_clips": self.target_clips,
             "raw_candidates": self.raw_candidates,
+            "raw_ai_candidates": self.raw_ai_candidates,
+            "valid_after_schema": self.valid_after_schema,
+            "rescued_candidates": self.rescued_candidates,
+            "local_fallback_candidates": self.local_fallback_candidates,
+            "rejected_invalid_time": self.rejected_invalid_time,
+            "rejected_duration": self.rejected_duration,
+            "rejected_empty_transcript": self.rejected_empty_transcript,
+            "rejected_overlap_early": self.rejected_overlap_early,
             "removed_overlap": self.removed_overlap,
             "removed_duplicates": self.removed_duplicates,
             "after_diversity": self.after_diversity,
@@ -75,6 +92,7 @@ class PipelineStats:
             "expansion_pass_ran": self.expansion_pass_ran,
             "expansion_pass_count": self.expansion_pass_count,
             "rejected_ungrounded": self.rejected_ungrounded,
+            "discovery_mode": self.discovery_mode,
             "warnings": self.warnings,
             "cache_hit": self.cache_hit,
             "resumed_from_progress": self.resumed_from_progress,
@@ -102,6 +120,7 @@ from clip_engine.clip_expand import ClipExpansionSettings, finalize_clips_after_
 from clip_engine.clip_metadata import ground_all_clips_metadata
 from clip_engine.clip_split import split_long_clips
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
+from clip_engine.clip_discovery import empty_pool_stats, generate_local_fallback_candidates
 from clip_engine.clip_signals import apply_signal_boosts_to_clips
 from clip_engine.speaker_signals import apply_speaker_signals_to_clips
 from clip_engine.openai_resilience import (
@@ -140,10 +159,13 @@ def _run_expansion_passes(
     profile_min_score: int,
     max_rounds: int = 3,
     token_saver_mode: bool = True,
+    discovery_mode: bool = False,
 ) -> tuple[list[dict], list[dict], int]:
     """Run up to max_rounds expansion passes when selected count is below target."""
-    if token_saver_mode:
+    if token_saver_mode and not discovery_mode:
         max_rounds = min(max_rounds, 1)
+    elif discovery_mode:
+        max_rounds = min(max_rounds, 2)
     rounds = 0
     merged_candidates = list(candidates)
 
@@ -214,6 +236,7 @@ def run_full_clip_pipeline(
     enable_signal_boosts: bool = True,
     enable_speaker_signals: bool = True,
     openai_config: PipelineOpenAIConfig | None = None,
+    discovery_mode: bool = False,
 ) -> tuple[list[dict], PipelineStats, TokenTracker]:
     """
     Full clip pipeline:
@@ -226,8 +249,9 @@ def run_full_clip_pipeline(
       7. Metadata grounding on final windows
     """
     tracker = reset_tracker(video_filename=video_filename)
-    stats = PipelineStats(target_clips=target_count)
+    stats = PipelineStats(target_clips=target_count, discovery_mode=discovery_mode)
     oai = openai_config or PipelineOpenAIConfig()
+    pool_stats = empty_pool_stats()
     model_fast = get_openai_model_fast()
     model_quality = get_openai_model()
     stats.model_fast = model_fast
@@ -315,21 +339,30 @@ def run_full_clip_pipeline(
     ctx_b = context_before if context_before is not None else profile.context_before
     ctx_a = context_after if context_after is not None else profile.context_after
 
-    pool_multiplier = 1.5 if oai.token_saver_mode else 3.0
-    pool_target = max(int(target_count * pool_multiplier), 30 if oai.token_saver_mode else 45)
+    if discovery_mode:
+        pool_multiplier = 2.5 if oai.token_saver_mode else 3.0
+        pool_target = max(int(target_count * pool_multiplier), 50 if oai.token_saver_mode else 60)
+    else:
+        pool_multiplier = 1.5 if oai.token_saver_mode else 3.0
+        pool_target = max(int(target_count * pool_multiplier), 30 if oai.token_saver_mode else 45)
     max_clips_region = profile.max_clips_per_region
-    if oai.token_saver_mode:
+    if oai.token_saver_mode and not discovery_mode:
         max_clips_region = max(6, int(max_clips_region * 0.65))
+    elif discovery_mode:
+        max_clips_region = min(22, max_clips_region + 4)
 
+    score_floor = max(38, profile.min_score - (15 if discovery_mode else 0))
     prompt_settings = ClipPromptSettings(
-        min_clip_seconds=max(user_min_seconds, profile.ideal_min_seconds * 0.85),
+        min_clip_seconds=max(user_min_seconds, profile.ideal_min_seconds * (0.75 if discovery_mode else 0.85)),
         max_clip_seconds=profile.ai_max_clip_seconds,
         ideal_min_seconds=profile.ideal_min_seconds,
         ideal_max_seconds=profile.ideal_max_seconds,
         max_clips=max_clips_region,
-        min_score=profile.min_score,
+        min_score=score_floor,
         n_transcript_chunks=5,
     )
+
+    min_acceptable = max(12, int(target_count * 0.6))
 
     try:
         candidates = collect_candidates_multipass(
@@ -345,20 +378,30 @@ def run_full_clip_pipeline(
             progress=progress,
             cache_key=cache_key,
             model=model_fast,
+            discovery_mode=discovery_mode,
+            pool_stats=pool_stats,
         )
-        candidates = dedupe_candidates_by_time(candidates, min_gap_seconds=12.0)
+        early_gap = 8.0 if discovery_mode else 12.0
+        candidates = dedupe_candidates_by_time(candidates, min_gap_seconds=early_gap)
         stats.raw_candidates = len(candidates)
+        stats.raw_ai_candidates = pool_stats.get("raw_ai_candidates", 0)
+        stats.valid_after_schema = pool_stats.get("valid_after_schema", 0)
+        stats.rescued_candidates = pool_stats.get("rescued_candidates", 0)
+        stats.rejected_invalid_time = pool_stats.get("rejected_invalid_time", 0)
+        stats.rejected_duration = pool_stats.get("rejected_duration", 0)
+        stats.rejected_empty_transcript = pool_stats.get("rejected_empty_transcript", 0)
+        stats.rejected_overlap_early = pool_stats.get("rejected_overlap_early", 0)
         logger.info("Candidate pool after multipass: %d (target pool=%d)", len(candidates), pool_target)
 
-        # If pool still too small, run another collection (skip in token saver unless very low)
-        if len(candidates) < pool_target and not oai.token_saver_mode:
+        # Boost collection when pool is still small (always in discovery mode; full mode otherwise)
+        if len(candidates) < pool_target and (discovery_mode or not oai.token_saver_mode):
             boost_settings = ClipPromptSettings(
                 min_clip_seconds=prompt_settings.min_clip_seconds,
                 max_clip_seconds=prompt_settings.max_clip_seconds,
                 ideal_min_seconds=prompt_settings.ideal_min_seconds,
                 ideal_max_seconds=prompt_settings.ideal_max_seconds,
                 max_clips=min(prompt_settings.max_clips + 4, 22),
-                min_score=max(42, profile.min_score - 5),
+                min_score=max(38, score_floor - 5),
                 n_transcript_chunks=5,
             )
             extra_pool = collect_candidates_multipass(
@@ -374,9 +417,37 @@ def run_full_clip_pipeline(
                 progress=progress,
                 cache_key=cache_key,
                 model=model_fast,
+                discovery_mode=discovery_mode,
+                pool_stats=pool_stats,
             )
-            candidates = dedupe_candidates_by_time(candidates + extra_pool, min_gap_seconds=10.0)
+            candidates = dedupe_candidates_by_time(candidates + extra_pool, min_gap_seconds=early_gap)
             stats.raw_candidates = len(candidates)
+            stats.raw_ai_candidates = pool_stats.get("raw_ai_candidates", stats.raw_ai_candidates)
+            stats.valid_after_schema = pool_stats.get("valid_after_schema", stats.valid_after_schema)
+            stats.rescued_candidates = pool_stats.get("rescued_candidates", stats.rescued_candidates)
+
+        min_acceptable = max(12, int(target_count * 0.6))
+        if len(candidates) < min_acceptable and segments:
+            fallback = generate_local_fallback_candidates(
+                segments,
+                media_duration,
+                clip_style=style_name,
+                profile=profile,
+                target_count=target_count,
+                existing=candidates,
+                min_gap_seconds=max(25.0, min_gap_seconds * 0.85),
+                user_min_seconds=user_min_seconds,
+                user_max_seconds=user_max_seconds,
+            )
+            if fallback:
+                candidates = dedupe_candidates_by_time(
+                    candidates + fallback, min_gap_seconds=early_gap
+                )
+                stats.local_fallback_candidates = len(fallback)
+                stats.raw_candidates = len(candidates)
+                stats.warnings.append(
+                    f"Added {len(fallback)} local transcript-window fallback candidate(s) (no extra GPT calls)."
+                )
 
         # Diversity on AI core windows BEFORE expansion
         selected, div_stats = run_diversity_pipeline(
@@ -394,7 +465,7 @@ def run_full_clip_pipeline(
         stats.removed_duplicates = div_stats.removed_duplicates
         stats.after_diversity = len(selected)
 
-        if len(selected) < target_count and candidates:
+        if len(selected) < target_count and candidates and (discovery_mode or not oai.token_saver_mode or len(selected) < 12):
             stats.expansion_pass_ran = True
             candidates, selected, exp_rounds = _run_expansion_passes(
                 formatted=formatted,
@@ -413,9 +484,40 @@ def run_full_clip_pipeline(
                 profile_min_score=profile.min_score,
                 max_rounds=3,
                 token_saver_mode=oai.token_saver_mode,
+                discovery_mode=discovery_mode,
             )
             stats.expansion_pass_count = exp_rounds
             stats.after_diversity = len(selected)
+
+        if len(selected) < min_acceptable and segments:
+            fallback_sel = generate_local_fallback_candidates(
+                segments,
+                media_duration,
+                clip_style=style_name,
+                profile=profile,
+                target_count=target_count,
+                existing=candidates,
+                min_gap_seconds=max(25.0, min_gap_seconds * 0.75),
+                user_min_seconds=user_min_seconds,
+                user_max_seconds=user_max_seconds,
+            )
+            if fallback_sel:
+                merged = dedupe_candidates_by_time(candidates + fallback_sel, min_gap_seconds=early_gap)
+                stats.local_fallback_candidates += len(fallback_sel)
+                selected, div2 = run_diversity_pipeline(
+                    merged,
+                    media_duration=media_duration,
+                    target_count=target_count,
+                    min_gap_seconds=min_gap_seconds,
+                    similarity_threshold=similarity_threshold,
+                    n_regions=5,
+                    min_per_region=1 if discovery_mode else 1,
+                    relax_if_under_target=True,
+                    return_stats=True,
+                )
+                stats.removed_overlap += div2.removed_overlap
+                stats.removed_duplicates += div2.removed_duplicates
+                stats.after_diversity = len(selected)
 
         selected = split_long_clips(
             selected,
@@ -484,10 +586,21 @@ def run_full_clip_pipeline(
         )
 
         grounded: list[dict] = []
+        ungrounded_floor = 8 if discovery_mode else 15
         for c in selected:
             conf = int(c.get("grounding_confidence", 0))
             excerpt = str(c.get("grounded_transcript_excerpt", "")).strip()
-            if conf < 15 or (len(excerpt.split()) < 6 and not c.get("metadata_grounded")):
+            is_local = c.get("source") == "local_transcript_window"
+            if is_local and discovery_mode:
+                grounded.append(c)
+                continue
+            if conf < ungrounded_floor or (
+                len(excerpt.split()) < 6 and not c.get("metadata_grounded")
+            ):
+                if discovery_mode and conf >= 5 and len(excerpt.split()) >= 4:
+                    c.setdefault("warnings", []).append("Low grounding confidence (kept in Discovery Mode).")
+                    grounded.append(c)
+                    continue
                 stats.rejected_ungrounded += 1
                 logger.info(
                     "Rejected ungrounded clip: %s (confidence=%d)",
@@ -506,13 +619,22 @@ def run_full_clip_pipeline(
 
         stats.final_clips = len(selected)
 
-        if stats.final_clips < 15:
+        if stats.final_clips < 12:
             stats.warnings.append(
-                f"Only {stats.final_clips} clips found. Try Micro clips mode or lower minimum score."
+                f"Only {stats.final_clips} clips found (target 12+). "
+                "Enable Discovery Mode to rescue borderline moments and add local transcript-window candidates."
+            )
+        elif stats.final_clips < 15:
+            stats.warnings.append(
+                f"Only {stats.final_clips} clips found (preferred 15–20 for long podcasts)."
             )
         elif stats.final_clips < stats.target_clips:
             stats.warnings.append(
                 f"Found {stats.final_clips} of {stats.target_clips} requested clips."
+            )
+        if discovery_mode and stats.final_clips < stats.target_clips:
+            stats.warnings.append(
+                "Discovery Mode is ON — quantity-first ranking with duplicate protection."
             )
         if stats.rejected_ungrounded:
             stats.warnings.append(

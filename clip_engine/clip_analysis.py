@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from clip_engine.token_tracking import TokenTracker, get_tracker, reset_tracker
+from clip_engine.clip_discovery import empty_pool_stats, process_raw_clips
 from clip_engine.openai_resilience import (
     JSON_STRICT_RULES,
     call_openai_chat_json,
@@ -176,7 +177,8 @@ RULES:
 - Score each clip across these dimensions (0-100 each):
 {dim_list}
 - Compute composite_score = weighted average (weight hook_strength and ending_strength 1.5x).
-- Only return clips with composite_score >= {settings.min_score}.
+- Prefer clips with composite_score >= {settings.min_score}, but include strong borderline moments when unsure.
+- Return as many distinct strong moments as you can find in this section (up to {settings.max_clips}).
 - For caption_style choose one of: Clean | Bold Viral | Podcast | Minimal
 - For platform_fit list applicable: TikTok | YouTube Shorts | Instagram Reels | LinkedIn
 
@@ -231,26 +233,6 @@ ANALYSIS_JSON_SCHEMA_HINT = (
 # Validation
 # ---------------------------------------------------------------------------
 
-def _validate_clip(c: dict, settings: ClipPromptSettings) -> list[str]:
-    issues = []
-    t0 = float(c.get("start_seconds", 0))
-    t1 = float(c.get("end_seconds", 0))
-    dur = t1 - t0
-    if dur < settings.min_clip_seconds:
-        issues.append(f"Too short: {dur:.1f}s")
-    if dur > settings.max_clip_seconds:
-        issues.append(f"Too long: {dur:.1f}s")
-    if t0 < 0:
-        issues.append("Negative start")
-    if t1 <= t0:
-        issues.append("end <= start")
-    if int(c.get("composite_score", 0)) < settings.min_score:
-        issues.append(f"Score {c.get('composite_score')} < {settings.min_score}")
-    if not str(c.get("hook_title", "")).strip():
-        issues.append("Missing hook_title")
-    return issues
-
-
 # ---------------------------------------------------------------------------
 # Sentence-boundary snapping
 # ---------------------------------------------------------------------------
@@ -298,8 +280,12 @@ def _analyze_region(
     model: str | None = None,
     progress: Any | None = None,
     cache_key: str = "",
+    discovery_mode: bool = False,
+    segments: list[dict] | None = None,
+    media_duration: float = 0.0,
+    region_stats: dict[str, int] | None = None,
 ) -> list[dict]:
-    """Call OpenAI for one transcript region. Returns validated clips."""
+    """Call OpenAI for one transcript region. Returns validated/rescued clips."""
     from clip_engine.analysis_cache import AnalysisProgress, save_progress
 
     tracker = tracker or get_tracker()
@@ -351,18 +337,29 @@ def _analyze_region(
         )
         return []
 
-    validated = []
-    for c in clips_raw:
-        c = dict(c)
-        c["_region"] = region_label
-        c["_pass"] = pass_name
-        issues = _validate_clip(c, settings)
-        if issues:
-            logger.debug("Clip rejected in region '%s': %s", region_label, issues)
-            c.setdefault("warnings", [])
-            c["warnings"].extend(issues)
-        else:
-            validated.append(c)
+    min_score = settings.min_score - 12 if discovery_mode else settings.min_score
+    validated, rs = process_raw_clips(
+        clips_raw,
+        min_clip_seconds=settings.min_clip_seconds,
+        max_clip_seconds=settings.max_clip_seconds,
+        min_score=min_score,
+        discovery_mode=discovery_mode,
+        segments=segments,
+        media_duration=media_duration,
+        region_label=region_label,
+        pass_name=pass_name,
+    )
+    if region_stats is not None:
+        region_stats["raw_ai_candidates"] = region_stats.get("raw_ai_candidates", 0) + rs["raw"]
+        region_stats["valid_after_schema"] = region_stats.get("valid_after_schema", 0) + rs["valid"]
+        region_stats["rescued_candidates"] = region_stats.get("rescued_candidates", 0) + rs["rescued"]
+        region_stats["rejected_invalid_time"] = region_stats.get("rejected_invalid_time", 0) + rs[
+            "rejected_invalid_time"
+        ]
+        region_stats["rejected_duration"] = region_stats.get("rejected_duration", 0) + rs["rejected_duration"]
+        region_stats["rejected_empty_transcript"] = region_stats.get("rejected_empty_transcript", 0) + rs[
+            "rejected_empty_transcript"
+        ]
 
     if progress and isinstance(progress, AnalysisProgress) and cache_key:
         progress.mark_done(pass_name, region_label)
@@ -443,6 +440,8 @@ def collect_candidates_multipass(
     progress: Any | None = None,
     cache_key: str = "",
     model: str | None = None,
+    discovery_mode: bool = False,
+    pool_stats: dict[str, int] | None = None,
 ) -> list[dict]:
     """Run analysis passes until candidate pool reaches pool_target (or rounds exhausted)."""
     import openai
@@ -467,13 +466,16 @@ def collect_candidates_multipass(
     if passes:
         pass_list = [(p, pass_map.get(p, "")) for p in passes if p in pass_map]
     else:
-        if ctx.token_saver_mode:
+        if discovery_mode:
+            pass_list = list(PASS_DEFINITIONS)
+        elif ctx.token_saver_mode:
             pass_list = list(PASS_DEFINITIONS[:2])  # primary + gems
         else:
             pass_list = list(PASS_DEFINITIONS)
 
     excluded_summary = _summarize_excluded_clips(exclude_clips or [])
     all_candidates: list[dict] = []
+    stats = pool_stats if pool_stats is not None else empty_pool_stats()
 
     if progress and getattr(progress, "partial_candidates", None):
         all_candidates = list(progress.partial_candidates)
@@ -483,6 +485,7 @@ def collect_candidates_multipass(
             break
         for pass_name, pass_focus in pass_list:
             for region_label, chunk_text in chunks:
+                before_dedupe = len(all_candidates)
                 region_clips = _analyze_region(
                     client,
                     region_label,
@@ -496,9 +499,17 @@ def collect_candidates_multipass(
                     model=model,
                     progress=progress,
                     cache_key=cache_key,
+                    discovery_mode=discovery_mode,
+                    segments=segments,
+                    media_duration=media_duration,
+                    region_stats=stats,
                 )
                 all_candidates.extend(region_clips)
-                all_candidates = dedupe_candidates_by_time(all_candidates, min_gap_seconds=10.0)
+                gap = 8.0 if discovery_mode else 10.0
+                all_candidates = dedupe_candidates_by_time(all_candidates, min_gap_seconds=gap)
+                stats["rejected_overlap_early"] = stats.get("rejected_overlap_early", 0) + max(
+                    0, before_dedupe + len(region_clips) - len(all_candidates)
+                )
             if not passes and len(all_candidates) >= pool_target * (1 if ctx.token_saver_mode else 2):
                 break
         if len(all_candidates) >= pool_target:

@@ -130,6 +130,8 @@ def _init_state() -> None:
         "cs_openai_call_delay": 0.75,
         "cs_openai_status": "",
         "cs_upload_reused": False,
+        "cs_discovery_mode": True,
+        "cs_long_defaults_applied": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -139,6 +141,24 @@ def _init_state() -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _apply_long_podcast_defaults() -> None:
+    """Apply recommended analysis defaults once for videos longer than 30 minutes."""
+    dur = float(st.session_state.get("cs_media_duration") or 0)
+    if dur < 30 * 60:
+        return
+    if st.session_state.get("cs_long_defaults_applied"):
+        return
+    st.session_state.cs_discovery_mode = True
+    st.session_state.cs_min_clip_seconds = 15
+    st.session_state.cs_max_clip_seconds = 90
+    st.session_state.cs_min_gap_seconds = 35
+    st.session_state.cs_similarity_threshold = 58
+    st.session_state.cs_max_tokens_budget = max(int(st.session_state.get("cs_max_tokens_budget", 60_000)), 120_000)
+    if str(st.session_state.get("cs_clip_style", "")) == "Balanced":
+        st.session_state.cs_clip_style = "Micro clips"
+    st.session_state.cs_long_defaults_applied = True
+
 
 def _uploaded_file_size_bytes(upload) -> int:
     try:
@@ -227,6 +247,7 @@ def _run_clip_analysis(
         enable_signal_boosts=bool(st.session_state.get("cs_enable_signal_boosts", True)),
         enable_speaker_signals=bool(st.session_state.get("cs_enable_signal_boosts", True)),
         openai_config=openai_config,
+        discovery_mode=bool(st.session_state.get("cs_discovery_mode", True)),
     )
 
     export_dict = tracker.to_export_dict(
@@ -518,6 +539,18 @@ def main() -> None:
             st.success(f"Cleared {n} cached analysis entries.")
 
         st.divider()
+        st.subheader("Discovery & coverage")
+        st.checkbox(
+            "Discovery Mode",
+            key="cs_discovery_mode",
+            help=(
+                "Quantity-first for long podcasts: relaxed validation, rescued borderline clips, "
+                "and local transcript-window fallbacks without extra GPT calls."
+            ),
+        )
+        if float(st.session_state.get("cs_media_duration") or 0) >= 30 * 60:
+            st.caption("Long video detected — Discovery Mode recommended (defaults applied once).")
+        st.divider()
         st.subheader("Diversity & coverage")
         st.selectbox(
             "Clip style",
@@ -580,6 +613,7 @@ def main() -> None:
                     st.session_state.cs_video_path = resolved
                     try:
                         st.session_state.cs_media_duration = get_media_duration_seconds(resolved)
+                        _apply_long_podcast_defaults()
                     except Exception:
                         logger.exception("ffprobe duration failed")
                     st.session_state.cs_status = f"Using local file: `{resolved}`"
@@ -624,6 +658,7 @@ def main() -> None:
                         st.session_state.cs_media_duration = 0.0
                     try:
                         st.session_state.cs_media_duration = get_media_duration_seconds(path)
+                        _apply_long_podcast_defaults()
                     except Exception:
                         logger.exception("ffprobe duration failed")
                     if reused:
@@ -705,6 +740,13 @@ def main() -> None:
                         st.session_state.cs_segments
                     )
                     st.session_state.cs_clips = []
+                    try:
+                        st.session_state.cs_media_duration = get_media_duration_seconds(
+                            Path(st.session_state.cs_video_path)
+                        )
+                    except Exception:
+                        pass
+                    _apply_long_podcast_defaults()
                     st.session_state.cs_status = (
                         f"Transcribed {len(segs)} raw segments -> "
                         f"{len(st.session_state.cs_segments)} sentence groups."
@@ -882,10 +924,23 @@ def main() -> None:
 
         if pipe_stats:
             st.caption(
-                f"Pipeline: **{pipe_stats.get('raw_candidates', '?')}** raw candidates | "
-                f"**{pipe_stats.get('removed_overlap', 0)}** removed (overlap) | "
-                f"**{pipe_stats.get('removed_duplicates', 0)}** removed (duplicates) | "
+                f"Pipeline pool: **{pipe_stats.get('raw_ai_candidates', pipe_stats.get('raw_candidates', '?'))}** "
+                f"raw AI | **{pipe_stats.get('valid_after_schema', '?')}** valid | "
+                f"**{pipe_stats.get('rescued_candidates', 0)}** rescued | "
+                f"**{pipe_stats.get('local_fallback_candidates', 0)}** local fallback | "
+                f"**{pipe_stats.get('raw_candidates', '?')}** in pool"
+            )
+            st.caption(
+                f"Rejected: **{pipe_stats.get('rejected_invalid_time', 0)}** time | "
+                f"**{pipe_stats.get('rejected_duration', 0)}** duration | "
+                f"**{pipe_stats.get('rejected_empty_transcript', 0)}** empty text | "
+                f"**{pipe_stats.get('rejected_overlap_early', 0)}** early overlap dedupe"
+            )
+            st.caption(
+                f"Selection: **{pipe_stats.get('removed_overlap', 0)}** overlap | "
+                f"**{pipe_stats.get('removed_duplicates', 0)}** duplicate similarity | "
                 f"**{pipe_stats.get('final_clips', len(clips))}** final"
+                + (" | Discovery Mode ON" if pipe_stats.get("discovery_mode") else "")
                 + (
                     f" | models: `{pipe_stats.get('model_fast', 'n/a')}` / `{pipe_stats.get('model_quality', 'n/a')}`"
                 )
@@ -907,6 +962,12 @@ def main() -> None:
                     else ""
                 )
             )
+            if int(pipe_stats.get("final_clips", len(clips))) < 12:
+                st.warning(
+                    "Only "
+                    f"{pipe_stats.get('final_clips', len(clips))} clips found. Discovery Mode can rescue "
+                    "borderline moments and add local transcript-window candidates."
+                )
             for w in pipe_stats.get("warnings", []):
                 st.warning(w)
 
