@@ -7,26 +7,25 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 from clip_engine.transcription_utils import detect_pauses, segments_to_prompt_transcript
 from clip_engine.token_tracking import TokenTracker, get_tracker
-from clip_engine.openai_resilience import call_openai_with_backoff, estimate_tokens_rough, get_call_context
+from clip_engine.openai_resilience import (
+    JSON_STRICT_RULES,
+    call_openai_chat_json,
+    estimate_tokens_rough,
+    get_call_context,
+)
 from config import get_openai_model_fast
 
 logger = logging.getLogger("clip_engine.clip_split")
 
 
-def _extract_json(raw: str) -> dict:
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE).strip()
-    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("No JSON in split response")
-    return json.loads(raw[start : end + 1])
+SPLIT_JSON_SCHEMA_HINT = (
+    '{"sub_clips": [{"start_seconds": 0, "end_seconds": 0, "hook_title": "", '
+    '"composite_score": 0, "selection_reason": "", "dominant_signal": ""}]}'
+)
 
 
 def _heuristic_split_by_pauses(
@@ -125,7 +124,9 @@ Rules:
 - Use EXACT timestamps from transcript
 - Do NOT overlap sub-clips in time
 - Prefer ONE powerful idea per sub-clip
-Output ONLY JSON:
+Return ONLY valid JSON. No markdown. No code fences. No explanations.
+{JSON_STRICT_RULES}
+Schema:
 {{"sub_clips": [{{"start_seconds": 0, "end_seconds": 0, "hook_title": "", "composite_score": 70, "selection_reason": "", "dominant_signal": "educational"}}]}}"""
 
     user = f"TRANSCRIPT INSIDE LONG CLIP:\n{ts_transcript}"
@@ -135,25 +136,24 @@ Output ONLY JSON:
     clip_id = str(clip.get("_wid") or f"split-{t0:.0f}")
 
     try:
-        response = call_openai_with_backoff(
+        data = call_openai_chat_json(
             client,
-            create_kwargs={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.25,
-                "max_tokens": 1800,
-                "response_format": {"type": "json_object"},
-            },
-            stage="clip_split",
             model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.25,
+            max_tokens=1800,
+            response_format={"type": "json_object"},
+            stage="clip_split",
+            schema_hint=SPLIT_JSON_SCHEMA_HINT,
             tracker=tracker,
             prompt_estimate=prompt_estimate,
             clip_id=clip_id,
         )
-        data = _extract_json(response.choices[0].message.content or "{}")
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected JSON object, got {type(data).__name__}")
         subs = data.get("sub_clips", [])
         if not isinstance(subs, list) or len(subs) < 2:
             return _heuristic_split_by_pauses(

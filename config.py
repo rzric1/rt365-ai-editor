@@ -37,10 +37,12 @@ DEFAULT_JSON_PATH: Path = TRANSCRIPTS_DIR / "input.json"
 ENV_OPENAI_API_KEY: str = "OPENAI_API_KEY"
 ENV_OPENAI_MODEL: str = "OPENAI_MODEL"
 ENV_OPENAI_MODEL_FAST: str = "OPENAI_MODEL_FAST"
+ENV_OPENAI_MODEL_JSON_FALLBACK: str = "OPENAI_MODEL_JSON_FALLBACK"
 
 # Optional absolute path to ffmpeg (or ffmpeg.exe on Windows). Loaded via .env / process env.
 ENV_FFMPEG_BINARY: str = "FFMPEG_BINARY"
 DEFAULT_OPENAI_MODEL: str = "gpt-5-mini"
+DEFAULT_OPENAI_MODEL_JSON_FALLBACK: str = "gpt-4o-mini"
 
 # Frame rate for the last field (FF) in bracket transcripts: [HH:MM:SS:FF - ...]
 ENV_TRANSCRIPT_BRACKET_FPS: str = "TRANSCRIPT_BRACKET_FPS"
@@ -95,6 +97,14 @@ def get_openai_model_fast() -> str:
     if fast:
         return fast
     return get_openai_model()
+
+
+def get_openai_model_json_fallback() -> str:
+    """Reliable JSON model when gpt-5* returns empty or unparseable output."""
+    fb = os.environ.get(ENV_OPENAI_MODEL_JSON_FALLBACK, "").strip()
+    if fb:
+        return fb
+    return DEFAULT_OPENAI_MODEL_JSON_FALLBACK
 
 
 def get_transcript_bracket_fps() -> float:

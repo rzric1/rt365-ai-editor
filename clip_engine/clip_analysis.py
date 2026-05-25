@@ -12,16 +12,14 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from clip_engine.token_tracking import TokenTracker, get_tracker, reset_tracker
 from clip_engine.openai_resilience import (
-    OpenAICallContext,
-    call_openai_with_backoff,
+    JSON_STRICT_RULES,
+    call_openai_chat_json,
     estimate_tokens_rough,
     get_call_context,
     truncate_text_safe,
@@ -182,7 +180,8 @@ RULES:
 - For caption_style choose one of: Clean | Bold Viral | Podcast | Minimal
 - For platform_fit list applicable: TikTok | YouTube Shorts | Instagram Reels | LinkedIn
 
-OUTPUT: Respond with ONLY valid JSON, no markdown, no explanation outside JSON.
+OUTPUT: Respond with ONLY valid JSON. No markdown. No code fences. No explanations.
+{JSON_STRICT_RULES}
 Schema:
 {{
   "clips": [
@@ -221,19 +220,11 @@ def _build_user_prompt(region_label: str, chunk_text: str, max_chars: int | None
     return f"TRANSCRIPT SECTION ({region_label}):\n{chunk_text}"
 
 
-# ---------------------------------------------------------------------------
-# JSON parsing
-# ---------------------------------------------------------------------------
-
-def _extract_json(raw: str) -> dict:
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE).strip()
-    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(raw[start:end + 1])
+ANALYSIS_JSON_SCHEMA_HINT = (
+    '{"clips": [{"rank": 1, "start_seconds": 0, "end_seconds": 0, "hook_title": "", '
+    '"composite_score": 0, "scores": {}, "dominant_signal": "", "selection_reason": "", '
+    '"ai_context_reason": "", "caption_style": "", "platform_fit": [], "warnings": []}]}'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -326,51 +317,37 @@ def _analyze_region(
     user_prompt = _build_user_prompt(region_label, chunk_text)
     prompt_estimate = estimate_tokens_rough(system_prompt + user_prompt)
 
-    raw_response = None
-    last_error = None
-    create_kwargs = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 3500,
-        "response_format": {"type": "json_object"},
-    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    for attempt in range(1, settings.retry_attempts + 1):
-        try:
-            logger.info(
-                "Region '%s' pass '%s' attempt %d/%d model=%s est_tokens=%d",
-                region_label, pass_name, attempt, settings.retry_attempts, model, prompt_estimate,
-            )
-            response = call_openai_with_backoff(
-                client,
-                create_kwargs=create_kwargs,
-                stage=stage,
-                model=model,
-                tracker=tracker,
-                prompt_estimate=prompt_estimate,
-            )
-            raw_response = response.choices[0].message.content or ""
-            data = _extract_json(raw_response)
-            clips_raw = data.get("clips", [])
-            if not isinstance(clips_raw, list):
-                raise ValueError("'clips' not a list")
-            break
-        except (json.JSONDecodeError, ValueError) as e:
-            last_error = e
-            logger.warning(
-                "Region '%s' pass '%s' parse failed attempt %d: %s",
-                region_label, pass_name, attempt, e,
-            )
-            if attempt < settings.retry_attempts:
-                time.sleep(settings.retry_delay_seconds)
-    else:
+    try:
+        logger.info(
+            "Region '%s' pass '%s' model=%s est_tokens=%d",
+            region_label, pass_name, model, prompt_estimate,
+        )
+        data = call_openai_chat_json(
+            client,
+            model=model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=3500,
+            response_format={"type": "json_object"},
+            stage=stage,
+            schema_hint=ANALYSIS_JSON_SCHEMA_HINT,
+            tracker=tracker,
+            prompt_estimate=prompt_estimate,
+        )
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected JSON object, got {type(data).__name__}")
+        clips_raw = data.get("clips", [])
+        if not isinstance(clips_raw, list):
+            raise ValueError("'clips' not a list")
+    except (json.JSONDecodeError, ValueError, RuntimeError) as e:
         logger.error(
-            "Region '%s' pass '%s' failed after %d attempts: %s",
-            region_label, pass_name, settings.retry_attempts, last_error,
+            "Region '%s' pass '%s' failed (parse/repair exhausted): %s",
+            region_label, pass_name, e,
         )
         return []
 

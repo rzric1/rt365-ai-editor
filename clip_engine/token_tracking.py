@@ -60,6 +60,8 @@ class TokenTracker:
         total = total_tokens if total_tokens is not None else prompt_tokens + completion_tokens
         if stage not in self.stages:
             self.stages[stage] = StageUsage(stage=stage, model=model)
+        else:
+            self.stages[stage].model = model
         self.stages[stage].add(prompt_tokens, completion_tokens, total)
 
         if clip_id:

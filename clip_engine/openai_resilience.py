@@ -6,6 +6,7 @@ Stdlib-only — no new dependencies.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -20,6 +21,14 @@ logger = logging.getLogger("clip_engine.openai_resilience")
 # Rough chars-per-token for English transcript + prompts
 CHARS_PER_TOKEN = 4
 DEFAULT_MAX_PROMPT_TOKENS = 12_000
+
+JSON_STRICT_RULES = """CRITICAL OUTPUT RULES:
+- Return ONLY valid JSON.
+- No markdown. No code fences. No explanations. No commentary.
+- The first character must be { or [.
+- The last character must be } or ].
+- Use double quotes for all keys and strings.
+- Do not include trailing commas."""
 
 
 @dataclass
@@ -170,6 +179,482 @@ def truncate_text_safe(text: str, max_chars: int, *, label: str = "text") -> tup
     return truncated, True
 
 
+def model_is_gpt5_family(model: str) -> bool:
+    """True for gpt-5* models that may return empty JSON completions."""
+    return (model or "").lower().strip().startswith("gpt-5")
+
+
+def resolve_json_fallback_model(primary_model: str) -> str | None:
+    """Return JSON fallback model when primary is gpt-5*, else None."""
+    if not model_is_gpt5_family(primary_model):
+        return None
+    from config import get_openai_model_json_fallback
+
+    fallback = get_openai_model_json_fallback().strip()
+    if not fallback or fallback.lower() == (primary_model or "").lower().strip():
+        return None
+    return fallback
+
+
+def model_uses_max_completion_tokens(model: str) -> bool:
+    """True for gpt-5* and similar models that prefer max_completion_tokens."""
+    m = (model or "").lower().strip()
+    return m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+
+
+def model_supports_temperature(model: str) -> bool:
+    """gpt-5* and reasoning models often reject non-default temperature."""
+    m = (model or "").lower().strip()
+    if m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
+        return False
+    return True
+
+
+def append_json_rules_to_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy messages and append strict JSON rules to the system message."""
+    out = [dict(m) for m in messages]
+    for msg in out:
+        if msg.get("role") == "system":
+            content = str(msg.get("content", ""))
+            if JSON_STRICT_RULES not in content:
+                msg["content"] = content.rstrip() + "\n\n" + JSON_STRICT_RULES
+            break
+    return out
+
+
+def _extract_balanced_json(text: str) -> str | None:
+    """Extract first balanced JSON object or array from text."""
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    return None
+
+
+def extract_json_from_text(text: str, *, stage: str = "") -> dict | list[Any]:
+    """
+    Parse JSON from model output with fence stripping and balanced-brace extraction.
+    """
+    if text is None or not str(text).strip():
+        logger.error("JSON parse failed stage=%s: empty response", stage or "unknown")
+        raise ValueError("Empty model response — no JSON to parse.")
+
+    raw = str(text).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s*```\s*$", "", raw).strip()
+
+    candidates: list[str] = []
+    if raw:
+        candidates.append(raw)
+    balanced = _extract_balanced_json(raw)
+    if balanced and balanced not in candidates:
+        candidates.append(balanced)
+    if "{" in raw or "[" in raw:
+        start = raw.find("{") if "{" in raw else raw.find("[")
+        end_obj = raw.rfind("}")
+        end_arr = raw.rfind("]")
+        end = max(end_obj, end_arr)
+        if start != -1 and end != -1 and end > start:
+            slice_json = raw[start : end + 1]
+            if slice_json not in candidates:
+                candidates.append(slice_json)
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+
+    preview = raw[:500].replace("\n", "\\n")
+    logger.error(
+        "JSON parse failed stage=%s (%d chars). Preview: %s",
+        stage or "unknown",
+        len(raw),
+        preview,
+    )
+    raise ValueError(
+        f"No JSON object found in model response (stage={stage or 'unknown'})."
+    ) from last_err
+
+
+def get_chat_response_text(response: Any) -> str:
+    """Extract text content from chat completion response."""
+    try:
+        return (response.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
+def _log_openai_request_params(params: dict[str, Any], *, stage: str) -> None:
+    token_key = (
+        "max_completion_tokens"
+        if "max_completion_tokens" in params
+        else "max_tokens"
+        if "max_tokens" in params
+        else "none"
+    )
+    token_val = params.get(token_key) if token_key != "none" else None
+    logger.info(
+        "OpenAI request stage=%s model=%s token_param=%s token_value=%s "
+        "temperature=%s response_format=%s",
+        stage,
+        params.get("model", ""),
+        token_key,
+        token_val,
+        params.get("temperature", "not_sent"),
+        "yes" if "response_format" in params else "no",
+    )
+
+
+def build_openai_params(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    response_format: dict[str, Any] | None = None,
+    use_max_completion_tokens: bool | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """
+    Build kwargs for client.chat.completions.create with model-aware token limits.
+    gpt-5* models use max_completion_tokens; older models use max_tokens.
+    """
+    params: dict[str, Any] = {"model": model, "messages": list(messages)}
+    params.update(kwargs)
+
+    if temperature is not None and model_supports_temperature(model):
+        params["temperature"] = temperature
+
+    if response_format is not None:
+        params["response_format"] = response_format
+
+    if max_tokens is not None:
+        use_mct = (
+            use_max_completion_tokens
+            if use_max_completion_tokens is not None
+            else model_uses_max_completion_tokens(model)
+        )
+        if use_mct:
+            params["max_completion_tokens"] = max_tokens
+        else:
+            params["max_tokens"] = max_tokens
+
+    return params
+
+
+def is_unsupported_parameter_error(exc: BaseException, param_name: str) -> bool:
+    """Detect OpenAI unsupported/invalid parameter errors for a specific param."""
+    msg = str(exc).lower()
+    pname = param_name.lower()
+    if pname not in msg:
+        return False
+    markers = (
+        "unsupported",
+        "not supported",
+        "unsupported_parameter",
+        "invalid_request",
+        "unknown parameter",
+        "unexpected parameter",
+    )
+    return any(m in msg for m in markers)
+
+
+def is_unsupported_response_format_error(exc: BaseException) -> bool:
+    """Detect when response_format is rejected."""
+    msg = str(exc).lower()
+    if "response_format" not in msg and "json_object" not in msg and "json_schema" not in msg:
+        return False
+    return is_unsupported_parameter_error(exc, "response_format") or "response_format" in msg
+
+
+def is_unsupported_temperature_error(exc: BaseException) -> bool:
+    """Detect when temperature is rejected by the model/API."""
+    msg = str(exc).lower()
+    if "temperature" not in msg:
+        return False
+    return is_unsupported_parameter_error(exc, "temperature") or (
+        "only the default" in msg and "temperature" in msg
+    )
+
+
+def apply_param_compatibility_fix(params: dict[str, Any], exc: BaseException) -> bool:
+    """
+    Mutate params to recover from unsupported_parameter errors.
+    Returns True if params were adjusted and the call should be retried.
+    """
+    changed = False
+
+    if "max_tokens" in params and is_unsupported_parameter_error(exc, "max_tokens"):
+        val = params.pop("max_tokens")
+        params["max_completion_tokens"] = val
+        logger.info("OpenAI compat: switched max_tokens -> max_completion_tokens (%s)", val)
+        changed = True
+    elif "max_completion_tokens" in params and is_unsupported_parameter_error(exc, "max_completion_tokens"):
+        val = params.pop("max_completion_tokens")
+        params["max_tokens"] = val
+        logger.info("OpenAI compat: switched max_completion_tokens -> max_tokens (%s)", val)
+        changed = True
+
+    if "temperature" in params and is_unsupported_temperature_error(exc):
+        params.pop("temperature", None)
+        logger.info("OpenAI compat: removed temperature for model %s", params.get("model", ""))
+        changed = True
+
+    if "response_format" in params and is_unsupported_response_format_error(exc):
+        params.pop("response_format", None)
+        params["messages"] = append_json_rules_to_messages(params.get("messages", []))
+        logger.info(
+            "OpenAI compat: removed response_format, enforced JSON via prompt for %s",
+            params.get("model", ""),
+        )
+        changed = True
+
+    return changed
+
+
+def repair_json_with_chat(
+    client: Any,
+    *,
+    model: str,
+    raw_text: str,
+    schema_hint: str,
+    stage: str,
+    tracker: TokenTracker | None = None,
+    prompt_estimate: int = 0,
+    clip_id: str | None = None,
+    max_tokens: int = 2000,
+) -> dict | list[Any]:
+    """One-shot repair call to convert malformed output into valid JSON."""
+    if not (raw_text or "").strip():
+        raise ValueError("Cannot repair empty model response.")
+    repair_stage = f"{stage}_json_repair"
+    repair_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Convert the following model output into valid JSON matching the required schema. "
+                "Return only JSON. No markdown. No code fences. No explanations.\n\n"
+                + JSON_STRICT_RULES
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Required schema:\n{schema_hint}\n\n"
+                f"Model output to fix:\n{raw_text[:14_000]}"
+            ),
+        },
+    ]
+    response = call_openai_chat(
+        client,
+        model=model,
+        messages=repair_messages,
+        stage=repair_stage,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+        tracker=tracker,
+        prompt_estimate=prompt_estimate,
+        clip_id=clip_id,
+        enforce_json_prompt=True,
+    )
+    repaired_text = get_chat_response_text(response)
+    return extract_json_from_text(repaired_text, stage=repair_stage)
+
+
+def call_openai_chat(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    stage: str,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    response_format: dict[str, Any] | None = None,
+    tracker: TokenTracker | None = None,
+    prompt_estimate: int = 0,
+    clip_id: str | None = None,
+    enforce_json_prompt: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """
+    Build model-compatible params, call with rate-limit backoff, and retry on
+    unsupported max_tokens / max_completion_tokens / temperature / response_format errors.
+    """
+    msg_list = append_json_rules_to_messages(messages) if (
+        enforce_json_prompt or response_format is not None
+    ) else list(messages)
+    create_kwargs = build_openai_params(
+        model=model,
+        messages=msg_list,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        response_format=response_format,
+        **kwargs,
+    )
+    compat_attempts = 0
+    max_compat_attempts = 4
+
+    while compat_attempts < max_compat_attempts:
+        try:
+            return call_openai_with_backoff(
+                client,
+                create_kwargs=dict(create_kwargs),
+                stage=stage,
+                model=model,
+                tracker=tracker,
+                prompt_estimate=prompt_estimate,
+                clip_id=clip_id,
+            )
+        except OpenAIRateLimitError:
+            raise
+        except Exception as exc:
+            compat_attempts += 1
+            if apply_param_compatibility_fix(create_kwargs, exc) and compat_attempts < max_compat_attempts:
+                logger.warning(
+                    "OpenAI compat retry stage=%s model=%s attempt=%d: %s",
+                    stage, model, compat_attempts, exc,
+                )
+                continue
+            raise
+
+    raise RuntimeError(f"OpenAI compatibility retries exhausted for stage '{stage}'")
+
+
+def call_openai_chat_json(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    stage: str,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    response_format: dict[str, Any] | None = None,
+    schema_hint: str = "",
+    tracker: TokenTracker | None = None,
+    prompt_estimate: int = 0,
+    clip_id: str | None = None,
+    allow_repair: bool = True,
+    **kwargs: Any,
+) -> dict | list[Any]:
+    """
+    call_openai_chat + parse JSON.
+    gpt-5* empty/invalid JSON: one full retry with OPENAI_MODEL_JSON_FALLBACK (no gpt-5 repair).
+    Other models: optional single repair call when output is non-empty but unparseable.
+    """
+    primary_model = model
+    json_fallback = resolve_json_fallback_model(primary_model)
+    effective_model = primary_model
+    attempted_fallback = False
+    rf = response_format or {"type": "json_object"}
+
+    def _fetch(chat_model: str, chat_stage: str) -> str:
+        resp = call_openai_chat(
+            client,
+            model=chat_model,
+            messages=messages,
+            stage=chat_stage,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=rf,
+            tracker=tracker,
+            prompt_estimate=prompt_estimate,
+            clip_id=clip_id,
+            enforce_json_prompt=True,
+            **kwargs,
+        )
+        return get_chat_response_text(resp)
+
+    def _retry_with_json_fallback(reason: str) -> bool:
+        nonlocal effective_model, attempted_fallback, text
+        if attempted_fallback or not json_fallback:
+            return False
+        attempted_fallback = True
+        effective_model = json_fallback
+        notice = (
+            f"Empty JSON response from {primary_model}; retrying with {json_fallback}."
+            if reason == "empty"
+            else f"Invalid JSON from {primary_model}; retrying with {json_fallback}."
+        )
+        logger.warning(notice)
+        _notify_status(notice)
+        text = _fetch(json_fallback, f"{stage}_json_fallback")
+        return True
+
+    text = _fetch(primary_model, stage)
+
+    if not text.strip():
+        if model_is_gpt5_family(primary_model) and _retry_with_json_fallback("empty"):
+            if not text.strip():
+                raise ValueError(
+                    f"Empty model response after JSON fallback (stage={stage}, model={effective_model})."
+                )
+        else:
+            raise ValueError(f"Empty model response — no JSON to parse (stage={stage}).")
+
+    try:
+        return extract_json_from_text(text, stage=stage)
+    except (ValueError, json.JSONDecodeError) as parse_err:
+        if (
+            model_is_gpt5_family(primary_model)
+            and not attempted_fallback
+            and _retry_with_json_fallback("invalid")
+        ):
+            try:
+                return extract_json_from_text(text, stage=stage)
+            except (ValueError, json.JSONDecodeError):
+                pass
+        elif not text.strip():
+            raise ValueError(
+                f"Empty model response — no JSON to parse (stage={stage})."
+            ) from parse_err
+
+        if not allow_repair or not text.strip():
+            raise
+        logger.warning(
+            "JSON parse failed stage=%s model=%s — attempting repair call: %s",
+            stage,
+            effective_model,
+            parse_err,
+        )
+        hint = schema_hint or "Return a single valid JSON object."
+        return repair_json_with_chat(
+            client,
+            model=effective_model,
+            raw_text=text,
+            schema_hint=hint,
+            stage=stage,
+            tracker=tracker,
+            prompt_estimate=prompt_estimate,
+            clip_id=clip_id,
+            max_tokens=min(max_tokens or 2000, 2500),
+        )
+
+
 def split_text_chunks(text: str, max_chars: int) -> list[str]:
     """Split text into chunks at line boundaries when over max_chars."""
     if len(text) <= max_chars:
@@ -218,8 +703,9 @@ def call_openai_with_backoff(
     for attempt in range(1, max_attempts + 1):
         try:
             apply_call_delay()
+            _log_openai_request_params(create_kwargs, stage=stage)
             if prompt_estimate:
-                logger.info(
+                logger.debug(
                     "OpenAI call stage=%s model=%s attempt=%d est_prompt_tokens=%d",
                     stage, model, attempt, prompt_estimate,
                 )

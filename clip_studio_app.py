@@ -31,14 +31,13 @@ from config import (  # noqa: E402
     ENV_FFMPEG_BINARY,
     ENV_OPENAI_API_KEY,
     PROJECT_ROOT,
-    UPLOADS_DIR,
     ensure_directories,
 )
 from clip_engine.clip_analysis import get_session_tokens  # noqa: E402
 from clip_engine.clip_pipeline import run_full_clip_pipeline, PipelineOpenAIConfig  # noqa: E402
 from clip_engine.openai_resilience import OpenAIRateLimitError, estimate_pipeline_tokens, token_saver_pass_config  # noqa: E402
 from clip_engine.analysis_cache import clear_all_analysis_cache  # noqa: E402
-from config import get_openai_model, get_openai_model_fast  # noqa: E402
+from config import get_openai_model, get_openai_model_fast, get_openai_model_json_fallback  # noqa: E402
 from clip_engine.clip_style import CLIP_STYLE_OPTIONS, ClipStyle  # noqa: E402
 from clip_engine.clip_metadata import (  # noqa: E402
     ground_clip_metadata_against_window,
@@ -76,6 +75,7 @@ from clip_engine.cuda_diagnostics import (  # noqa: E402
     log_ai_acceleration_startup,
 )
 from clip_engine.dependency_status import get_dependency_report, render_status_markdown  # noqa: E402
+from clip_engine.upload_manifest import clean_duplicate_uploads, save_upload_once  # noqa: E402
 from ui_helpers import open_folder  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -129,6 +129,7 @@ def _init_state() -> None:
         "cs_max_tokens_budget": 60_000,
         "cs_openai_call_delay": 0.75,
         "cs_openai_status": "",
+        "cs_upload_reused": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -154,37 +155,6 @@ def _format_size(n: int) -> str:
     if n >= 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n} bytes"
-
-
-def _save_upload_chunked(upload, dest: Path, progress_bar) -> None:
-    buf = upload.getbuffer()
-    total = len(buf)
-    chunk = 32 * 1024 * 1024
-    written = 0
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("wb") as f:
-        offset = 0
-        while offset < total:
-            piece = buf[offset : offset + chunk]
-            f.write(piece)
-            offset += len(piece)
-            written += len(piece)
-            if total > 0:
-                pct = min(1.0, written / total)
-                try:
-                    progress_bar.progress(pct, text=f"Saving: {_format_size(written)} / {_format_size(total)}")
-                except TypeError:
-                    progress_bar.progress(pct)
-
-
-def _save_upload(upload, *, progress_bar) -> Path:
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    ext = Path(upload.name).suffix.lower()
-    if ext not in (".mp4", ".mov", ".m4v"):
-        ext = ".mp4"
-    dest = UPLOADS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
-    _save_upload_chunked(upload, dest, progress_bar)
-    return dest
 
 
 def _slug(s: str, max_len: int = 48) -> str:
@@ -540,6 +510,9 @@ def main() -> None:
         )
         st.caption(f"Fast model: `{get_openai_model_fast()}`")
         st.caption(f"Quality model: `{get_openai_model()}`")
+        st.caption(
+            f"JSON fallback (if gpt-5* returns empty/invalid JSON): `{get_openai_model_json_fallback()}`"
+        )
         if st.button("Clear analysis cache", use_container_width=True):
             n = clear_all_analysis_cache()
             st.success(f"Cleared {n} cached analysis entries.")
@@ -578,6 +551,42 @@ def main() -> None:
 
     # ------------------------------------------------------------------ UPLOAD
     st.subheader("1. Upload video")
+    st.info(
+        "For DaVinci Resolve exports, use **Local File Path** mode to avoid copies entirely."
+    )
+    input_mode = st.radio(
+        "Video source",
+        ["Browser upload", "Local file path"],
+        horizontal=True,
+        key="cs_video_input_mode",
+    )
+    if input_mode == "Local file path":
+        local_path = st.text_input(
+            "Path to video on disk",
+            placeholder=r"C:\Videos\export.mp4",
+            key="cs_local_video_path",
+        )
+        if st.button("Use local file", type="primary"):
+            if not local_path.strip():
+                st.error("Enter a file path.")
+            else:
+                lp = Path(local_path.strip()).expanduser()
+                if not lp.is_file():
+                    st.error(f"File not found: `{lp}`")
+                elif lp.suffix.lower() not in (".mp4", ".mov", ".m4v"):
+                    st.error("Supported formats: MP4, MOV, M4V.")
+                else:
+                    resolved = lp.resolve()
+                    st.session_state.cs_video_path = resolved
+                    try:
+                        st.session_state.cs_media_duration = get_media_duration_seconds(resolved)
+                    except Exception:
+                        logger.exception("ffprobe duration failed")
+                    st.session_state.cs_status = f"Using local file: `{resolved}`"
+                    st.rerun()
+        if st.session_state.cs_video_path and input_mode == "Local file path":
+            st.success(str(st.session_state.cs_video_path))
+
     st.caption(
         f"**Upload limit:** up to **{CLIP_STUDIO_MAX_UPLOAD_MB} MB (~4 GB)** per file. "
         "Large files take time in browser before Save appears."
@@ -590,43 +599,73 @@ def main() -> None:
             "- Keep browser tab open during upload"
         )
 
-    up = st.file_uploader("MP4 / MOV / M4V", type=["mp4", "mov", "m4v"], key="cs_upload")
-    if up is not None:
-        sz = _uploaded_file_size_bytes(up)
-        if sz > CLIP_STUDIO_MAX_UPLOAD_BYTES:
-            st.error(
-                f"File is **{_format_size(sz)}** - exceeds limit of **{CLIP_STUDIO_MAX_UPLOAD_MB} MB**. "
-                "Compress with `compress_video.bat` or raise `maxUploadSize` in `config.toml`."
-            )
-        else:
-            st.success(f"Ready: **{up.name}** - {_format_size(sz)}. Click **Save** to continue.")
-        if st.button("Save upload to project", type="primary", disabled=sz > CLIP_STUDIO_MAX_UPLOAD_BYTES):
-            bar = st.progress(0.0, text="Preparing to save...")
-            try:
-                path = _save_upload(up, progress_bar=bar)
-                st.session_state.cs_video_path = path
-                st.session_state.cs_segments = []
-                st.session_state.cs_formatted = ""
-                st.session_state.cs_clips = []
-                st.session_state.cs_session_dir = None
-                st.session_state.cs_media_duration = 0.0
+    if input_mode == "Browser upload":
+        up = st.file_uploader("MP4 / MOV / M4V", type=["mp4", "mov", "m4v"], key="cs_upload")
+        if up is not None:
+            sz = _uploaded_file_size_bytes(up)
+            if sz > CLIP_STUDIO_MAX_UPLOAD_BYTES:
+                st.error(
+                    f"File is **{_format_size(sz)}** - exceeds limit of **{CLIP_STUDIO_MAX_UPLOAD_MB} MB**. "
+                    "Compress with `compress_video.bat` or raise `maxUploadSize` in `config.toml`."
+                )
+            else:
+                st.success(f"Ready: **{up.name}** - {_format_size(sz)}. Click **Save** to continue.")
+            if st.button("Save upload to project", type="primary", disabled=sz > CLIP_STUDIO_MAX_UPLOAD_BYTES):
+                bar = st.progress(0.0, text="Preparing to save...")
                 try:
-                    st.session_state.cs_media_duration = get_media_duration_seconds(path)
-                except Exception:
-                    logger.exception("ffprobe duration failed")
-                st.session_state.cs_status = f"Saved: `{path.relative_to(PROJECT_ROOT)}` ({_format_size(sz)})"
-                try:
-                    bar.progress(1.0, text="Saved.")
-                except TypeError:
-                    bar.progress(1.0)
-                st.rerun()
-            except OSError as exc:
-                st.error(f"Could not write file (disk full or permissions?): {exc}")
-            finally:
-                bar.empty()
+                    path, reused = save_upload_once(up, progress_bar=bar)
+                    st.session_state.cs_video_path = path
+                    st.session_state.cs_upload_reused = reused
+                    if not reused:
+                        st.session_state.cs_segments = []
+                        st.session_state.cs_formatted = ""
+                        st.session_state.cs_clips = []
+                        st.session_state.cs_session_dir = None
+                        st.session_state.cs_media_duration = 0.0
+                    try:
+                        st.session_state.cs_media_duration = get_media_duration_seconds(path)
+                    except Exception:
+                        logger.exception("ffprobe duration failed")
+                    if reused:
+                        st.session_state.cs_status = (
+                            f"Reused: `{path.relative_to(PROJECT_ROOT)}` ({_format_size(sz)})"
+                        )
+                    else:
+                        st.session_state.cs_status = (
+                            f"Saved: `{path.relative_to(PROJECT_ROOT)}` ({_format_size(sz)})"
+                        )
+                    try:
+                        bar.progress(1.0, text="Saved." if not reused else "Reused existing file.")
+                    except TypeError:
+                        bar.progress(1.0)
+                    st.rerun()
+                except OSError as exc:
+                    st.error(f"Could not write file (disk full or permissions?): {exc}")
+                finally:
+                    bar.empty()
+
+        if st.button("Clean duplicate uploads", use_container_width=True):
+            with st.spinner("Scanning uploads folder..."):
+                result = clean_duplicate_uploads()
+            moved = int(result.get("moved", 0))
+            saved = int(result.get("bytes_saved", 0))
+            if moved:
+                st.success(
+                    f"Moved **{moved}** duplicate file(s) to `uploads/_duplicates/` "
+                    f"(~{_format_size(saved)})."
+                )
+            else:
+                st.info("No duplicate uploads found to move.")
+
+    if st.session_state.get("cs_upload_reused"):
+        st.info("This video was already saved. Reusing existing project file.")
 
     if st.session_state.cs_video_path:
-        st.success(str(st.session_state.cs_video_path.relative_to(PROJECT_ROOT)))
+        try:
+            rel = st.session_state.cs_video_path.relative_to(PROJECT_ROOT)
+            st.success(str(rel))
+        except ValueError:
+            st.success(str(st.session_state.cs_video_path))
 
     # ------------------------------------------------------------------ TRANSCRIBE
     st.subheader("2. Transcript")

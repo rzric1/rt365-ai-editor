@@ -13,7 +13,8 @@ from typing import Any
 from clip_engine.transcription_utils import extract_transcript_excerpt, extract_transcript_window
 from clip_engine.token_tracking import TokenTracker, get_tracker
 from clip_engine.openai_resilience import (
-    call_openai_with_backoff,
+    JSON_STRICT_RULES,
+    call_openai_chat_json,
     estimate_tokens_rough,
     get_call_context,
     truncate_text_safe,
@@ -90,7 +91,7 @@ def _regenerate_metadata_from_window(
     clip_id: str,
 ) -> dict | None:
     """Call GPT to rewrite metadata using ONLY the final transcript window."""
-    system = """You rewrite short-form clip metadata so it matches ONLY the provided transcript.
+    system = f"""You rewrite short-form clip metadata so it matches ONLY the provided transcript.
 Rules:
 - hook_title: max 8 words, must describe content actually spoken in the transcript
 - selection_reason: one sentence, only facts from the transcript
@@ -98,39 +99,39 @@ Rules:
 - dominant_signal: one of educational | emotional | story | debate | funny | inspirational
 - platform_fit: list from TikTok | YouTube Shorts | Instagram Reels | LinkedIn
 - grounding_confidence: 0-100 how well the title matches the transcript
-Output ONLY valid JSON with keys:
-hook_title, selection_reason, ai_context_reason, dominant_signal, platform_fit, grounding_confidence"""
+Return ONLY valid JSON. No markdown. No code fences. No explanations.
+{JSON_STRICT_RULES}
+Schema keys: hook_title, selection_reason, ai_context_reason, dominant_signal, platform_fit, grounding_confidence"""
 
     user = f"FINAL CLIP TRANSCRIPT (only source of truth):\n{window_text[:8000]}"
     user, _ = truncate_text_safe(user, 8200, label="grounding_window")
     prompt_estimate = estimate_tokens_rough(system + user)
     model = get_openai_model()
 
+    schema_hint = (
+        '{"hook_title": "", "selection_reason": "", "ai_context_reason": "", '
+        '"dominant_signal": "", "platform_fit": [], "grounding_confidence": 0}'
+    )
     try:
-        response = call_openai_with_backoff(
+        data = call_openai_chat_json(
             client,
-            create_kwargs={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.2,
-                "max_tokens": 600,
-                "response_format": {"type": "json_object"},
-            },
-            stage="metadata_grounding",
             model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=600,
+            response_format={"type": "json_object"},
+            stage="metadata_grounding",
+            schema_hint=schema_hint,
             tracker=tracker,
             prompt_estimate=prompt_estimate,
             clip_id=clip_id,
         )
-        raw = response.choices[0].message.content or "{}"
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1:
-            return None
-        return json.loads(raw[start : end + 1])
+        if isinstance(data, dict):
+            return data
+        return None
     except Exception as e:
         logger.warning("Metadata regeneration failed: %s", e)
         return None
