@@ -538,13 +538,19 @@ def get_torch_embedding_diagnostics() -> dict[str, Any]:
 
         out["sentence_transformers_installed"] = True
 
-    except ImportError:
+    except Exception as exc:
 
-        pass
+        out["sentence_transformers_error"] = str(exc)[:200]
 
-    sem = semantic_pipeline_status()
+    try:
 
-    out["embeddings_device_selected"] = sem.get("device", "cpu")
+        sem = semantic_pipeline_status()
+
+        out["embeddings_device_selected"] = sem.get("device", "cpu")
+
+    except Exception as exc:
+
+        out["semantic_status_error"] = str(exc)[:200]
 
     return out
 
