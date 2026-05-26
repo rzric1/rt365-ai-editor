@@ -552,80 +552,73 @@ def get_torch_embedding_diagnostics() -> dict[str, Any]:
 
 
 
+_RTX_STATUS_SAFE_DEFAULT: dict[str, Any] = {
+    "cuda_available": False,
+    "gpu_name": "unknown",
+    "embeddings_on_gpu": False,
+    "embeddings_available": False,
+    "diarization_on_gpu": False,
+    "pyannote_available": False,
+    "faster_whisper_cuda": False,
+    "local_ranking_enabled": False,
+    "gpu_memory": None,
+    "embedding_model": None,
+    "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    "torch_installed": False,
+    "torch_version": None,
+    "torch_cuda_available": False,
+    "torch_cuda_device_count": 0,
+    "torch_cuda_device_name": None,
+    "sentence_transformers_installed": False,
+    "embeddings_device_selected": "cpu",
+    "_error": None,
+}
+
+
 def get_rtx_pipeline_status() -> dict[str, Any]:
+    """Combined status for RTX 4090 AI Pipeline UI panel.
 
-    """Combined status for RTX 4090 AI Pipeline UI panel."""
-
-    sem = semantic_pipeline_status()
-
-    spk = speaker_pipeline_status()
-
-    torch_diag = get_torch_embedding_diagnostics()
-
-    whisper_cuda = False
-
+    Never raises — returns a safe default dict on any failure so the
+    Streamlit sidebar never crashes the whole app.
+    """
     try:
+        sem = semantic_pipeline_status()
+        spk = speaker_pipeline_status()
+        torch_diag = get_torch_embedding_diagnostics()
 
-        from clip_engine.ffmpeg_gpu import faster_whisper_cuda_available
-
-
-
-        whisper_cuda = faster_whisper_cuda_available()
-
-    except Exception:
-
-        pass
-
-
-
-    gpu_mem = None
-
-    if torch_diag.get("torch_cuda_available"):
-
+        whisper_cuda = False
         try:
-
-            import torch
-
-
-
-            gpu_mem = {
-
-                "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
-
-                "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
-
-            }
-
+            from clip_engine.ffmpeg_gpu import faster_whisper_cuda_available
+            whisper_cuda = faster_whisper_cuda_available()
         except Exception:
-
             pass
 
+        gpu_mem = None
+        if torch_diag.get("torch_cuda_available"):
+            try:
+                import torch
+                gpu_mem = {
+                    "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
+                    "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
+                }
+            except Exception:
+                pass
 
-
-    return {
-
-        "cuda_available": sem.get("cuda_available", False),
-
-        "gpu_name": sem.get("gpu_name", "unknown"),
-
-        "embeddings_on_gpu": sem.get("device") == "cuda",
-
-        "embeddings_available": sem.get("embeddings_available", False),
-
-        "diarization_on_gpu": spk.get("device") == "cuda",
-
-        "pyannote_available": spk.get("pyannote_available", False),
-
-        "faster_whisper_cuda": whisper_cuda,
-
-        "local_ranking_enabled": True,
-
-        "gpu_memory": gpu_mem,
-
-        "embedding_model": sem.get("model"),
-
-        **torch_diag,
-
-    }
+        return {
+            "cuda_available": sem.get("cuda_available", False),
+            "gpu_name": sem.get("gpu_name", "unknown"),
+            "embeddings_on_gpu": sem.get("device") == "cuda",
+            "embeddings_available": sem.get("embeddings_available", False),
+            "diarization_on_gpu": spk.get("device") == "cuda",
+            "pyannote_available": spk.get("pyannote_available", False),
+            "faster_whisper_cuda": whisper_cuda,
+            "local_ranking_enabled": True,
+            "gpu_memory": gpu_mem,
+            "embedding_model": sem.get("model"),
+            **torch_diag,
+        }
+    except Exception as exc:
+        logger.warning("get_rtx_pipeline_status failed: %s", exc, exc_info=True)
+        return {**_RTX_STATUS_SAFE_DEFAULT, "_error": str(exc)}
 
 

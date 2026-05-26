@@ -77,7 +77,7 @@ Start-Process cmd.exe -ArgumentList '/c', 'timeout /t 2 /nobreak >nul && start h
 
 Write-Host "`n--- Streamlit (Ctrl+C to stop) ---`n" -ForegroundColor Cyan
 Set-Location -LiteralPath $ProjectRoot
-& $st run clip_studio_app.py
+& $st run clip_studio_app.py --server.headless true
 $code = $LASTEXITCODE
 
 Write-Host "`nStreamlit exited with code $code" -ForegroundColor $(if ($code -eq 0) { 'Green' } else { 'Red' })

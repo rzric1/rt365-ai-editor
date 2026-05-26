@@ -47,7 +47,9 @@ def embeddings_available() -> bool:
         import sentence_transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except Exception:
+        # Catches ImportError AND runtime failures (e.g. torchcodec/FFmpeg
+        # version mismatches that surface during sentence_transformers import).
         return False
 
 

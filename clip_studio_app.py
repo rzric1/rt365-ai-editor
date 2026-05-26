@@ -58,7 +58,16 @@ from clip_engine.effective_config import (  # noqa: E402
     apply_profile_widget_defaults,
     resolve_models_from_effective_config,
 )
-from clip_engine.gpu_pipeline import get_rtx_pipeline_status  # noqa: E402
+try:
+    from clip_engine.gpu_pipeline import get_rtx_pipeline_status  # noqa: E402
+except Exception as _gpu_pipeline_import_err:
+    import logging as _logging
+    _logging.getLogger("clip_studio").warning(
+        "gpu_pipeline import failed (%s) — RTX status panel will show defaults.",
+        _gpu_pipeline_import_err,
+    )
+    def get_rtx_pipeline_status():  # type: ignore[misc]
+        return {"_error": str(_gpu_pipeline_import_err), "embeddings_available": False}
 from clip_engine.openai_resilience import get_json_telemetry  # noqa: E402
 from clip_engine.clip_style import CLIP_STYLE_OPTIONS, ClipStyle  # noqa: E402
 from clip_engine.clip_metadata import (  # noqa: E402
