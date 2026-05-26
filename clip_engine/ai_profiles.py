@@ -114,7 +114,7 @@ _PROFILES: dict[str, AIProfile] = {
 
         json_fallback_model="gpt-4o-mini",
 
-        max_tokens=35_000,
+        max_tokens=60_000,
 
         token_saver=True,
 
@@ -124,7 +124,7 @@ _PROFILES: dict[str, AIProfile] = {
 
         prefer_gpu_prefilter=True,
 
-        max_gpt_passes=1,
+        max_gpt_passes=2,
 
         max_gpt_regions=5,
 
@@ -134,9 +134,9 @@ _PROFILES: dict[str, AIProfile] = {
 
         context_after=5.0,
 
-        target_gpu_shortlist_min=10,
+        target_gpu_shortlist_min=20,
 
-        target_gpu_shortlist_max=25,
+        target_gpu_shortlist_max=40,
 
         max_active_gpt_regions=5,
 
@@ -284,7 +284,7 @@ def get_profile_help_text() -> str:
 
     return (
 
-        "**SAFE** = most stable and production-ready (gpt-4o-mini, 35k token budget, GPU pre-filter).\n\n"
+        "**SAFE** = most stable and production-ready (gpt-4o-mini, 60k token budget, GPU pre-filter).\n\n"
 
         "**BALANCED** = better reasoning with moderate fallback risk.\n\n"
 

@@ -329,10 +329,13 @@ def run_full_clip_pipeline(
         max_pass_rounds = 2
 
     _PASS_NAMES = ("primary", "gems", "micro")
-    passes_override: tuple[str, ...] | None = tuple(
-        _PASS_NAMES[: max(1, min(ai_prof.max_gpt_passes, 3))]
-    )
-    stats.gpt_passes_used = len(passes_override)
+    _max_gpt_passes = max(1, min(ai_prof.max_gpt_passes, 3))
+    # Always run only the first pass upfront; additional passes are conditional
+    # on the final clip count (see conditional second-pass block below).
+    passes_override: tuple[str, ...] | None = tuple(_PASS_NAMES[:1])
+    stats.gpt_passes_used = 1
+
+    _trim_context_for_budget = False  # set True if token saver kicks in over budget
 
     token_estimate = estimate_pipeline_tokens(
         formatted,
@@ -345,10 +348,11 @@ def run_full_clip_pipeline(
 
     if token_estimate.estimated_total_tokens > oai.max_tokens_budget:
         oai.token_saver_mode = True
+        _trim_context_for_budget = True
         n_passes, max_pass_rounds, _ = token_saver_pass_config(style_name)
         stats.warnings.append(
             f"Estimated ~{token_estimate.estimated_total_tokens:,} tokens exceeds budget "
-            f"({oai.max_tokens_budget:,}). Token Saver Mode enforced."
+            f"({oai.max_tokens_budget:,}). Token Saver Mode enforced; context trimmed to 2s/3s."
         )
         if token_estimate.estimated_total_tokens > oai.max_tokens_budget * 1.5:
             stats.warnings.append(
@@ -412,6 +416,10 @@ def run_full_clip_pipeline(
 
     ctx_b = context_before if context_before is not None else profile.context_before
     ctx_a = context_after if context_after is not None else profile.context_after
+    if _trim_context_for_budget:
+        ctx_b = min(ctx_b, 2.0)
+        ctx_a = min(ctx_a, 3.0)
+        logger.info("[PIPELINE] Context trimmed to %.0fs/%.0fs due to token budget", ctx_b, ctx_a)
 
     if discovery_mode:
         pool_multiplier = 2.5 if oai.token_saver_mode else 3.0
@@ -600,6 +608,59 @@ def run_full_clip_pipeline(
         stats.removed_overlap = div_stats.removed_overlap
         stats.removed_duplicates = div_stats.removed_duplicates
         stats.after_diversity = len(selected)
+
+        # Conditional second GPT pass: only run if clip count is below 50% of target
+        # and the AI profile allows more than one pass.
+        if _max_gpt_passes >= 2 and len(selected) < target_count * 0.5:
+            logger.info(
+                "[PIPELINE] Only %d/%d clips after pass 1 (<50%%) — running conditional gems pass",
+                len(selected), target_count,
+            )
+            extra_passes = tuple(_PASS_NAMES[1:_max_gpt_passes])
+            if extra_passes:
+                try:
+                    gems_candidates = collect_candidates_multipass(
+                        formatted,
+                        api_key,
+                        optional_content_note=creator_note,
+                        prompt_settings=prompt_settings,
+                        segments=segments,
+                        media_duration=media_duration,
+                        pool_target=pool_target,
+                        tracker=tracker,
+                        max_pass_rounds=max_pass_rounds,
+                        progress=progress,
+                        cache_key=cache_key,
+                        model=model_fast,
+                        discovery_mode=discovery_mode,
+                        pool_stats=pool_stats,
+                        passes_override=extra_passes,
+                        region_filter_override=region_filter_gpu,
+                    )
+                    if gems_candidates:
+                        before_gems = len(candidates)
+                        candidates = dedupe_candidates_exact_start(candidates + gems_candidates)
+                        stats.rejected_overlap_early += before_gems + len(gems_candidates) - len(candidates)
+                        stats.raw_candidates = len(candidates)
+                        stats.gpt_passes_used += 1
+                        selected, div_gems = run_diversity_pipeline(
+                            candidates,
+                            media_duration=media_duration,
+                            target_count=target_count,
+                            min_gap_seconds=min_gap_seconds,
+                            similarity_threshold=similarity_threshold,
+                            n_regions=5,
+                            min_per_region=1,
+                            relax_if_under_target=True,
+                            return_stats=True,
+                        )
+                        stats.removed_overlap += div_gems.removed_overlap
+                        stats.removed_duplicates += div_gems.removed_duplicates
+                        stats.after_diversity = len(selected)
+                        logger.info("[PIPELINE] After gems pass: %d clips", len(selected))
+                except Exception as _gems_exc:
+                    logger.warning("Conditional gems pass failed: %s", _gems_exc)
+                    stats.warnings.append(f"Conditional gems pass skipped: {_gems_exc}")
 
         if len(selected) < target_count and candidates and (discovery_mode or not oai.token_saver_mode or len(selected) < 12):
             stats.expansion_pass_ran = True

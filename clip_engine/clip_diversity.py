@@ -92,7 +92,7 @@ def bucket_transcript(
 # Overlap prevention
 # ---------------------------------------------------------------------------
 
-def clips_overlap(a: dict, b: dict, min_gap_seconds: float = 60.0) -> bool:
+def clips_overlap(a: dict, b: dict, min_gap_seconds: float = 15.0) -> bool:
     """
     Return True if clips a and b overlap OR are within min_gap_seconds of each other.
     """
@@ -111,7 +111,7 @@ def clips_overlap(a: dict, b: dict, min_gap_seconds: float = 60.0) -> bool:
 
 def remove_overlapping_clips(
     clips: list[dict],
-    min_gap_seconds: float = 60.0,
+    min_gap_seconds: float = 15.0,
 ) -> tuple[list[dict], int]:
     """
     Given a list of clips sorted by score (desc), remove any clip that overlaps
@@ -324,18 +324,25 @@ def remove_content_overlap_nearby(
 
 def remove_semantic_duplicates(
     clips: list[dict],
-    similarity_threshold: float = 0.45,
+    similarity_threshold: float = 0.80,
 ) -> tuple[list[dict], int]:
     """
     Remove clips that are semantically too similar to a higher-ranked clip.
     Returns (kept, removed_count).
+
+    Floor rule: clips whose start times differ by more than 60 s are NEVER
+    deduped regardless of text similarity (different moments in the video).
     """
+    START_GAP_FLOOR = 60.0  # seconds
     kept: list[dict] = []
     removed = 0
     for clip in clips:
         clip_text = _clip_text(clip)
         is_dup = False
         for k in kept:
+            start_gap = abs(_clip_start_seconds(clip) - _clip_start_seconds(k))
+            if start_gap > START_GAP_FLOOR:
+                continue  # different moments — never dedup
             sim = text_similarity(clip_text, _clip_text(k))
             if sim >= similarity_threshold:
                 from clip_engine.telemetry import log_clip_reject
@@ -489,8 +496,8 @@ def run_diversity_pipeline(
     clips: list[dict],
     media_duration: float,
     target_count: int = 20,
-    min_gap_seconds: float = 60.0,
-    similarity_threshold: float = 0.45,
+    min_gap_seconds: float = 15.0,
+    similarity_threshold: float = 0.80,
     n_regions: int = 5,
     min_per_region: int = 1,
     return_stats: bool = False,
@@ -508,22 +515,34 @@ def run_diversity_pipeline(
 
     When relax_if_under_target is True and output is below target_count,
     re-runs selection with progressively smaller min_gap_seconds.
+
+    The effective gap is the larger of min_gap_seconds and a relative formula
+    based on media duration: max(10, media_duration * 0.005).  This prevents
+    60-second no-go zones on short clips and keeps them sane on very long ones.
     """
     stats = DiversityPipelineStats(input_count=len(clips))
+
+    # Relative gap: 0.5% of media duration, clamped to [10s, min_gap_seconds].
+    # Never exceeds the caller-requested min_gap_seconds so the pipeline
+    # argument still acts as a ceiling — just not an artificially large floor.
+    relative_gap = max(10.0, media_duration * 0.005) if media_duration > 0 else min_gap_seconds
+    effective_gap = min(min_gap_seconds, relative_gap)
+
     logger.info(
-        "Diversity pipeline: %d candidates -> target=%d, gap=%.0fs, sim_thresh=%.2f",
-        len(clips), target_count, min_gap_seconds, similarity_threshold,
+        "Diversity pipeline: %d candidates -> target=%d, gap=%.0fs (relative=%.0fs), sim_thresh=%.2f",
+        len(clips), target_count, effective_gap, relative_gap, similarity_threshold,
     )
 
     if not clips:
         stats.output_count = 0
         return (clips, stats) if return_stats else clips
 
-    gap_steps = [min_gap_seconds]
+    # Use the effective (smaller) gap; relaxation steps go down from there.
+    gap_steps = [effective_gap]
     if relax_if_under_target:
         gap_steps.extend([
-            max(20.0, min_gap_seconds * 0.6),
-            max(10.0, min_gap_seconds * 0.3),
+            max(10.0, effective_gap * 0.6),
+            max(5.0, effective_gap * 0.3),
         ])
 
     best_result: list[dict] = []
