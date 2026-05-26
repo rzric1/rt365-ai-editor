@@ -144,6 +144,7 @@ def segments_to_prompt_transcript(segments: list[dict]) -> str:
     """
     Convert segments to a timestamped text block for LLM prompts.
     Format: [HH:MM:SS] text
+    If a segment has a "speaker" key: [HH:MM:SS] [Speaker]: text
     """
     lines: list[str] = []
     for seg in segments:
@@ -152,7 +153,12 @@ def segments_to_prompt_transcript(segments: list[dict]) -> str:
         m = int((t % 3600) // 60)
         s = int(t % 60)
         text = str(seg.get("text", "")).strip()
-        if text:
+        if not text:
+            continue
+        speaker = str(seg.get("speaker", "")).strip()
+        if speaker:
+            lines.append(f"[{h:02d}:{m:02d}:{s:02d}] [{speaker}]: {text}")
+        else:
             lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {text}")
     return "\n".join(lines)
 

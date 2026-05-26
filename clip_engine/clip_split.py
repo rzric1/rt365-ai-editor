@@ -17,7 +17,7 @@ from clip_engine.openai_resilience import (
     estimate_tokens_rough,
     get_call_context,
 )
-from config import get_openai_model_fast
+from clip_engine.effective_config import resolve_models_from_call_context
 
 logger = logging.getLogger("clip_engine.clip_split")
 
@@ -130,7 +130,7 @@ Schema:
 {{"sub_clips": [{{"start_seconds": 0, "end_seconds": 0, "hook_title": "", "composite_score": 70, "selection_reason": "", "dominant_signal": "educational"}}]}}"""
 
     user = f"TRANSCRIPT INSIDE LONG CLIP:\n{ts_transcript}"
-    model = get_openai_model_fast()
+    model = resolve_models_from_call_context().fast_model
     prompt_estimate = estimate_tokens_rough(system + user)
 
     clip_id = str(clip.get("_wid") or f"split-{t0:.0f}")

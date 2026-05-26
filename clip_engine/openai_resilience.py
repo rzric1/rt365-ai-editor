@@ -18,6 +18,13 @@ from clip_engine.token_tracking import TokenTracker, get_tracker
 
 logger = logging.getLogger("clip_engine.openai_resilience")
 
+# Runtime telemetry (GPT-5 JSON reliability)
+GPT5_SUCCESS_COUNT = 0
+GPT5_EMPTY_JSON_COUNT = 0
+JSON_FALLBACK_COUNT = 0
+_JSON_CALL_COUNT = 0
+_TELEMETRY_LOG_EVERY = 10
+
 # Rough chars-per-token for English transcript + prompts
 CHARS_PER_TOKEN = 4
 DEFAULT_MAX_PROMPT_TOKENS = 12_000
@@ -51,6 +58,9 @@ class OpenAICallContext:
     max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS
     status_callback: Callable[[str], None] | None = None
     tracker: TokenTracker | None = None
+    json_fallback_model: str | None = None
+    model_fast: str | None = None
+    model_quality: str | None = None
 
 
 @dataclass
@@ -184,13 +194,85 @@ def model_is_gpt5_family(model: str) -> bool:
     return (model or "").lower().strip().startswith("gpt-5")
 
 
+def get_json_telemetry() -> dict[str, int | float]:
+    """Snapshot of GPT-5 JSON telemetry counters."""
+    attempts = GPT5_SUCCESS_COUNT + GPT5_EMPTY_JSON_COUNT
+    success_rate = (GPT5_SUCCESS_COUNT / attempts * 100.0) if attempts else 0.0
+    fallback_rate = (JSON_FALLBACK_COUNT / attempts * 100.0) if attempts else 0.0
+    return {
+        "gpt5_success": GPT5_SUCCESS_COUNT,
+        "gpt5_empty_json": GPT5_EMPTY_JSON_COUNT,
+        "json_fallback": JSON_FALLBACK_COUNT,
+        "gpt5_success_rate_pct": round(success_rate, 1),
+        "fallback_rate_pct": round(fallback_rate, 1),
+    }
+
+
+def reset_json_telemetry() -> None:
+    global GPT5_SUCCESS_COUNT, GPT5_EMPTY_JSON_COUNT, JSON_FALLBACK_COUNT, _JSON_CALL_COUNT
+    GPT5_SUCCESS_COUNT = 0
+    GPT5_EMPTY_JSON_COUNT = 0
+    JSON_FALLBACK_COUNT = 0
+    _JSON_CALL_COUNT = 0
+
+
+def _record_gpt5_success() -> None:
+    global GPT5_SUCCESS_COUNT
+    GPT5_SUCCESS_COUNT += 1
+    _maybe_log_telemetry_summary()
+
+
+def _record_gpt5_empty() -> None:
+    global GPT5_EMPTY_JSON_COUNT
+    GPT5_EMPTY_JSON_COUNT += 1
+    _maybe_log_telemetry_summary()
+
+
+def _record_json_fallback(primary_model: str, fallback_model: str, reason: str) -> None:
+    global JSON_FALLBACK_COUNT
+    JSON_FALLBACK_COUNT += 1
+    logger.warning(
+        "GPT-5-mini fallback triggered (%s). Retrying with %s. Fallback count: %d",
+        reason,
+        fallback_model,
+        JSON_FALLBACK_COUNT,
+    )
+    _maybe_log_telemetry_summary()
+
+
+def _maybe_log_telemetry_summary() -> None:
+    global _JSON_CALL_COUNT
+    _JSON_CALL_COUNT += 1
+    if _JSON_CALL_COUNT % _TELEMETRY_LOG_EVERY != 0:
+        return
+    tel = get_json_telemetry()
+    if tel["gpt5_success"] or tel["gpt5_empty_json"] or tel["json_fallback"]:
+        logger.info(
+            "GPT-5-mini JSON success rate: %s%% | Fallback rate: %s%% "
+            "(success=%d empty=%d fallback=%d)",
+            tel["gpt5_success_rate_pct"],
+            tel["fallback_rate_pct"],
+            tel["gpt5_success"],
+            tel["gpt5_empty_json"],
+            tel["json_fallback"],
+        )
+
+
 def resolve_json_fallback_model(primary_model: str) -> str | None:
-    """Return JSON fallback model when primary is gpt-5*, else None."""
+    """Return JSON fallback model from pipeline context or SAFE profile (never env GPT-5)."""
+    ctx = get_call_context()
+    if ctx.json_fallback_model:
+        fb = ctx.json_fallback_model.strip()
+        if fb and fb.lower() != (primary_model or "").lower().strip():
+            return fb
+
     if not model_is_gpt5_family(primary_model):
         return None
-    from config import get_openai_model_json_fallback
 
-    fallback = get_openai_model_json_fallback().strip()
+    from clip_engine.effective_config import resolve_models_from_call_context
+
+    resolved = resolve_models_from_call_context()
+    fallback = resolved.json_fallback_model.strip()
     if not fallback or fallback.lower() == (primary_model or "").lower().strip():
         return None
     return fallback
@@ -289,6 +371,9 @@ def extract_json_from_text(text: str, *, stage: str = "") -> dict | list[Any]:
             last_err = e
             continue
 
+    from clip_engine.telemetry import log_clip_reject
+
+    log_clip_reject("invalid_json", stage=stage or "unknown", chars=len(raw))
     preview = raw[:500].replace("\n", "\\n")
     logger.error(
         "JSON parse failed stage=%s (%d chars). Preview: %s",
@@ -595,12 +680,16 @@ def call_openai_chat_json(
             return False
         attempted_fallback = True
         effective_model = json_fallback
+        if model_is_gpt5_family(primary_model):
+            _record_json_fallback(primary_model, json_fallback, reason)
+        from clip_engine.telemetry import record_json_fallback as _tel_fb
+
+        _tel_fb(f"{stage}_json_fallback", primary_model, json_fallback)
         notice = (
             f"Empty JSON response from {primary_model}; retrying with {json_fallback}."
             if reason == "empty"
             else f"Invalid JSON from {primary_model}; retrying with {json_fallback}."
         )
-        logger.warning(notice)
         _notify_status(notice)
         text = _fetch(json_fallback, f"{stage}_json_fallback")
         return True
@@ -608,6 +697,8 @@ def call_openai_chat_json(
     text = _fetch(primary_model, stage)
 
     if not text.strip():
+        if model_is_gpt5_family(primary_model):
+            _record_gpt5_empty()
         if model_is_gpt5_family(primary_model) and _retry_with_json_fallback("empty"):
             if not text.strip():
                 raise ValueError(
@@ -617,7 +708,10 @@ def call_openai_chat_json(
             raise ValueError(f"Empty model response — no JSON to parse (stage={stage}).")
 
     try:
-        return extract_json_from_text(text, stage=stage)
+        parsed = extract_json_from_text(text, stage=stage)
+        if model_is_gpt5_family(primary_model) and not attempted_fallback:
+            _record_gpt5_success()
+        return parsed
     except (ValueError, json.JSONDecodeError) as parse_err:
         if (
             model_is_gpt5_family(primary_model)
@@ -625,7 +719,8 @@ def call_openai_chat_json(
             and _retry_with_json_fallback("invalid")
         ):
             try:
-                return extract_json_from_text(text, stage=stage)
+                parsed = extract_json_from_text(text, stage=stage)
+                return parsed
             except (ValueError, json.JSONDecodeError):
                 pass
         elif not text.strip():
@@ -641,6 +736,9 @@ def call_openai_chat_json(
             effective_model,
             parse_err,
         )
+        from clip_engine.telemetry import record_json_repair
+
+        record_json_repair(stage, effective_model)
         hint = schema_hint or "Return a single valid JSON object."
         return repair_json_with_chat(
             client,
@@ -700,7 +798,10 @@ def call_openai_with_backoff(
     max_attempts = cfg.max_retries + 1 if use_backoff else 1
     last_exc: BaseException | None = None
 
+    from clip_engine.telemetry import record_openai_request
+
     for attempt in range(1, max_attempts + 1):
+        t_req = time.perf_counter()
         try:
             apply_call_delay()
             _log_openai_request_params(create_kwargs, stage=stage)
@@ -710,9 +811,32 @@ def call_openai_with_backoff(
                     stage, model, attempt, prompt_estimate,
                 )
             response = client.chat.completions.create(**create_kwargs)
+            latency = time.perf_counter() - t_req
             usage = getattr(response, "usage", None)
             if usage:
                 tracker.record_openai_usage(stage, usage, model=model, clip_id=clip_id)
+            finish_reason = None
+            response_empty = True
+            try:
+                choice = response.choices[0]
+                finish_reason = getattr(choice, "finish_reason", None)
+                content = (choice.message.content or "").strip()
+                response_empty = not bool(content)
+            except (AttributeError, IndexError, TypeError):
+                pass
+            record_openai_request(
+                stage=stage,
+                model=str(create_kwargs.get("model", model)),
+                create_kwargs=create_kwargs,
+                latency_sec=latency,
+                retry_count=max(0, attempt - 1),
+                prompt_estimate=prompt_estimate,
+                fallback_used=stage.endswith("_json_fallback"),
+                json_repair="_json_repair" in stage,
+                response_empty=response_empty,
+                finish_reason=finish_reason,
+                usage=usage,
+            )
             return response
         except Exception as exc:
             last_exc = exc

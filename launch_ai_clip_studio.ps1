@@ -50,16 +50,16 @@ if (-not $ff) {
     & ffmpeg.exe -hide_banner -version 2>$null | Select-Object -First 1
 }
 
-$venvActivate = Join-Path $ProjectRoot '.venv\Scripts\Activate.ps1'
+$venvActivate = Join-Path $ProjectRoot '.venv311\Scripts\Activate.ps1'
 if (-not (Test-Path -LiteralPath $venvActivate)) {
-    Write-Host "ERROR: Missing venv: $venvActivate" -ForegroundColor Red
+    Write-Host "ERROR: Missing .venv311 - run scripts\setup_python311_ai_env.ps1" -ForegroundColor Red
     Read-Host 'Press Enter to exit'
     exit 1
 }
 
 . $venvActivate
 
-$st = Join-Path $ProjectRoot '.venv\Scripts\streamlit.exe'
+$st = Join-Path $ProjectRoot '.venv311\Scripts\streamlit.exe'
 if (-not (Test-Path -LiteralPath $st)) {
     Write-Host "ERROR: streamlit not installed in .venv" -ForegroundColor Red
     Read-Host 'Press Enter to exit'
@@ -82,3 +82,4 @@ $code = $LASTEXITCODE
 
 Write-Host "`nStreamlit exited with code $code" -ForegroundColor $(if ($code -eq 0) { 'Green' } else { 'Red' })
 Read-Host 'Press Enter to close this window'
+

@@ -19,7 +19,7 @@ from clip_engine.openai_resilience import (
     get_call_context,
     truncate_text_safe,
 )
-from config import get_openai_model
+from clip_engine.effective_config import ResolvedModels, resolve_models_from_call_context
 
 logger = logging.getLogger("clip_engine.clip_metadata")
 
@@ -89,6 +89,8 @@ def _regenerate_metadata_from_window(
     clip: dict,
     tracker: TokenTracker,
     clip_id: str,
+    *,
+    resolved_models: ResolvedModels | None = None,
 ) -> dict | None:
     """Call GPT to rewrite metadata using ONLY the final transcript window."""
     system = f"""You rewrite short-form clip metadata so it matches ONLY the provided transcript.
@@ -106,7 +108,8 @@ Schema keys: hook_title, selection_reason, ai_context_reason, dominant_signal, p
     user = f"FINAL CLIP TRANSCRIPT (only source of truth):\n{window_text[:8000]}"
     user, _ = truncate_text_safe(user, 8200, label="grounding_window")
     prompt_estimate = estimate_tokens_rough(system + user)
-    model = get_openai_model()
+    models = resolved_models or resolve_models_from_call_context()
+    model = models.quality_model
 
     schema_hint = (
         '{"hook_title": "", "selection_reason": "", "ai_context_reason": "", '
@@ -145,6 +148,7 @@ def ground_clip_metadata_against_window(
     tracker: TokenTracker | None = None,
     force_regenerate: bool = False,
     min_confidence: float = 0.20,
+    resolved_models: ResolvedModels | None = None,
 ) -> dict:
     """
     Verify and correct clip metadata against final start_seconds/end_seconds window.
@@ -194,7 +198,9 @@ def ground_clip_metadata_against_window(
 
     if needs_regen:
         client = openai.OpenAI(api_key=api_key)
-        regen = _regenerate_metadata_from_window(client, window_text, c, tracker, clip_id)
+        regen = _regenerate_metadata_from_window(
+            client, window_text, c, tracker, clip_id, resolved_models=resolved_models
+        )
         if regen:
             if regen.get("hook_title"):
                 c["hook_title"] = str(regen["hook_title"]).strip()
@@ -258,6 +264,7 @@ def ground_all_clips_metadata(
     tracker: TokenTracker | None = None,
     force_regenerate: bool = False,
     skip_strong_grounding: bool = False,
+    resolved_models: ResolvedModels | None = None,
 ) -> list[dict]:
     """Ground metadata for every clip in the list."""
     tracker = tracker or get_tracker()
@@ -266,7 +273,12 @@ def ground_all_clips_metadata(
     out: list[dict] = []
     for c in clips:
         grounded = ground_clip_metadata_against_window(
-            c, segments, api_key, tracker=tracker, force_regenerate=effective_force
+            c,
+            segments,
+            api_key,
+            tracker=tracker,
+            force_regenerate=effective_force,
+            resolved_models=resolved_models,
         )
         out.append(grounded)
     logger.info("Grounded metadata for %d clips", len(out))

@@ -68,9 +68,9 @@ def _minimal_nvenc_probe_cmd(
     preset: str = "p4",
 ) -> list[str]:
     """
-    Short, driver-friendly probe. Heavy export flags (multipass fullres, etc.)
-    are NOT used here — they often fail on tiny synthetic encodes even when
-    full exports work, which produced false 'listed=True probe=False' results.
+    Short, driver-friendly probe at 640×360 (NVENC minimum frame size on many drivers).
+    Heavy export flags (multipass fullres, etc.) are NOT used here — they often fail on
+    tiny synthetic encodes even when full exports work.
     """
     return [
         exe,
@@ -81,7 +81,7 @@ def _minimal_nvenc_probe_cmd(
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=128x128:d=0.04",
+        "color=c=black:s=640x360:d=0.04",
         "-c:v",
         "h264_nvenc",
         *extra_gpu,

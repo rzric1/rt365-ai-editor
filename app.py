@@ -206,7 +206,7 @@ def main() -> None:
 
         st.divider()
         st.header("Resolve")
-        if st.button("Check Resolve connection", use_container_width=True):
+        if st.button("Check Resolve connection", width="stretch"):
             ok, msg, _details = try_resolve_connection()
             if ok:
                 st.success(msg)
@@ -215,10 +215,10 @@ def main() -> None:
 
         st.divider()
         st.header("Folders")
-        if st.button("Open transcripts folder", use_container_width=True):
+        if st.button("Open transcripts folder", width="stretch"):
             open_folder(TRANSCRIPTS_DIR)
             st.toast("Opened transcripts folder.", icon="📂")
-        if st.button("Open logs folder", use_container_width=True):
+        if st.button("Open logs folder", width="stretch"):
             from config import LOGS_DIR
 
             open_folder(LOGS_DIR)

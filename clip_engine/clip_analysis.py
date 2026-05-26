@@ -25,7 +25,7 @@ from clip_engine.openai_resilience import (
     get_call_context,
     truncate_text_safe,
 )
-from config import get_openai_model_fast
+from clip_engine.effective_config import resolve_models_from_call_context
 
 logger = logging.getLogger("clip_engine.clip_analysis")
 
@@ -289,7 +289,7 @@ def _analyze_region(
     from clip_engine.analysis_cache import AnalysisProgress, save_progress
 
     tracker = tracker or get_tracker()
-    model = model or get_openai_model_fast()
+    model = model or resolve_models_from_call_context().fast_model
     stage = f"clip_analysis_{pass_name}_{region_label}"
 
     if progress and isinstance(progress, AnalysisProgress):
@@ -364,8 +364,8 @@ def _analyze_region(
     if progress and isinstance(progress, AnalysisProgress) and cache_key:
         progress.mark_done(pass_name, region_label)
         progress.partial_candidates.extend(validated)
-        progress.partial_candidates = dedupe_candidates_by_time(
-            progress.partial_candidates, min_gap_seconds=10.0,
+        progress.partial_candidates = dedupe_candidates_exact_start(
+            progress.partial_candidates,
         )
         save_progress(progress)
 
@@ -380,6 +380,11 @@ def _analyze_region(
 # Candidate deduplication
 # ---------------------------------------------------------------------------
 
+# Early candidate-pool dedupe only: drop near-exact duplicates by start time.
+# User-facing min_gap_seconds applies later in run_diversity_pipeline only.
+EARLY_POOL_START_GAP_SECONDS = 5.0
+
+
 def _clip_time_range(c: dict) -> tuple[float, float]:
     t0 = float(c.get("start_seconds", c.get("start", 0)))
     t1 = float(c.get("end_seconds", c.get("end", t0)))
@@ -388,6 +393,27 @@ def _clip_time_range(c: dict) -> tuple[float, float]:
 
 def _ranges_overlap(a: tuple[float, float], b: tuple[float, float], gap: float = 0.0) -> bool:
     return a[0] < b[1] + gap and b[0] < a[1] + gap
+
+
+def dedupe_candidates_exact_start(
+    candidates: list[dict],
+    *,
+    start_gap_seconds: float = EARLY_POOL_START_GAP_SECONDS,
+) -> list[dict]:
+    """
+    Early pool dedupe: remove only clips whose start times are within start_gap_seconds
+    of a higher-scored clip. Does not use range overlap or user-facing min gap.
+    """
+    sorted_c = sorted(candidates, key=lambda x: int(x.get("composite_score", 0)), reverse=True)
+    kept: list[dict] = []
+    kept_starts: list[float] = []
+    for c in sorted_c:
+        t0 = float(c.get("start_seconds", c.get("start", 0)))
+        if any(abs(t0 - ks) < start_gap_seconds for ks in kept_starts):
+            continue
+        kept.append(c)
+        kept_starts.append(t0)
+    return kept
 
 
 def dedupe_candidates_by_time(candidates: list[dict], min_gap_seconds: float = 15.0) -> list[dict]:
@@ -442,6 +468,8 @@ def collect_candidates_multipass(
     model: str | None = None,
     discovery_mode: bool = False,
     pool_stats: dict[str, int] | None = None,
+    passes_override: tuple[str, ...] | None = None,
+    region_filter_override: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Run analysis passes until candidate pool reaches pool_target (or rounds exhausted)."""
     import openai
@@ -449,7 +477,7 @@ def collect_candidates_multipass(
     settings = prompt_settings or ClipPromptSettings()
     tracker = tracker or get_tracker()
     client = openai.OpenAI(api_key=api_key)
-    model = model or get_openai_model_fast()
+    model = model or resolve_models_from_call_context().fast_model
     ctx = get_call_context()
 
     if segments and media_duration > 0:
@@ -457,13 +485,16 @@ def collect_candidates_multipass(
     else:
         chunks = _chunk_transcript(transcript, settings.n_transcript_chunks)
 
-    if region_filter:
-        chunks = [(r, t) for r, t in chunks if r in region_filter] or chunks
+    active_region_filter = region_filter_override or region_filter
+    if active_region_filter:
+        chunks = [(r, t) for r, t in chunks if r in active_region_filter] or chunks
 
     pass_map = {name: focus for name, focus in PASS_DEFINITIONS}
     pass_map[EXPANSION_PASS[0]] = EXPANSION_PASS[1]
 
-    if passes:
+    if passes_override:
+        pass_list = [(p, pass_map.get(p, "")) for p in passes_override if p in pass_map]
+    elif passes:
         pass_list = [(p, pass_map.get(p, "")) for p in passes if p in pass_map]
     else:
         if discovery_mode:
@@ -505,8 +536,7 @@ def collect_candidates_multipass(
                     region_stats=stats,
                 )
                 all_candidates.extend(region_clips)
-                gap = 8.0 if discovery_mode else 10.0
-                all_candidates = dedupe_candidates_by_time(all_candidates, min_gap_seconds=gap)
+                all_candidates = dedupe_candidates_exact_start(all_candidates)
                 stats["rejected_overlap_early"] = stats.get("rejected_overlap_early", 0) + max(
                     0, before_dedupe + len(region_clips) - len(all_candidates)
                 )

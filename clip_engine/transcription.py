@@ -185,15 +185,19 @@ def transcribe_video(
             "in .env to the full path to ffmpeg (e.g. WinGet Gyan.FFmpeg) and restart the app."
         )
 
+    from clip_engine.telemetry import pipeline_phase
+
     wav_path = work_dir / "_whisper_input.wav"
-    extract_audio_wav(video_path, wav_path)
+    with pipeline_phase("audio_extract"):
+        extract_audio_wav(video_path, wav_path)
 
     if prefer_gpu and os.environ.get("FORCE_CPU_WHISPER", "").lower() not in ("1", "true", "yes"):
-        local = transcribe_with_faster_whisper_cuda(
-            wav_path,
-            language=language,
-            model_size=faster_whisper_model,
-        )
+        with pipeline_phase("transcription"):
+            local = transcribe_with_faster_whisper_cuda(
+                wav_path,
+                language=language,
+                model_size=faster_whisper_model,
+            )
         if local is not None:
             segs, txt, dev_tag = local
             label = "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU int8/float32 fallback)"
@@ -223,11 +227,12 @@ def transcribe_video(
             kwargs["language"] = language
         return client.audio.transcriptions.create(**kwargs)
 
-    try:
-        tr = _request()
-    except TypeError:
-        language = None
-        tr = _request()
+    with pipeline_phase("transcription"):
+        try:
+            tr = _request()
+        except TypeError:
+            language = None
+            tr = _request()
 
     segments, full_text = _segments_from_response(tr)
 

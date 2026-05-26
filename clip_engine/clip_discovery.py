@@ -11,6 +11,7 @@ import re
 from typing import Any
 
 from clip_engine.clip_signals import compute_signal_boosts
+from clip_engine.clip_split_parts import flag_split_recommended
 from clip_engine.clip_style import ClipStyle, ClipStyleProfile
 from clip_engine.transcription_utils import extract_transcript_window, merge_segments_into_sentences
 
@@ -77,7 +78,7 @@ def validate_clip_candidate(
     if dur < hard_floor:
         hard.append(f"Too short: {dur:.1f}s")
     max_allowed = max_clip_seconds * (1.08 if discovery_mode else 1.0)
-    if dur > max_allowed:
+    if dur > max_allowed and not c.get("split_recommended"):
         hard.append(f"Too long: {dur:.1f}s")
 
     if segments:
@@ -122,7 +123,7 @@ def rescue_clip_candidate(
     dur = t1 - t0
     if dur < min_clip_seconds:
         t1 = min(t0 + min_clip_seconds, media_duration if media_duration > 0 else t0 + min_clip_seconds)
-    if dur > max_clip_seconds:
+    if dur > max_clip_seconds and not out.get("split_recommended"):
         t1 = t0 + max_clip_seconds
 
     out["start_seconds"] = round(t0, 3)
@@ -180,6 +181,8 @@ def process_raw_clips(
         c["_region"] = region_label or c.get("_region", "")
         c["_pass"] = pass_name or c.get("_pass", "")
 
+        flag_split_recommended(c, max_clip_seconds)
+
         rescued = rescue_clip_candidate(
             c,
             min_clip_seconds=min_clip_seconds,
@@ -199,13 +202,47 @@ def process_raw_clips(
         )
 
         if hard:
+            from clip_engine.telemetry import log_clip_reject
+
+            clip_id = f"{region_label}_{rescued.get('hook_title', '')[:24]}"
             for issue in hard:
                 if "end <=" in issue or "negative" in issue or "beyond media" in issue:
                     stats["rejected_invalid_time"] += 1
-                elif "Too short" in issue or "Too long" in issue:
+                    log_clip_reject(
+                        "invalid_time",
+                        issue=issue,
+                        candidate_clip=clip_id,
+                        region=region_label,
+                    )
+                elif "Too short" in issue:
                     stats["rejected_duration"] += 1
+                    dur = float(rescued.get("end_seconds", 0)) - float(
+                        rescued.get("start_seconds", 0)
+                    )
+                    log_clip_reject(
+                        "duration_too_short",
+                        duration=round(dur, 1),
+                        minimum=min_clip_seconds,
+                        candidate_clip=clip_id,
+                    )
+                elif "Too long" in issue:
+                    stats["rejected_duration"] += 1
+                    dur = float(rescued.get("end_seconds", 0)) - float(
+                        rescued.get("start_seconds", 0)
+                    )
+                    log_clip_reject(
+                        "duration_too_long",
+                        duration=round(dur, 1),
+                        maximum=max_clip_seconds,
+                        candidate_clip=clip_id,
+                    )
                 elif "Empty transcript" in issue:
                     stats["rejected_empty_transcript"] += 1
+                    log_clip_reject(
+                        "empty_transcript",
+                        candidate_clip=clip_id,
+                        region=region_label,
+                    )
             logger.debug("Hard reject region=%s: %s (%s)", region_label, hard, rescued.get("hook_title"))
             continue
 

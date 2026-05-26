@@ -19,6 +19,10 @@ from typing import NamedTuple
 
 logger = logging.getLogger("clip_engine.clip_diversity")
 
+MIN_HOOK_SCORE = 35
+MIN_CLIPS_FLOOR = 5
+NEARBY_CONTENT_START_GAP = 60.0
+
 
 @dataclass
 class DiversityPipelineStats:
@@ -121,6 +125,23 @@ def remove_overlapping_clips(
             kept.append(clip)
         else:
             removed += 1
+            from clip_engine.telemetry import log_clip_reject
+
+            conflict_clip = next(
+                (k for k in kept if clips_overlap(clip, k, min_gap_seconds)), None
+            )
+            log_clip_reject(
+                "timeline_overlap",
+                candidate_clip=(
+                    f"{clip.get('hook_title', '?')} @"
+                    f"{float(clip.get('start_seconds', clip.get('start', 0))):.0f}s"
+                ),
+                existing_clip=(
+                    f"{(conflict_clip or {}).get('hook_title', '?')} @"
+                    f"{float((conflict_clip or {}).get('start_seconds', (conflict_clip or {}).get('start', 0))):.0f}s"
+                ),
+                min_gap_seconds=min_gap_seconds,
+            )
             logger.debug(
                 "Overlap removed: %.1f-%.1f '%s'",
                 float(clip.get("start_seconds", 0)),
@@ -161,8 +182,144 @@ def _clip_text(clip: dict) -> str:
         str(clip.get("selection_reason", "")),
         str(clip.get("ai_context_reason", "")),
         str(clip.get("dominant_signal", "")),
+        str(clip.get("grounded_transcript_excerpt", "")),
     ]
     return " ".join(p for p in parts if p)
+
+
+def _clip_start_seconds(clip: dict) -> float:
+    return float(clip.get("start_seconds", clip.get("start", 0)))
+
+
+def _clip_hook_score(clip: dict) -> int:
+    if clip.get("hook_score") is not None:
+        return int(clip.get("hook_score", 0))
+    sig = clip.get("signal_scores") or clip.get("local_signals") or {}
+    if sig.get("scroll_stopping_hook") is not None:
+        return int(sig.get("scroll_stopping_hook", 0))
+    scores = clip.get("scores") or {}
+    return int(scores.get("hook_strength", 0))
+
+
+def filter_minimum_hook_score(clips: list[dict]) -> tuple[list[dict], int]:
+    """
+    Drop clips with hook_score below MIN_HOOK_SCORE unless that would leave
+    fewer than MIN_CLIPS_FLOOR clips (then keep the highest hook scores).
+    """
+    if not clips:
+        return clips, 0
+
+    strong = [c for c in clips if _clip_hook_score(c) >= MIN_HOOK_SCORE]
+    if len(strong) >= MIN_CLIPS_FLOOR:
+        kept_ids = {id(c) for c in strong}
+        removed = 0
+        for c in clips:
+            if id(c) not in kept_ids:
+                removed += 1
+                from clip_engine.telemetry import log_clip_reject
+
+                log_clip_reject(
+                    "weak_hook",
+                    hook_score=_clip_hook_score(c),
+                    threshold=MIN_HOOK_SCORE,
+                    clip=c.get("hook_title", ""),
+                )
+        return strong, removed
+
+    ranked = sorted(clips, key=_clip_hook_score, reverse=True)
+    kept = ranked[: min(MIN_CLIPS_FLOOR, len(ranked))]
+    kept_ids = {id(c) for c in kept}
+    removed = 0
+    for c in clips:
+        if id(c) not in kept_ids:
+            removed += 1
+            if _clip_hook_score(c) < MIN_HOOK_SCORE:
+                from clip_engine.telemetry import log_clip_reject
+
+                log_clip_reject(
+                    "weak_hook",
+                    hook_score=_clip_hook_score(c),
+                    threshold=MIN_HOOK_SCORE,
+                    clip=c.get("hook_title", ""),
+                )
+    from clip_engine.clip_split_parts import apply_series_hook_filter
+
+    kept = apply_series_hook_filter(clips, kept)
+    return kept, removed
+
+
+def remove_content_overlap_nearby(
+    clips: list[dict],
+    *,
+    similarity_threshold: float = 0.45,
+    max_start_gap_seconds: float = NEARBY_CONTENT_START_GAP,
+) -> tuple[list[dict], int]:
+    """
+    Remove lower-scored clips that are semantically similar to a kept clip and
+    whose start times are within max_start_gap_seconds (start-to-start).
+    """
+    if len(clips) <= 1:
+        return clips, 0
+
+    from clip_engine.semantic_ranking import (
+        embeddings_available,
+        generate_embeddings,
+        semantic_similarity,
+    )
+
+    if not embeddings_available():
+        return clips, 0
+
+    texts = [_clip_text(c) for c in clips]
+    try:
+        emb = generate_embeddings(texts)
+    except Exception as exc:
+        logger.warning("Content overlap nearby check skipped: %s", exc)
+        return clips, 0
+
+    sorted_idx = sorted(
+        range(len(clips)),
+        key=lambda i: int(clips[i].get("composite_score", 0)),
+        reverse=True,
+    )
+    kept: list[dict] = []
+    kept_idx: list[int] = []
+    removed = 0
+
+    for i in sorted_idx:
+        clip = clips[i]
+        vec = emb[i]
+        conflict = False
+        for ki in kept_idx:
+            start_gap = abs(_clip_start_seconds(clip) - _clip_start_seconds(clips[ki]))
+            if start_gap >= max_start_gap_seconds:
+                continue
+            sim = semantic_similarity(vec, emb[ki])
+            if sim >= similarity_threshold:
+                from clip_engine.telemetry import log_clip_reject
+
+                log_clip_reject(
+                    "content_overlap_nearby",
+                    start_a=int(_clip_start_seconds(clips[ki])),
+                    start_b=int(_clip_start_seconds(clip)),
+                    similarity=round(sim, 2),
+                )
+                logger.debug(
+                    "Content overlap nearby (%.2f): %.0fs vs %.0fs '%s' ~ '%s'",
+                    sim,
+                    _clip_start_seconds(clips[ki]),
+                    _clip_start_seconds(clip),
+                    clips[ki].get("hook_title", ""),
+                    clip.get("hook_title", ""),
+                )
+                removed += 1
+                conflict = True
+                break
+        if not conflict:
+            kept.append(clip)
+            kept_idx.append(i)
+
+    return kept, removed
 
 
 def remove_semantic_duplicates(
@@ -181,6 +338,20 @@ def remove_semantic_duplicates(
         for k in kept:
             sim = text_similarity(clip_text, _clip_text(k))
             if sim >= similarity_threshold:
+                from clip_engine.telemetry import log_clip_reject
+
+                log_clip_reject(
+                    "duplicate_similarity",
+                    similarity=round(sim, 2),
+                    existing_clip=(
+                        f"{k.get('hook_title', '?')} @"
+                        f"{float(k.get('start_seconds', k.get('start', 0))):.0f}s"
+                    ),
+                    candidate_clip=(
+                        f"{clip.get('hook_title', '?')} @"
+                        f"{float(clip.get('start_seconds', clip.get('start', 0))):.0f}s"
+                    ),
+                )
                 logger.debug(
                     "Semantic dup (%.2f): '%s' ~ '%s'",
                     sim,
@@ -233,7 +404,7 @@ def enforce_timeline_diversity(
         for c in region_clips:
             if added >= min_per_region:
                 break
-            if not any(clips_overlap(c, s, min_gap_seconds=30.0) for s in selected):
+            if not any(clips_overlap(c, s, min_gap_seconds=15.0) for s in selected):
                 selected.append(c)
                 added += 1
         if added == 0:
@@ -251,7 +422,7 @@ def enforce_timeline_diversity(
     for c in remaining:
         if len(selected) >= target_count:
             break
-        if not any(clips_overlap(c, s, min_gap_seconds=30.0) for s in selected):
+        if not any(clips_overlap(c, s, min_gap_seconds=15.0) for s in selected):
             selected.append(c)
 
     # Final sort by timeline position
@@ -351,8 +522,8 @@ def run_diversity_pipeline(
     gap_steps = [min_gap_seconds]
     if relax_if_under_target:
         gap_steps.extend([
-            max(40.0, min_gap_seconds * 0.75),
-            max(30.0, min_gap_seconds * 0.5),
+            max(20.0, min_gap_seconds * 0.6),
+            max(10.0, min_gap_seconds * 0.3),
         ])
 
     best_result: list[dict] = []
@@ -361,6 +532,9 @@ def run_diversity_pipeline(
     for gap in gap_steps:
         working = sorted(clips, key=lambda x: int(x.get("composite_score", 0)), reverse=True)
         working, removed_overlap = remove_overlapping_clips(working, min_gap_seconds=gap)
+        working, _ = remove_content_overlap_nearby(
+            working, similarity_threshold=similarity_threshold
+        )
         working, removed_dup = remove_semantic_duplicates(
             working, similarity_threshold=similarity_threshold
         )

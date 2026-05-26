@@ -25,6 +25,10 @@ class PipelineOpenAIConfig:
     status_callback: Callable[[str], None] | None = None
     model_fast: str | None = None
     model_final: str | None = None
+    model_quality: str | None = None
+    json_fallback_model: str | None = None
+    ai_profile_name: str = "SAFE"
+    enable_gpu_prefilter: bool = True
 
     # Aliases for alternate naming (clip_studio / docs)
     @property
@@ -58,6 +62,8 @@ class PipelineStats:
     rejected_overlap_early: int = 0
     removed_overlap: int = 0
     removed_duplicates: int = 0
+    removed_weak_hook: int = 0
+    series_splits: int = 0
     after_diversity: int = 0
     after_split: int = 0
     final_clips: int = 0
@@ -65,6 +71,13 @@ class PipelineStats:
     expansion_pass_count: int = 0
     rejected_ungrounded: int = 0
     discovery_mode: bool = False
+    gpu_local_candidates: int = 0
+    gpu_shortlist: int = 0
+    semantic_dedupe_removed: int = 0
+    gpt_passes_used: int = 0
+    ai_profile: str = "SAFE"
+    gpu_explorer_rows: list = field(default_factory=list)
+    json_telemetry: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     cache_hit: bool = False
     resumed_from_progress: bool = False
@@ -86,6 +99,8 @@ class PipelineStats:
             "rejected_overlap_early": self.rejected_overlap_early,
             "removed_overlap": self.removed_overlap,
             "removed_duplicates": self.removed_duplicates,
+            "removed_weak_hook": self.removed_weak_hook,
+            "series_splits": self.series_splits,
             "after_diversity": self.after_diversity,
             "after_split": self.after_split,
             "final_clips": self.final_clips,
@@ -93,12 +108,20 @@ class PipelineStats:
             "expansion_pass_count": self.expansion_pass_count,
             "rejected_ungrounded": self.rejected_ungrounded,
             "discovery_mode": self.discovery_mode,
+            "gpu_local_candidates": self.gpu_local_candidates,
+            "gpu_shortlist": self.gpu_shortlist,
+            "semantic_dedupe_removed": self.semantic_dedupe_removed,
+            "gpt_passes_used": self.gpt_passes_used,
+            "ai_profile": self.ai_profile,
+            "json_telemetry": self.json_telemetry,
             "warnings": self.warnings,
             "cache_hit": self.cache_hit,
             "resumed_from_progress": self.resumed_from_progress,
             "estimated_tokens": self.estimated_tokens,
             "model_fast": self.model_fast,
             "model_quality": self.model_quality,
+            "gpu_explorer_rows": self.gpu_explorer_rows,
+            "session_telemetry": get_session_telemetry().to_dict(),
         }
 
 
@@ -113,31 +136,59 @@ from clip_engine.analysis_cache import (
 from clip_engine.clip_analysis import (
     ClipPromptSettings,
     collect_candidates_multipass,
-    dedupe_candidates_by_time,
+    dedupe_candidates_exact_start,
 )
-from clip_engine.clip_diversity import run_diversity_pipeline, underrepresented_regions
+from clip_engine.effective_config import (
+    ResolvedModels,
+    plan_analysis_token_estimate,
+)
+from clip_engine.clip_diversity import (
+    filter_minimum_hook_score,
+    run_diversity_pipeline,
+    underrepresented_regions,
+)
+from clip_engine.clip_split_parts import (
+    apply_recommended_series_splits,
+    flag_split_recommended,
+)
 from clip_engine.clip_expand import ClipExpansionSettings, finalize_clips_after_ai
 from clip_engine.clip_metadata import ground_all_clips_metadata
 from clip_engine.clip_split import split_long_clips
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
+from clip_engine.ai_profiles import get_ai_profile
 from clip_engine.clip_discovery import empty_pool_stats, generate_local_fallback_candidates
+from clip_engine.gpu_pipeline import run_gpu_prefilter_pipeline
 from clip_engine.clip_signals import apply_signal_boosts_to_clips
 from clip_engine.speaker_signals import apply_speaker_signals_to_clips
 from clip_engine.openai_resilience import (
     OpenAICallContext,
     OpenAIRateLimitError,
     estimate_pipeline_tokens,
+    get_json_telemetry,
+    reset_json_telemetry,
     set_call_context,
     token_saver_pass_config,
 )
 from clip_engine.token_tracking import TokenTracker, get_tracker, reset_tracker
-from config import get_openai_model, get_openai_model_fast
+from clip_engine.effective_config import resolve_models_from_profile
+from clip_engine.telemetry import (
+    get_session_telemetry,
+    log_clip_reject,
+    log_gpu_memory,
+    log_pipeline_timing_summary,
+    log_rejection_summary,
+    log_session_tokens_summary,
+    pipeline_phase,
+    reset_session_telemetry,
+)
 
 
 def _assign_clip_ids(clips: list[dict]) -> list[dict]:
     for c in clips:
         if not c.get("_wid"):
             c["_wid"] = uuid.uuid4().hex
+        if not c.get("clip_id"):
+            c["clip_id"] = c["_wid"]
     return clips
 
 
@@ -198,9 +249,7 @@ def _run_expansion_passes(
         )
         if not extra:
             break
-        merged_candidates = dedupe_candidates_by_time(
-            merged_candidates + extra, min_gap_seconds=12.0
-        )
+        merged_candidates = dedupe_candidates_exact_start(merged_candidates + extra)
         selected, _ = run_diversity_pipeline(
             merged_candidates,
             media_duration=media_duration,
@@ -249,19 +298,41 @@ def run_full_clip_pipeline(
       7. Metadata grounding on final windows
     """
     tracker = reset_tracker(video_filename=video_filename)
+    reset_session_telemetry()
     stats = PipelineStats(target_clips=target_count, discovery_mode=discovery_mode)
     oai = openai_config or PipelineOpenAIConfig()
     pool_stats = empty_pool_stats()
-    model_fast = get_openai_model_fast()
-    model_quality = get_openai_model()
+    ai_prof = get_ai_profile(oai.ai_profile_name or "SAFE")
+    stats.ai_profile = ai_prof.name
+
+    if oai.model_fast and oai.model_quality:
+        resolved = ResolvedModels(
+            fast_model=oai.model_fast,
+            quality_model=oai.model_final or oai.model_quality,
+            json_fallback_model=oai.json_fallback_model or ai_prof.json_fallback_model,
+            profile_name=ai_prof.name,
+        )
+    else:
+        resolved = resolve_models_from_profile(ai_prof)
+    model_fast = resolved.fast_model
+    model_quality = resolved.quality_model
+    json_fallback = resolved.json_fallback_model
     stats.model_fast = model_fast
     stats.model_quality = model_quality
+
+    reset_json_telemetry()
 
     style_name = clip_style if clip_style in ("Balanced", "Micro clips", "Long story clips") else "Balanced"
     n_passes, max_pass_rounds, _ = token_saver_pass_config(style_name)
     if not oai.token_saver_mode:
         n_passes = 3
         max_pass_rounds = 2
+
+    _PASS_NAMES = ("primary", "gems", "micro")
+    passes_override: tuple[str, ...] | None = tuple(
+        _PASS_NAMES[: max(1, min(ai_prof.max_gpt_passes, 3))]
+    )
+    stats.gpt_passes_used = len(passes_override)
 
     token_estimate = estimate_pipeline_tokens(
         formatted,
@@ -318,6 +389,9 @@ def run_full_clip_pipeline(
         max_chunk_chars=8_000 if oai.token_saver_mode else 10_000,
         status_callback=oai.status_callback,
         tracker=tracker,
+        json_fallback_model=json_fallback,
+        model_fast=model_fast,
+        model_quality=model_quality,
     )
     set_call_context(ctx)
 
@@ -364,25 +438,83 @@ def run_full_clip_pipeline(
 
     min_acceptable = max(12, int(target_count * 0.6))
 
+    gpu_shortlist: list[dict] = []
+    region_filter_gpu: tuple[str, ...] | None = None
+    gpu_explorer_rows: list[dict] = []
+    if oai.enable_gpu_prefilter and segments and media_duration > 0:
+        try:
+            log_gpu_memory("before_embeddings")
+            eff_max_clip = min(user_max_seconds, ai_prof.max_clip_length)
+            with pipeline_phase("semantic_prefilter"):
+                gpu_shortlist, gpu_stats = run_gpu_prefilter_pipeline(
+                segments,
+                media_duration,
+                clip_style=style_name,
+                user_min_seconds=user_min_seconds,
+                user_max_seconds=eff_max_clip,
+                target_count=target_count,
+                pool_target=pool_target,
+                ai_profile=ai_prof,
+                )
+            log_gpu_memory("after_embeddings")
+            stats.gpu_local_candidates = int(gpu_stats.get("local_prefilter_count", 0))
+            stats.gpu_shortlist = int(gpu_stats.get("shortlist_count", 0))
+            stats.semantic_dedupe_removed = int(gpu_stats.get("semantic_dedupe_removed", 0))
+            gpu_explorer_rows = list(gpu_stats.get("explorer_rows") or [])
+            regions = gpu_stats.get("active_regions") or []
+            if regions:
+                region_filter_gpu = tuple(regions[: ai_prof.max_active_gpt_regions])
+            est_refine = int(gpu_stats.get("estimated_refinement_tokens", 0))
+            if est_refine > oai.max_tokens_budget:
+                oai.token_saver_mode = True
+                passes_override = tuple(
+                    _PASS_NAMES[: max(1, min(ai_prof.max_gpt_passes, 1))]
+                )
+                stats.gpt_passes_used = len(passes_override)
+                stats.warnings.append(
+                    f"GPU prefilter estimated ~{est_refine:,} refinement tokens exceeds "
+                    f"budget ({oai.max_tokens_budget:,}); limiting to 1 GPT pass."
+                )
+            stats.warnings.append(
+                f"GPU prefilter: {stats.gpu_shortlist} shortlist "
+                f"(raw={stats.gpu_local_candidates}, est refine tokens≈{est_refine:,}, "
+                f"embeddings GPU: {gpu_stats.get('embeddings_on_gpu', False)})."
+            )
+        except Exception as exc:
+            logger.warning("GPU prefilter skipped: %s", exc)
+            stats.warnings.append(f"GPU prefilter unavailable: {exc}")
+    stats.gpu_explorer_rows = gpu_explorer_rows
+
     try:
-        candidates = collect_candidates_multipass(
-            formatted,
-            api_key,
-            optional_content_note=creator_note,
-            prompt_settings=prompt_settings,
-            segments=segments,
-            media_duration=media_duration,
-            pool_target=pool_target,
-            tracker=tracker,
-            max_pass_rounds=max_pass_rounds,
-            progress=progress,
-            cache_key=cache_key,
-            model=model_fast,
-            discovery_mode=discovery_mode,
-            pool_stats=pool_stats,
+        candidates: list[dict] = list(gpu_shortlist)
+        with pipeline_phase("openai_refinement"):
+            ai_candidates = collect_candidates_multipass(
+                formatted,
+                api_key,
+                optional_content_note=creator_note,
+                prompt_settings=prompt_settings,
+                segments=segments,
+                media_duration=media_duration,
+                pool_target=pool_target,
+                tracker=tracker,
+                max_pass_rounds=max_pass_rounds,
+                progress=progress,
+                cache_key=cache_key,
+                model=model_fast,
+                discovery_mode=discovery_mode,
+                pool_stats=pool_stats,
+                passes_override=passes_override,
+                region_filter_override=region_filter_gpu,
+            )
+        pool_stats["local_prefilter_candidates"] = stats.gpu_shortlist
+        candidates.extend(ai_candidates)
+        # Early pool dedupe: start times within 5s only (not user min_gap_seconds).
+        before_early = len(candidates)
+        candidates = dedupe_candidates_exact_start(candidates)
+        stats.rejected_overlap_early = int(pool_stats.get("rejected_overlap_early", 0)) + (
+            before_early - len(candidates)
         )
-        early_gap = 8.0 if discovery_mode else 12.0
-        candidates = dedupe_candidates_by_time(candidates, min_gap_seconds=early_gap)
+        stats.json_telemetry = get_json_telemetry()
         stats.raw_candidates = len(candidates)
         stats.raw_ai_candidates = pool_stats.get("raw_ai_candidates", 0)
         stats.valid_after_schema = pool_stats.get("valid_after_schema", 0)
@@ -390,7 +522,6 @@ def run_full_clip_pipeline(
         stats.rejected_invalid_time = pool_stats.get("rejected_invalid_time", 0)
         stats.rejected_duration = pool_stats.get("rejected_duration", 0)
         stats.rejected_empty_transcript = pool_stats.get("rejected_empty_transcript", 0)
-        stats.rejected_overlap_early = pool_stats.get("rejected_overlap_early", 0)
         logger.info("Candidate pool after multipass: %d (target pool=%d)", len(candidates), pool_target)
 
         # Boost collection when pool is still small (always in discovery mode; full mode otherwise)
@@ -419,8 +550,13 @@ def run_full_clip_pipeline(
                 model=model_fast,
                 discovery_mode=discovery_mode,
                 pool_stats=pool_stats,
+                passes_override=passes_override,
+                region_filter_override=region_filter_gpu,
             )
-            candidates = dedupe_candidates_by_time(candidates + extra_pool, min_gap_seconds=early_gap)
+            before_boost = len(candidates)
+            candidates = dedupe_candidates_exact_start(candidates + extra_pool)
+            stats.rejected_overlap_early += before_boost + len(extra_pool) - len(candidates)
+            stats.json_telemetry = get_json_telemetry()
             stats.raw_candidates = len(candidates)
             stats.raw_ai_candidates = pool_stats.get("raw_ai_candidates", stats.raw_ai_candidates)
             stats.valid_after_schema = pool_stats.get("valid_after_schema", stats.valid_after_schema)
@@ -440,9 +576,9 @@ def run_full_clip_pipeline(
                 user_max_seconds=user_max_seconds,
             )
             if fallback:
-                candidates = dedupe_candidates_by_time(
-                    candidates + fallback, min_gap_seconds=early_gap
-                )
+                before_fb = len(candidates)
+                candidates = dedupe_candidates_exact_start(candidates + fallback)
+                stats.rejected_overlap_early += before_fb + len(fallback) - len(candidates)
                 stats.local_fallback_candidates = len(fallback)
                 stats.raw_candidates = len(candidates)
                 stats.warnings.append(
@@ -502,7 +638,10 @@ def run_full_clip_pipeline(
                 user_max_seconds=user_max_seconds,
             )
             if fallback_sel:
-                merged = dedupe_candidates_by_time(candidates + fallback_sel, min_gap_seconds=early_gap)
+                before_m = len(candidates)
+                merged = dedupe_candidates_exact_start(candidates + fallback_sel)
+                stats.rejected_overlap_early += before_m + len(fallback_sel) - len(merged)
+                candidates = merged
                 stats.local_fallback_candidates += len(fallback_sel)
                 selected, div2 = run_diversity_pipeline(
                     merged,
@@ -519,15 +658,16 @@ def run_full_clip_pipeline(
                 stats.removed_duplicates += div2.removed_duplicates
                 stats.after_diversity = len(selected)
 
-        selected = split_long_clips(
-            selected,
-            segments,
-            api_key,
-            max_duration=profile.split_threshold_seconds,
-            sub_clip_max=profile.sub_clip_max_seconds,
-            min_duration=max(user_min_seconds, profile.ideal_min_seconds * 0.8),
-            tracker=tracker,
-        )
+        with pipeline_phase("clip_splitting"):
+            selected = split_long_clips(
+                selected,
+                segments,
+                api_key,
+                max_duration=profile.split_threshold_seconds,
+                sub_clip_max=profile.sub_clip_max_seconds,
+                min_duration=max(user_min_seconds, profile.ideal_min_seconds * 0.8),
+                tracker=tracker,
+            )
         stats.after_split = len(selected)
 
         if len(selected) > target_count:
@@ -576,14 +716,17 @@ def run_full_clip_pipeline(
 
         selected = _assign_clip_ids(selected)
 
-        selected = ground_all_clips_metadata(
-            selected,
-            segments,
-            api_key,
-            tracker=tracker,
-            force_regenerate=True,
-            skip_strong_grounding=oai.token_saver_mode,
-        )
+        with pipeline_phase("metadata_grounding"):
+            selected = ground_all_clips_metadata(
+                selected,
+                segments,
+                api_key,
+                tracker=tracker,
+                force_regenerate=True,
+                skip_strong_grounding=oai.token_saver_mode,
+                resolved_models=resolved,
+            )
+        log_gpu_memory("after_openai_phase")
 
         grounded: list[dict] = []
         ungrounded_floor = 8 if discovery_mode else 15
@@ -602,6 +745,12 @@ def run_full_clip_pipeline(
                     grounded.append(c)
                     continue
                 stats.rejected_ungrounded += 1
+                log_clip_reject(
+                    "metadata_weak",
+                    grounding_confidence=conf,
+                    candidate_clip=c.get("hook_title", ""),
+                    threshold=ungrounded_floor,
+                )
                 logger.info(
                     "Rejected ungrounded clip: %s (confidence=%d)",
                     c.get("hook_title", ""), conf,
@@ -616,6 +765,17 @@ def run_full_clip_pipeline(
         selected = apply_speaker_signals_to_clips(
             selected, segments, enabled=enable_speaker_signals,
         )
+
+        max_part_len = min(user_max_seconds, ai_prof.max_clip_length)
+        for c in selected:
+            flag_split_recommended(c, max_part_len)
+        selected, stats.series_splits = apply_recommended_series_splits(
+            selected,
+            formatted,
+            segments=segments,
+        )
+        selected = _assign_clip_ids(selected)
+        selected, stats.removed_weak_hook = filter_minimum_hook_score(selected)
 
         stats.final_clips = len(selected)
 
@@ -654,6 +814,14 @@ def run_full_clip_pipeline(
                 ),
             )
 
+        token_plan = plan_analysis_token_estimate(
+            formatted,
+            ai_prof,
+            target_count=target_count,
+            clip_style=style_name,
+        )
+        stats.estimated_tokens = token_plan.after_prune
+
         return selected, stats, tracker
 
     except OpenAIRateLimitError as exc:
@@ -663,6 +831,9 @@ def run_full_clip_pipeline(
         )
         raise
     finally:
+        log_session_tokens_summary()
+        log_rejection_summary()
+        log_pipeline_timing_summary()
         set_call_context(None)
 
 

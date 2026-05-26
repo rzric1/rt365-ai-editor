@@ -123,7 +123,7 @@ def get_dependency_report() -> DependencyReport:
         check_package(
             "pyannote.audio",
             "pyannote.audio",
-            feature="Speaker diarization (future)",
+            feature="GPU speaker diarization (optional)",
             fallback="Transcript-based speaker/interruption heuristics",
         ),
         check_package(
@@ -147,7 +147,7 @@ def get_dependency_report() -> DependencyReport:
         check_package(
             "sentence-transformers",
             "sentence_transformers",
-            feature="Semantic similarity (optional)",
+            feature="GPU semantic ranking & embedding dedupe (RTX prefilter)",
             fallback="Jaccard word-set deduplication",
         ),
     ]

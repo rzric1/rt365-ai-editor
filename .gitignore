@@ -51,3 +51,4 @@ transcripts/
 # Optional AI/temp
 *.tmp
 *.cache
+.venv311/

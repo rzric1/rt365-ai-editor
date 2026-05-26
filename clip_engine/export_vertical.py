@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import Literal
 from clip_engine.captions import CaptionPreset, DEFAULT_PRESET, segments_to_ass, write_sidecar_files
@@ -27,10 +28,13 @@ def export_vertical_clip_with_captions(
     advanced_captions: bool = False, dynamic_smart_crop: bool = True,
     preview_mode: bool = False,
 ) -> dict:
+    from clip_engine.telemetry import log_export_event, log_gpu_memory, pipeline_phase
+
     duration = end - start
     if duration <= 0:
         raise ValueError(f"Invalid clip range: {start:.2f} to {end:.2f}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    t_export = time.perf_counter()
     if not smart_crop and export_mode == "smart_crop":
         export_mode = "full_fit"
 
@@ -47,7 +51,9 @@ def export_vertical_clip_with_captions(
         ),
         encoding="utf-8",
     )
+    clip_title = output_path.stem
     try:
+        log_gpu_memory("before_export")
         vf, uses_complex = build_vf_filter(
             video_path,
             mode=export_mode,
@@ -62,11 +68,30 @@ def export_vertical_clip_with_captions(
             video_path, output_path, start, duration, vf, uses_complex,
             prefer_gpu, force_gpu_export, preview_mode=preview_mode,
         )
-        encoder_used = _run_with_fallback(
-            cmd, video_path, output_path, start, duration, vf, uses_complex,
-            encoder, allow_cpu_fallback, preview_mode=preview_mode,
-        )
+        with pipeline_phase("exports"):
+            encoder_used = _run_with_fallback(
+                cmd, video_path, output_path, start, duration, vf, uses_complex,
+                encoder, allow_cpu_fallback, preview_mode=preview_mode,
+            )
         out_w, out_h = validate_output_resolution(output_path)
+        elapsed = time.perf_counter() - t_export
+        size_mb = None
+        try:
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+        except OSError:
+            pass
+        if not preview_mode:
+            log_export_event(
+                clip_title=clip_title,
+                duration_sec=duration,
+                resolution=f"{out_w}x{out_h}",
+                encoder=encoder_used,
+                elapsed_sec=elapsed,
+                subtitle_burn=True,
+                size_mb=size_mb,
+                output_path=str(output_path),
+            )
+        log_gpu_memory("after_exports")
         expected_w = PREVIEW_SCALE_W if preview_mode else OUTPUT_W
         expected_h = PREVIEW_SCALE_H if preview_mode else OUTPUT_H
         if out_w != expected_w or out_h != expected_h:
@@ -150,6 +175,17 @@ def _build_cmd(video_path, output_path, start, duration, vf, uses_complex, prefe
         preset = "veryfast" if preview_mode else "fast"
         base += ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"]
     return encoder, base + [str(output_path)]
+
+
+def export_filename_stem(clip: dict, sequence_index: int, title_slug: str) -> str:
+    """
+    Build export file stem (without _9x16.mp4 suffix).
+    Series parts include Part1/Part2 in the slug segment.
+    """
+    if clip.get("is_part_of_series"):
+        part_num = int(clip.get("part_number", 1))
+        return f"{sequence_index:02d}_{title_slug}_Part{part_num}"
+    return f"{sequence_index:02d}_{title_slug}"
 
 
 def _run_with_fallback(cmd, video_path, output_path, start, duration, vf, uses_complex, encoder, allow_cpu_fallback, *, preview_mode=False):

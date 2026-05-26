@@ -43,8 +43,7 @@ from clip_engine.telemetry import (  # noqa: E402
 )
 from clip_engine.clip_analysis import get_session_tokens  # noqa: E402
 from clip_engine.clip_pipeline import run_full_clip_pipeline, PipelineOpenAIConfig  # noqa: E402
-from clip_engine.openai_resilience import OpenAIRateLimitError, token_saver_pass_config
-from clip_engine.effective_config import plan_analysis_token_estimate  # noqa: E402
+from clip_engine.openai_resilience import OpenAIRateLimitError, estimate_pipeline_tokens, token_saver_pass_config  # noqa: E402
 from clip_engine.analysis_cache import clear_all_analysis_cache  # noqa: E402
 from clip_engine.ai_profiles import (  # noqa: E402
     PROFILE_LABELS,
@@ -66,14 +65,11 @@ from clip_engine.clip_metadata import (  # noqa: E402
     write_clip_audit_json,
 )
 from clip_engine.token_tracking import get_tracker  # noqa: E402
-from clip_engine.export_vertical import (  # noqa: E402
-    EXPORT_MODE_LABELS,
-    export_clip_preview,
-    export_filename_stem,
-    export_vertical_clip_with_captions,
-)
+from clip_engine.export_vertical import export_vertical_clip_with_captions  # noqa: E402
+from clip_engine.export_vertical import export_clip_preview  # noqa: E402
 from clip_engine.media_probe import get_media_duration_seconds  # noqa: E402
 from clip_engine.captions import CAPTION_PRESETS, CaptionPreset  # noqa: E402
+from clip_engine.export_vertical import EXPORT_MODE_LABELS  # noqa: E402
 from clip_engine.ffmpeg_gpu import (  # noqa: E402
     faster_whisper_cuda_available,
     get_gpu_acceleration_status,
@@ -84,7 +80,6 @@ from clip_engine.ffmpeg_gpu import (  # noqa: E402
 from clip_engine.transcription import (  # noqa: E402
     transcribe_video,
 )
-from clip_engine.speaker_analysis import diarize_audio_file  # noqa: E402
 from clip_engine.transcription_utils import (  # noqa: E402
     extract_transcript_excerpt,
     merge_segments_into_sentences,
@@ -142,8 +137,8 @@ def _init_state() -> None:
         "cs_write_sidecars": True,
         "cs_default_caption_preset": "Clean",
         "cs_target_clips": 20,
-        "cs_min_gap_seconds": 30,
-        "cs_similarity_threshold": 85,
+        "cs_min_gap_seconds": 60,
+        "cs_similarity_threshold": 45,
         "cs_clip_style": "Balanced",
         "cs_pipeline_stats": {},
         "cs_enable_signal_boosts": True,
@@ -154,7 +149,7 @@ def _init_state() -> None:
         "cs_token_saver_mode": True,
         "cs_rate_limit_safe": True,
         "cs_use_analysis_cache": True,
-        "cs_max_tokens_budget": 60_000,
+        "cs_max_tokens_budget": 35_000,
         "cs_openai_call_delay": 0.75,
         "cs_openai_status": "",
         "cs_upload_reused": False,
@@ -164,8 +159,6 @@ def _init_state() -> None:
         "cs_ai_profile_label": "SAFE (Recommended)",
         "cs_enable_gpu_prefilter": True,
         "cs_session_telemetry": {},
-        "cs_diarization_turns": [],
-        "cs_speaker_names": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -206,7 +199,7 @@ def _flush_pending_long_defaults() -> None:
     st.session_state.cs_min_clip_seconds = 15
     st.session_state.cs_max_clip_seconds = 90
     st.session_state.cs_min_gap_seconds = 35
-    st.session_state.cs_similarity_threshold = 85
+    st.session_state.cs_similarity_threshold = 58
     apply_profile_non_widget_keys(
         st.session_state, profile_from_ui_label("SAFE (Recommended)")
     )
@@ -252,61 +245,6 @@ def _slug(s: str, max_len: int = 48) -> str:
     return s or "clip"
 
 
-def _sync_series_export_checkbox(series_wids: list[str], source_wid: str) -> None:
-    checked = bool(st.session_state.get(f"ex_{source_wid}", False))
-    for w in series_wids:
-        if w != source_wid:
-            st.session_state[f"ex_{w}"] = checked
-
-
-def _expand_export_selection(clips: list, selected: list[dict]) -> list[dict]:
-    """Include every part when any part of a series is selected for export."""
-    out: list[dict] = []
-    seen: set[str] = set()
-    for c in selected:
-        wid = str(c.get("_wid", ""))
-        if wid and wid not in seen:
-            out.append(c)
-            seen.add(wid)
-        for sib in clips:
-            if (
-                c.get("is_part_of_series")
-                and sib.get("series_id") == c.get("series_id")
-            ):
-                swid = str(sib.get("_wid", ""))
-                if swid and swid not in seen:
-                    out.append(sib)
-                    seen.add(swid)
-                    st.session_state[f"ex_{swid}"] = True
-    return out
-
-
-def _assign_speakers_to_segments(
-    segments: list[dict],
-    turns: list[dict],
-    name_map: dict[str, str],
-) -> list[dict]:
-    """Tag each transcript segment with the speaker that overlaps it most."""
-    labeled = []
-    for seg in segments:
-        s0 = float(seg.get("start", 0))
-        s1 = float(seg.get("end", s0))
-        best_speaker: str | None = None
-        best_overlap = 0.0
-        for turn in turns:
-            t0 = float(turn.get("start", 0))
-            t1 = float(turn.get("end", t0))
-            overlap = max(0.0, min(t1, s1) - max(t0, s0))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = str(turn.get("speaker", ""))
-        new_seg = dict(seg)
-        if best_speaker:
-            new_seg["speaker"] = name_map.get(best_speaker, best_speaker)
-        labeled.append(new_seg)
-    return labeled
-
-
 def _run_clip_analysis(
     formatted: str,
     api_key: str,
@@ -334,15 +272,19 @@ def _run_clip_analysis(
     models = resolve_models_from_effective_config(effective)
     token_saver = effective.token_saver
     style_name = str(clip_style)
-    est = plan_analysis_token_estimate(
+    n_passes = min(effective.max_gpt_passes, 3)
+    max_rounds = 1 if token_saver else 2
+    est = estimate_pipeline_tokens(
         formatted,
-        get_ai_profile(effective.profile_name),
         target_count=target_count,
-        clip_style=style_name,
+        n_passes=n_passes,
+        max_pass_rounds=max_rounds,
+        token_saver_mode=token_saver,
     )
     st.session_state.cs_token_estimate = est.to_dict()
 
     openai_config = PipelineOpenAIConfig(
+        token_saver_mode=effective.token_saver,
         rate_limit_safe=bool(st.session_state.get("cs_rate_limit_safe", True)),
         use_cache=bool(st.session_state.get("cs_use_analysis_cache", True)),
         max_tokens_budget=effective.token_budget,
@@ -611,7 +553,7 @@ def main() -> None:
             st.caption("GPU mode off - OpenAI Whisper API used.")
 
         with st.expander("AI acceleration diagnostics", expanded=False):
-            if st.button("Refresh CUDA / NVENC probes", width="stretch", key="cs_ai_diag_refresh"):
+            if st.button("Refresh CUDA / NVENC probes", use_container_width=True, key="cs_ai_diag_refresh"):
                 invalidate_cuda_runtime_probe_cache()
                 from clip_engine.ffmpeg_gpu import invalidate_nvenc_cache
                 invalidate_nvenc_cache()
@@ -734,7 +676,7 @@ def main() -> None:
             step=0.25,
             key="cs_openai_call_delay",
         )
-        if st.button("Clear analysis cache", width="stretch"):
+        if st.button("Clear analysis cache", use_container_width=True):
             n = clear_all_analysis_cache()
             st.success(f"Cleared {n} cached analysis entries.")
 
@@ -745,7 +687,7 @@ def main() -> None:
             except Exception as exc:
                 logger.exception("Telemetry panel render failed")
                 st.caption(f"Diagnostics display error: {exc}")
-            if st.button("Refresh diagnostics from session", width="stretch", key="cs_tel_refresh"):
+            if st.button("Refresh diagnostics from session", use_container_width=True, key="cs_tel_refresh"):
                 st.session_state.cs_session_telemetry = get_session_telemetry().to_dict()
                 st.rerun()
             st.caption(f"Rotating logs: `{LOGS_DIR}` (app.log, openai.log, gpu.log, exports.log)")
@@ -767,7 +709,7 @@ def main() -> None:
             help="How many unique clips to find across the full video.")
         st.number_input("Min gap between clips (s)", min_value=10, max_value=300, step=10, key="cs_min_gap_seconds",
             help="Clips must be at least this many seconds apart.")
-        st.slider("Duplicate similarity threshold (%)", min_value=20, max_value=95, step=5, key="cs_similarity_threshold",
+        st.slider("Duplicate similarity threshold (%)", min_value=20, max_value=80, step=5, key="cs_similarity_threshold",
             help="Clips more similar than this % are considered duplicates and removed.")
 
         # FFmpeg
@@ -779,7 +721,7 @@ def main() -> None:
         else:
             st.error(f"FFmpeg not found. Set **{ENV_FFMPEG_BINARY}** in `.env` or install FFmpeg.")
 
-        if st.button("Open exports folder", width="stretch"):
+        if st.button("Open exports folder", use_container_width=True):
             ensure_directories()
             open_folder(CLIP_STUDIO_OUTPUT_DIR)
             st.toast("Opened outputs/clips")
@@ -881,7 +823,7 @@ def main() -> None:
                 finally:
                     bar.empty()
 
-        if st.button("Clean duplicate uploads", width="stretch"):
+        if st.button("Clean duplicate uploads", use_container_width=True):
             with st.spinner("Scanning uploads folder..."):
                 result = clean_duplicate_uploads()
             moved = int(result.get("moved", 0))
@@ -978,90 +920,26 @@ def main() -> None:
             )
         if api_key and st.session_state.cs_formatted:
             _prof = profile_from_ui_label(st.session_state.get("cs_ai_profile_label", ""))
-            _plan = plan_analysis_token_estimate(
+            _n = min(_prof.max_gpt_passes, 3)
+            _r = 1 if _prof.token_saver else 2
+            _pre = estimate_pipeline_tokens(
                 st.session_state.cs_formatted,
-                _prof,
                 target_count=int(st.session_state.get("cs_target_clips", 20)),
-                clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
+                n_passes=_n,
+                max_pass_rounds=_r,
+                token_saver_mode=_prof.token_saver,
             )
             _budget = _prof.max_tokens
-            _pruned = _plan.after_prune
-            if _pruned > _budget:
+            if _pre.estimated_total_tokens > _budget:
                 st.warning(
-                    f"This run may use approximately **{_pruned:,}** tokens after pruning. "
+                    f"This run may use approximately **{_pre.estimated_total_tokens:,}** tokens. "
                     f"Budget is **{_budget:,}**. Token Saver Mode will be enforced."
                 )
             else:
                 st.caption(
-                    f"Estimated tokens (after GPU pruning): ~{_pruned:,} "
-                    f"(budget {_budget:,}) | regions: {_plan.effective_regions}, passes: {_plan.effective_passes}"
+                    f"Estimated analysis tokens: ~{_pre.estimated_total_tokens:,} "
+                    f"(budget {_budget:,}) | ~{_pre.estimated_calls} API calls"
                 )
-
-    # ------------------------------------------------------------------ DIARIZATION (optional)
-    _diar_turns: list[dict] = st.session_state.get("cs_diarization_turns") or []
-    # Prefer the canonical work WAV; fall back to any _whisper_input.wav under outputs/
-    _work_wav = CLIP_STUDIO_OUTPUT_DIR / "_work" / "_whisper_input.wav"
-    if not _work_wav.is_file():
-        _fallback_wavs = sorted(CLIP_STUDIO_OUTPUT_DIR.rglob("_whisper_input.wav"))
-        if _fallback_wavs:
-            _work_wav = _fallback_wavs[0]
-    if st.session_state.cs_segments:
-        st.subheader("2b. Speaker Diarization (optional)")
-        if not _work_wav.is_file():
-            st.caption(
-                "Diarization WAV not found. Run transcription first so a WAV is available."
-            )
-        if st.button(
-            "Detect Speakers (faster-whisper)",
-            key="cs_run_diarization",
-            disabled=not _work_wav.is_file(),
-        ):
-            with st.spinner("Detecting speaker turns via faster-whisper gap analysis..."):
-                try:
-                    _new_turns = diarize_audio_file(str(_work_wav))
-                    st.session_state.cs_diarization_turns = _new_turns
-                    _diar_turns = _new_turns
-                    if _new_turns:
-                        _n_sp = len({t["speaker"] for t in _new_turns})
-                        st.success(f"Found {len(_new_turns)} speaker turns across {_n_sp} speaker(s).")
-                    else:
-                        st.warning(
-                            "No speaker turns detected. "
-                            "Ensure faster-whisper is installed (`pip install faster-whisper`)."
-                        )
-                except Exception as _diar_exc:
-                    logger.exception("Speaker diarization failed")
-                    st.error(f"Diarization failed: {_diar_exc}")
-
-        if _diar_turns:
-            _unique_speakers = sorted({t["speaker"] for t in _diar_turns})
-            st.caption(
-                f"{len(_unique_speakers)} speaker(s): {', '.join(_unique_speakers)}"
-            )
-            st.markdown("**Rename speakers** (leave blank = keep generic label)")
-            _name_map: dict[str, str] = {}
-            _sp_cols = st.columns(min(len(_unique_speakers), 4))
-            for _si, _sp_id in enumerate(_unique_speakers):
-                _prev_name = (st.session_state.get("cs_speaker_names") or {}).get(_sp_id, "")
-                _entered = _sp_cols[_si % len(_sp_cols)].text_input(
-                    _sp_id,
-                    value=_prev_name,
-                    placeholder="e.g. Host",
-                    key=f"sp_name_{_sp_id}",
-                )
-                _name_map[_sp_id] = _entered.strip() if _entered.strip() else _sp_id
-            st.session_state.cs_speaker_names = _name_map
-
-            # Merge speaker labels into cs_segments and regenerate formatted transcript
-            _labeled_segs = _assign_speakers_to_segments(
-                st.session_state.cs_segments, _diar_turns, _name_map
-            )
-            st.session_state.cs_segments = _labeled_segs
-            st.session_state.cs_formatted = segments_to_prompt_transcript(_labeled_segs)
-            st.caption(
-                "Speaker labels applied — re-run **Analyze** to include "
-                "`[Host]`/`[Guest]` context in the GPT prompt."
-            )
 
     # ------------------------------------------------------------------ CLIP AI
     st.subheader("3. AI clip suggestions")
@@ -1118,7 +996,7 @@ def main() -> None:
         openai_status = st.session_state.get("cs_openai_status", "")
         if openai_status:
             st.info(openai_status)
-        if st.button("Analyze for high-retention clips", type="primary", disabled=not can_analyze, width="stretch"):
+        if st.button("Analyze for high-retention clips", type="primary", disabled=not can_analyze, use_container_width=True):
             status_slot = st.empty()
 
             def _status_cb(msg: str) -> None:
@@ -1130,11 +1008,12 @@ def main() -> None:
                     params = _get_analysis_params()
                     if st.session_state.cs_formatted:
                         _prof_run = profile_from_ui_label(st.session_state.get("cs_ai_profile_label", ""))
-                        pre_est = plan_analysis_token_estimate(
+                        pre_est = estimate_pipeline_tokens(
                             st.session_state.cs_formatted,
-                            _prof_run,
                             target_count=int(st.session_state.get("cs_target_clips", 20)),
-                            clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
+                            n_passes=min(_prof_run.max_gpt_passes, 3),
+                            max_pass_rounds=1 if _prof_run.token_saver else 2,
+                            token_saver_mode=_prof_run.token_saver,
                         )
                         st.session_state.cs_token_estimate = pre_est.to_dict()
                     clips, pipe_stats = _run_clip_analysis(**params, status_callback=_status_cb)
@@ -1146,14 +1025,6 @@ def main() -> None:
                     else:
                         st.session_state.cs_status = f"Suggested {len(clips)} clips."
                     st.session_state.cs_openai_status = ""
-                    # Release GPU memory after heavy analysis to prevent post-analysis crash
-                    try:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            logger.info("[cuda] empty_cache() called after clip analysis")
-                    except Exception:
-                        pass
                 except OpenAIRateLimitError as e:
                     logger.exception("Clip analysis rate limited")
                     st.error(
@@ -1170,7 +1041,7 @@ def main() -> None:
 
     with col_rescore:
         if st.session_state.cs_clips:
-            if st.button("Re-score clips", width="stretch", disabled=not can_analyze):
+            if st.button("Re-score clips", use_container_width=True, disabled=not can_analyze):
                 with st.spinner("Re-scoring..."):
                     try:
                         clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
@@ -1184,7 +1055,7 @@ def main() -> None:
 
     with col_more:
         if st.session_state.cs_clips:
-            if st.button("Find more clips", width="stretch", disabled=not can_analyze):
+            if st.button("Find more clips", use_container_width=True, disabled=not can_analyze):
                 with st.spinner("Finding more..."):
                     try:
                         extra, extra_stats = _run_clip_analysis(**_get_analysis_params())
@@ -1246,9 +1117,8 @@ def main() -> None:
                     f" | models: `{pipe_stats.get('model_fast', 'n/a')}` / `{pipe_stats.get('model_quality', 'n/a')}`"
                 )
                 + (
-                    f" | est. ~{int((st.session_state.get('cs_token_estimate') or {}).get('after_prune') or pipe_stats.get('estimated_tokens', 0)):,} tokens"
-                    if (st.session_state.get("cs_token_estimate") or {}).get("after_prune")
-                    or pipe_stats.get("estimated_tokens")
+                    f" | est. ~{pipe_stats.get('estimated_tokens', 0):,} tokens"
+                    if pipe_stats.get("estimated_tokens")
                     else ""
                 )
                 + (" | **cache hit**" if pipe_stats.get("cache_hit") else "")
@@ -1299,14 +1169,6 @@ def main() -> None:
 
         _render_clip_map(clips, media_dur_for_map)
 
-        series_export_wids: dict[str, list[str]] = {}
-        for c in clips:
-            if c.get("is_part_of_series") and c.get("series_id"):
-                sid = str(c["series_id"])
-                wid = str(c.get("_wid") or "")
-                if wid:
-                    series_export_wids.setdefault(sid, []).append(wid)
-
         for i, c in enumerate(clips):
             wid = c.get("_wid") or str(i)
             fs_default = float(c.get("start_seconds", c.get("start", 0)))
@@ -1322,34 +1184,24 @@ def main() -> None:
                 header_col, score_col, export_col = st.columns([4, 1, 1])
                 with header_col:
                     st.markdown(f"### #{i+1} - {c.get('hook_title', 'Untitled clip')}")
-                    if c.get("is_part_of_series"):
-                        part_n = int(c.get("part_number", 1))
-                        part_total = int(c.get("part_total", 2))
-                        try:
-                            st.badge(f"Part {part_n} of {part_total}")
-                        except Exception:
-                            st.markdown(f"**Part {part_n} of {part_total}**")
-                        st.caption(
-                            "This clip is part of a series — both parts will export together"
-                        )
                     st.caption(f"Platform: **{platform_str}** | Signal: `{c.get('dominant_signal', 'n/a')}` | Style: `{c.get('caption_style', 'n/a')}`")
                 with score_col:
                     color = "High" if score >= 80 else ("Mid" if score >= 65 else "Low")
                     st.metric(f"{color} Score", f"{score}/100")
                 with export_col:
-                    series_wids = series_export_wids.get(str(c.get("series_id", "")), [wid])
-                    st.checkbox(
-                        "Export",
-                        value=bool(c.get("export", True)),
-                        key=f"ex_{wid}",
-                        on_change=_sync_series_export_checkbox,
-                        args=(series_wids, wid),
-                    )
+                    st.checkbox("Export", value=bool(c.get("export", True)), key=f"ex_{wid}")
 
                 # Editable fields row
                 e1, e2, e3, e4 = st.columns([2, 1, 1, 1])
                 with e1:
                     st.text_input("Hook / title", value=str(c.get("hook_title", "") or ""), key=f"hook_{wid}")
+                    grounded_hook = st.session_state.get(f"grounded_hook_{wid}")
+                    user_hook = st.session_state.get(f"hook_{wid}", c.get("hook_title", ""))
+                    if grounded_hook and str(grounded_hook).strip() != str(user_hook).strip():
+                        st.caption(
+                            f"Last export used grounded title: **{grounded_hook}** "
+                            f"(widget value unchanged — edit manually if desired)"
+                        )
                 with e2:
                     st.number_input(
                         "Start (s)",
@@ -1493,15 +1345,10 @@ def main() -> None:
                 export_mode = EXPORT_MODE_LABELS.get(export_mode_label, "full_fit")
                 write_sidecars = bool(st.session_state.get("cs_write_sidecars", True))
 
-                to_export = _expand_export_selection(
-                    clips,
-                    [
-                        c for c in clips
-                        if st.session_state.get(
-                            f"ex_{c.get('_wid', '')}", c.get("export", True)
-                        )
-                    ],
-                )
+                to_export = [
+                    c for c in clips
+                    if st.session_state.get(f"ex_{c.get('_wid', '')}", c.get("export", True))
+                ]
                 if not to_export:
                     st.warning("No clips selected for export. Check at least one 'Export' checkbox.")
                 else:
@@ -1527,7 +1374,6 @@ def main() -> None:
                         export_clip["hook_title"] = user_hook
                         export_clip["export_title"] = user_hook
                         export_title = user_hook
-                        corrected_title = user_hook.strip()
 
                         if api_key:
                             export_clip = ground_clip_metadata_against_window(
@@ -1542,13 +1388,13 @@ def main() -> None:
                             export_clip["grounded_hook_title"] = corrected_title
                             export_clip["export_title"] = corrected_title
                             export_title = corrected_title
+                            if corrected_title != user_hook.strip():
+                                st.session_state[f"grounded_hook_{wid}"] = corrected_title
                             tid = export_clip.get("_wid", wid)
                             if tid and tid in tracker.per_clip:
                                 export_clip["_token_usage"] = tracker.per_clip[tid]
 
-                        base = export_filename_stem(
-                            export_clip, idx + 1, _slug(export_title)
-                        )
+                        base = f"{idx+1:02d}_{_slug(export_title)}"
                         out = session / f"{base}_9x16.mp4"
 
                         write_clip_audit_json(export_clip, session / f"clip_{idx+1:02d}_audit.json", index=idx + 1)
@@ -1568,14 +1414,6 @@ def main() -> None:
                                 dynamic_smart_crop=bool(st.session_state.get("cs_enable_dynamic_smart_crop", True)),
                             )
                             exported += 1
-                            if api_key and corrected_title:
-                                st.session_state[f"hook_{wid}"] = corrected_title
-                                st.session_state.pop(f"grounded_hook_{wid}", None)
-                                for clip in st.session_state.get("cs_clips") or []:
-                                    if str(clip.get("_wid", "")) == str(wid):
-                                        clip["hook_title"] = corrected_title
-                                        clip["grounded_hook_title"] = corrected_title
-                                        break
                             logger.info(
                                 "Exported %s - mode=%s encoder=%s res=%s",
                                 out.name,
@@ -1620,4 +1458,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
