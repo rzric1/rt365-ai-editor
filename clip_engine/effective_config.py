@@ -2,12 +2,15 @@
 clip_engine/effective_config.py
 
 Merge AI profile defaults with Streamlit widget state without mutating widget keys after render.
+Durable analysis snapshots and cache fingerprints live here (not in widget keys).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 from clip_engine.ai_profiles import AIProfile, PROFILE_MAX_QUALITY, get_ai_profile, profile_from_ui_label
@@ -21,6 +24,18 @@ logger = logging.getLogger("clip_engine.effective_config")
 
 _PROFILE_SAFE = get_ai_profile("SAFE")
 
+# Session keys (durable — not Streamlit widget keys)
+SESSION_ANALYSIS_FINGERPRINT = "cs_analysis_fingerprint"
+SESSION_EFFECTIVE_CONFIG = "cs_durable_effective_config"
+SESSION_ANALYSIS_DIAGNOSTICS = "cs_analysis_diagnostics"
+SESSION_CLIP_EDITS = "cs_clip_ui_edits"
+SESSION_FORCE_REANALYZE = "cs_force_reanalyze"
+
+# Creator control defaults
+DEFAULT_CLIP_STRATEGY = "Balanced"
+DEFAULT_PLATFORM_TARGET = "TikTok/Reels/Shorts"
+DEFAULT_TITLE_STYLE = "Curiosity"
+
 
 @dataclass(frozen=True)
 class ResolvedModels:
@@ -33,8 +48,8 @@ class ResolvedModels:
 
 
 def _safe_default_models() -> ResolvedModels:
-    logger.error(
-        "[AI PROFILE ERROR] Missing effective config; defaulting to SAFE gpt-4o-mini"
+    logger.warning(
+        "[AI PROFILE] No durable effective config in session; using SAFE gpt-4o-mini defaults"
     )
     p = _PROFILE_SAFE
     return ResolvedModels(
@@ -119,12 +134,18 @@ class ClipStudioEffectiveConfig:
     min_gap_seconds: float
     duplicate_similarity: float
     target_clips: int
+    clip_strategy: str = DEFAULT_CLIP_STRATEGY
+    platform_target: str = DEFAULT_PLATFORM_TARGET
+    title_style: str = DEFAULT_TITLE_STYLE
+    clip_style: str = "Balanced"
 
     @classmethod
     def from_session(cls, session_state: Any) -> ClipStudioEffectiveConfig:
         label = str(session_state.get("cs_ai_profile_label", "SAFE (Recommended)"))
         profile = profile_from_ui_label(label)
         widget_gpu = bool(session_state.get("cs_enable_gpu_prefilter", True))
+        raw_max = float(session_state.get("cs_max_clip_seconds", profile.max_clip_length))
+        capped_max = min(raw_max, profile.max_clip_length, 120.0)
         return cls(
             profile_name=profile.name,
             fast_model=profile.fast_model,
@@ -141,10 +162,7 @@ class ClipStudioEffectiveConfig:
             shortlist_min=profile.target_gpu_shortlist_min,
             shortlist_max=profile.target_gpu_shortlist_max,
             min_clip_length=float(session_state.get("cs_min_clip_seconds", 25)),
-            max_clip_length=min(
-                float(session_state.get("cs_max_clip_seconds", profile.max_clip_length)),
-                profile.max_clip_length,
-            ),
+            max_clip_length=capped_max,
             context_before=float(
                 session_state.get("cs_context_before", profile.context_before)
             ),
@@ -155,6 +173,141 @@ class ClipStudioEffectiveConfig:
             duplicate_similarity=float(session_state.get("cs_similarity_threshold", 45))
             / 100.0,
             target_clips=int(session_state.get("cs_target_clips", 20)),
+            clip_strategy=str(
+                session_state.get("cs_clip_strategy", DEFAULT_CLIP_STRATEGY)
+            ),
+            platform_target=str(
+                session_state.get("cs_platform_target", DEFAULT_PLATFORM_TARGET)
+            ),
+            title_style=str(session_state.get("cs_title_style", DEFAULT_TITLE_STYLE)),
+            clip_style=str(session_state.get("cs_clip_style", "Balanced")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClipStudioEffectiveConfig:
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: data[k] for k in names if k in data})
+
+
+def build_analysis_fingerprint(
+    session_state: Any,
+    *,
+    video_identity: str,
+    transcript_hash: str,
+) -> str:
+    """
+    Stable fingerprint for analysis cache invalidation.
+    Excludes widget edit state (hook titles, export checkboxes, trim fields).
+    """
+    effective = ClipStudioEffectiveConfig.from_session(session_state)
+    payload = {
+        "video": video_identity,
+        "transcript": transcript_hash,
+        "profile": effective.profile_name,
+        "discovery": effective.discovery_mode,
+        "token_saver": effective.token_saver,
+        "gpu_prefilter": effective.gpu_prefilter,
+        "min_clip": effective.min_clip_length,
+        "max_clip": effective.max_clip_length,
+        "ctx_before": effective.context_before,
+        "ctx_after": effective.context_after,
+        "min_gap": effective.min_gap_seconds,
+        "similarity": round(effective.duplicate_similarity, 3),
+        "target": effective.target_clips,
+        "clip_style": effective.clip_style,
+        "clip_strategy": effective.clip_strategy,
+        "platform_target": effective.platform_target,
+        "title_style": effective.title_style,
+        "fast_model": effective.fast_model,
+        "quality_model": effective.quality_model,
+    }
+    raw = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def get_invalidation_reason(
+    session_state: Any,
+    *,
+    video_identity: str,
+    transcript_hash: str,
+) -> str | None:
+    """
+    Return why analysis should re-run, or None if cached session analysis is still valid.
+    """
+    if session_state.get(SESSION_FORCE_REANALYZE):
+        return "explicit_reanalyze"
+    if not session_state.get("cs_formatted"):
+        return "missing_transcript"
+    if not video_identity:
+        return "missing_video"
+    prev_video = str(session_state.get("cs_analysis_video_identity", ""))
+    if prev_video and prev_video != video_identity:
+        return "video_changed"
+    prev_hash = str(session_state.get("cs_analysis_transcript_hash", ""))
+    if prev_hash and prev_hash != transcript_hash:
+        return "transcript_changed"
+    fp = build_analysis_fingerprint(session_state, video_identity=video_identity, transcript_hash=transcript_hash)
+    prev_fp = str(session_state.get(SESSION_ANALYSIS_FINGERPRINT, ""))
+    if prev_fp and prev_fp != fp:
+        return "ai_settings_changed"
+    if not session_state.get("cs_clips") and not prev_fp:
+        return None
+    if prev_fp == fp and session_state.get("cs_clips"):
+        return None
+    return None
+
+
+def store_analysis_snapshot(
+    session_state: Any,
+    *,
+    effective: ClipStudioEffectiveConfig,
+    fingerprint: str,
+    video_identity: str,
+    transcript_hash: str,
+    diagnostics: dict[str, Any],
+) -> None:
+    """Persist durable analysis state (survives widget reruns)."""
+    session_state[SESSION_EFFECTIVE_CONFIG] = effective.to_dict()
+    session_state[SESSION_ANALYSIS_FINGERPRINT] = fingerprint
+    session_state["cs_analysis_video_identity"] = video_identity
+    session_state["cs_analysis_transcript_hash"] = transcript_hash
+    session_state[SESSION_ANALYSIS_DIAGNOSTICS] = diagnostics
+    session_state[SESSION_FORCE_REANALYZE] = False
+    logger.info("[ANALYSIS] Stored durable config fingerprint=%s", fingerprint)
+
+
+def get_durable_effective_config(session_state: Any) -> ClipStudioEffectiveConfig | None:
+    """Return last analysis effective config, or None."""
+    raw = session_state.get(SESSION_EFFECTIVE_CONFIG)
+    if not raw or not isinstance(raw, dict):
+        return None
+    try:
+        return ClipStudioEffectiveConfig.from_dict(raw)
+    except (TypeError, KeyError) as exc:
+        logger.warning("[ANALYSIS] Invalid durable config: %s", exc)
+        return None
+
+
+def resolve_models_for_session(session_state: Any) -> ResolvedModels:
+    """Prefer durable analysis config; fall back to live session."""
+    durable = get_durable_effective_config(session_state)
+    if durable is not None:
+        return resolve_models_from_effective_config(durable)
+    return resolve_models_from_effective_config(
+        ClipStudioEffectiveConfig.from_session(session_state)
+    )
+
+
+def log_widget_rerun_noop(session_state: Any) -> None:
+    """Log when a Streamlit rerun does not invalidate analysis."""
+    if session_state.get("cs_clips") and session_state.get(SESSION_ANALYSIS_FINGERPRINT):
+        logger.info(
+            "[ANALYSIS] no-op widget rerun (fingerprint=%s, clips=%d)",
+            session_state.get(SESSION_ANALYSIS_FINGERPRINT),
+            len(session_state.get("cs_clips") or []),
         )
 
 
@@ -335,26 +488,42 @@ def apply_profile_widget_defaults(session_state: Any, profile: AIProfile) -> Non
     Initialize widget-bound keys only when missing (call before widgets render).
     """
     init_session_default(session_state, "cs_enable_gpu_prefilter", profile.prefer_gpu_prefilter)
-    init_session_default(
-        session_state, "cs_max_clip_seconds", int(profile.max_clip_length)
-    )
+    default_max = min(int(profile.max_clip_length), 120)
+    init_session_default(session_state, "cs_max_clip_seconds", default_max)
     init_session_default(
         session_state, "cs_context_before", int(profile.context_before)
     )
     init_session_default(
         session_state, "cs_context_after", int(profile.context_after)
     )
+    init_session_default(session_state, "cs_clip_strategy", DEFAULT_CLIP_STRATEGY)
+    init_session_default(session_state, "cs_platform_target", DEFAULT_PLATFORM_TARGET)
+    init_session_default(session_state, "cs_title_style", DEFAULT_TITLE_STYLE)
 
 
 __all__ = [
     "ClipStudioEffectiveConfig",
+    "DEFAULT_CLIP_STRATEGY",
+    "DEFAULT_PLATFORM_TARGET",
+    "DEFAULT_TITLE_STYLE",
     "ResolvedModels",
+    "SESSION_ANALYSIS_DIAGNOSTICS",
+    "SESSION_ANALYSIS_FINGERPRINT",
+    "SESSION_CLIP_EDITS",
+    "SESSION_EFFECTIVE_CONFIG",
+    "SESSION_FORCE_REANALYZE",
     "TokenPlanResult",
     "apply_profile_non_widget_keys",
     "apply_profile_widget_defaults",
+    "build_analysis_fingerprint",
+    "get_durable_effective_config",
+    "get_invalidation_reason",
     "init_session_default",
+    "log_widget_rerun_noop",
     "plan_analysis_token_estimate",
+    "resolve_models_for_session",
     "resolve_models_from_call_context",
     "resolve_models_from_effective_config",
     "resolve_models_from_profile",
+    "store_analysis_snapshot",
 ]

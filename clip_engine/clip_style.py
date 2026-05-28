@@ -39,17 +39,17 @@ def get_clip_style_profile(
 ) -> ClipStyleProfile:
     """Map UI clip style to generation/expansion parameters."""
     user_min = max(5.0, float(user_min_seconds))
-    user_max = max(user_min, float(user_max_seconds))
+    user_max = max(user_min, min(float(user_max_seconds), 120.0))
 
     if style == "Micro clips":
         return ClipStyleProfile(
             ideal_min_seconds=max(user_min, 30.0),
             ideal_max_seconds=min(user_max, 75.0),
-            ai_max_clip_seconds=min(user_max, 90.0),
-            expansion_max_seconds=min(user_max, 90.0),
+            ai_max_clip_seconds=min(user_max, 120.0),
+            expansion_max_seconds=min(user_max, 120.0),
             split_threshold_seconds=75.0,
             sub_clip_max_seconds=75.0,
-            hard_max_export_seconds=min(user_max, 90.0),
+            hard_max_export_seconds=min(user_max, 120.0),
             context_before=4.0,
             context_after=8.0,
             max_clips_per_region=18,
@@ -77,11 +77,11 @@ def get_clip_style_profile(
     return ClipStyleProfile(
         ideal_min_seconds=max(user_min, 45.0),
         ideal_max_seconds=min(user_max, 100.0),
-        ai_max_clip_seconds=min(user_max, 100.0),
-        expansion_max_seconds=min(user_max, 100.0),
-        split_threshold_seconds=90.0,
-        sub_clip_max_seconds=90.0,
-        hard_max_export_seconds=min(user_max, 100.0),
+        ai_max_clip_seconds=min(user_max, 120.0),
+        expansion_max_seconds=min(user_max, 120.0),
+        split_threshold_seconds=120.0,
+        sub_clip_max_seconds=120.0,
+        hard_max_export_seconds=min(user_max, 120.0),
         context_before=6.0,
         context_after=10.0,
         max_clips_per_region=15,

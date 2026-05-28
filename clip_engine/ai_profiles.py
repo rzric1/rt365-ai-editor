@@ -128,7 +128,7 @@ _PROFILES: dict[str, AIProfile] = {
 
         max_gpt_regions=5,
 
-        max_clip_length=90.0,
+        max_clip_length=120.0,
 
         context_before=4.0,
 

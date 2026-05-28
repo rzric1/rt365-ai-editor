@@ -202,7 +202,7 @@ def split_long_clips(
     segments: list[dict],
     api_key: str,
     *,
-    max_duration: float = 90.0,
+    max_duration: float = 120.0,
     sub_clip_max: float | None = None,
     min_duration: float = 25.0,
     tracker: TokenTracker | None = None,

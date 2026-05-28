@@ -80,10 +80,18 @@ class PipelineStats:
     json_telemetry: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     cache_hit: bool = False
+    cache_miss_reason: str = ""
     resumed_from_progress: bool = False
     estimated_tokens: int = 0
     model_fast: str = ""
     model_quality: str = ""
+    boundary_repairs: int = 0
+    title_repairs: int = 0
+    quality_gate_repaired: int = 0
+    openai_calls_used: int = 0
+    clip_strategy: str = "Balanced"
+    platform_target: str = "TikTok/Reels/Shorts"
+    title_style: str = "Curiosity"
 
     def to_dict(self) -> dict:
         return {
@@ -116,7 +124,15 @@ class PipelineStats:
             "json_telemetry": self.json_telemetry,
             "warnings": self.warnings,
             "cache_hit": self.cache_hit,
+            "cache_miss_reason": self.cache_miss_reason,
             "resumed_from_progress": self.resumed_from_progress,
+            "boundary_repairs": self.boundary_repairs,
+            "title_repairs": self.title_repairs,
+            "quality_gate_repaired": self.quality_gate_repaired,
+            "openai_calls_used": self.openai_calls_used,
+            "clip_strategy": self.clip_strategy,
+            "platform_target": self.platform_target,
+            "title_style": self.title_style,
             "estimated_tokens": self.estimated_tokens,
             "model_fast": self.model_fast,
             "model_quality": self.model_quality,
@@ -154,6 +170,9 @@ from clip_engine.clip_split_parts import (
 from clip_engine.clip_expand import ClipExpansionSettings, finalize_clips_after_ai
 from clip_engine.clip_metadata import ground_all_clips_metadata
 from clip_engine.clip_split import split_long_clips
+from clip_engine.clip_boundaries import apply_boundary_repairs
+from clip_engine.clip_scoring import apply_virality_to_clips
+from clip_engine.clip_quality_gate import run_quality_gate
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
 from clip_engine.ai_profiles import get_ai_profile
 from clip_engine.clip_discovery import empty_pool_stats, generate_local_fallback_candidates
@@ -286,6 +305,9 @@ def run_full_clip_pipeline(
     enable_speaker_signals: bool = True,
     openai_config: PipelineOpenAIConfig | None = None,
     discovery_mode: bool = False,
+    clip_strategy: str = "Balanced",
+    platform_target: str = "TikTok/Reels/Shorts",
+    title_style: str = "Curiosity",
 ) -> tuple[list[dict], PipelineStats, TokenTracker]:
     """
     Full clip pipeline:
@@ -301,7 +323,13 @@ def run_full_clip_pipeline(
     reset_session_telemetry()
     if media_duration is None or media_duration <= 0:
         media_duration = 300.0
-    stats = PipelineStats(target_clips=target_count, discovery_mode=discovery_mode)
+    stats = PipelineStats(
+        target_clips=target_count,
+        discovery_mode=discovery_mode,
+        clip_strategy=clip_strategy,
+        platform_target=platform_target,
+        title_style=title_style,
+    )
     oai = openai_config or PipelineOpenAIConfig()
     pool_stats = empty_pool_stats()
     ai_prof = get_ai_profile(oai.ai_profile_name or "SAFE")
@@ -368,7 +396,7 @@ def run_full_clip_pipeline(
         target_clips=target_count,
         clip_style=style_name,
         min_clip_seconds=user_min_seconds,
-        max_clip_seconds=user_max_seconds,
+        max_clip_seconds=min(user_max_seconds, ai_prof.max_clip_length, 120.0),
         min_gap_seconds=min_gap_seconds,
         similarity_threshold=similarity_threshold,
         token_saver_mode=oai.token_saver_mode,
@@ -376,6 +404,11 @@ def run_full_clip_pipeline(
         model_quality=model_quality,
         context_before=context_before if context_before is not None else 8.0,
         context_after=context_after if context_after is not None else 12.0,
+        discovery_mode=discovery_mode,
+        ai_profile_name=ai_prof.name,
+        clip_strategy=clip_strategy,
+        platform_target=platform_target,
+        title_style=title_style,
     )
     cache_key = cache_key_obj.digest()
 
@@ -385,8 +418,15 @@ def run_full_clip_pipeline(
             tracker.record_cache_hit(cached.get("token_usage", {}).get("total_tokens", stats.estimated_tokens))
             stats.cache_hit = True
             stats.final_clips = len(cached.get("clips", []))
+            cached_stats = cached.get("stats") or {}
+            stats.boundary_repairs = int(cached_stats.get("boundary_repairs", 0))
+            stats.title_repairs = int(cached_stats.get("title_repairs", 0))
+            stats.openai_calls_used = 0
             stats.warnings.append("Loaded cached analysis — no OpenAI tokens used.")
+            logger.info("[CACHE] hit — skipping OpenAI pipeline")
             return cached["clips"], stats, tracker
+        stats.cache_miss_reason = "no_cached_entry_or_version"
+        logger.info("[CACHE] miss — running full pipeline")
 
     ctx = OpenAICallContext(
         token_saver_mode=oai.token_saver_mode,
@@ -424,8 +464,11 @@ def run_full_clip_pipeline(
         logger.info("[PIPELINE] Context trimmed to %.0fs/%.0fs due to token budget", ctx_b, ctx_a)
 
     if discovery_mode:
-        pool_multiplier = 2.5 if oai.token_saver_mode else 3.0
-        pool_target = max(int(target_count * pool_multiplier), 50 if oai.token_saver_mode else 60)
+        pool_multiplier = 3.0 if oai.token_saver_mode else 3.5
+        pool_target = max(int(target_count * pool_multiplier), 55 if oai.token_saver_mode else 70)
+        if media_duration >= 40 * 60:
+            pool_target = max(pool_target, 60)
+            pool_multiplier = max(pool_multiplier, 3.2)
     else:
         pool_multiplier = 1.5 if oai.token_saver_mode else 3.0
         pool_target = max(int(target_count * pool_multiplier), 30 if oai.token_saver_mode else 45)
@@ -829,7 +872,39 @@ def run_full_clip_pipeline(
             selected, segments, enabled=enable_speaker_signals,
         )
 
-        max_part_len = min(user_max_seconds, ai_prof.max_clip_length)
+        hard_max = min(user_max_seconds, ai_prof.max_clip_length, 120.0)
+        with pipeline_phase("boundary_repair"):
+            selected, stats.boundary_repairs = apply_boundary_repairs(
+                selected,
+                segments,
+                max_duration=hard_max,
+                min_duration=user_min_seconds,
+            )
+
+        with pipeline_phase("virality_scoring"):
+            selected, stats.title_repairs = apply_virality_to_clips(
+                selected,
+                segments,
+                clip_strategy=clip_strategy,
+                platform_target=platform_target,
+                title_style=title_style,
+            )
+
+        with pipeline_phase("quality_gate"):
+            selected, qg_stats = run_quality_gate(
+                selected,
+                segments,
+                media_duration=media_duration,
+                max_duration=hard_max,
+                min_duration=user_min_seconds,
+            )
+            stats.quality_gate_repaired = qg_stats.repaired
+            if qg_stats.dropped:
+                stats.warnings.append(
+                    f"Quality gate dropped {qg_stats.dropped} unusable clip(s)."
+                )
+
+        max_part_len = hard_max
         for c in selected:
             flag_split_recommended(c, max_part_len)
         selected, stats.series_splits = apply_recommended_series_splits(
@@ -841,6 +916,12 @@ def run_full_clip_pipeline(
         selected, stats.removed_weak_hook = filter_minimum_hook_score(selected)
 
         stats.final_clips = len(selected)
+        export_usage = tracker.to_export_dict(
+            target_clips=target_count,
+            final_clip_count=len(selected),
+            model=model_quality,
+        )
+        stats.openai_calls_used = int(export_usage.get("total_calls", 0))
 
         if stats.final_clips < 12:
             stats.warnings.append(
@@ -870,11 +951,8 @@ def run_full_clip_pipeline(
                 cache_key,
                 clips=selected,
                 stats=stats.to_dict(),
-                token_usage=tracker.to_export_dict(
-                    target_clips=target_count,
-                    final_clip_count=len(selected),
-                    model=model_quality,
-                ),
+                token_usage=export_usage,
+                analysis_fingerprint=cache_key,
             )
 
         token_plan = plan_analysis_token_estimate(
