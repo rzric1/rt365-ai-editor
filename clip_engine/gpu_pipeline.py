@@ -15,7 +15,10 @@ import os
 import sys
 import traceback
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from clip_engine.discovery_forensics import DiscoveryForensics
 
 
 
@@ -190,6 +193,9 @@ def run_gpu_prefilter_pipeline(
 
     ai_profile: AIProfile | str | None = None,
 
+    discovery_mode: bool = False,
+    forensics: DiscoveryForensics | None = None,
+
 ) -> tuple[list[dict], dict[str, Any]]:
 
     """
@@ -221,6 +227,7 @@ def run_gpu_prefilter_pipeline(
         "raw_candidates": 0,
         "semantic_prefilter_fallback": False,
         "semantic_prefilter_error": "",
+        "discovery_scan": {},
     }
 
     # Hard safety valve for unstable environments.
@@ -233,12 +240,48 @@ def run_gpu_prefilter_pipeline(
             clip_style=clip_style,
             user_min_seconds=user_min_seconds,
             user_max_seconds=min(user_max_seconds, prof.max_clip_length),
-            max_candidates=max(80, pool_target * 3),
+            max_candidates=max(100, pool_target * 4) if discovery_mode else max(80, pool_target * 3),
+            discovery_mode=discovery_mode,
+            forensics=forensics,
         )
+
+        if len(local) < 10:
+            from clip_engine.transcript_candidate_scanner import scan_transcript_candidates
+
+            rescue, scan_stats = scan_transcript_candidates(
+                segments,
+                media_duration,
+                discovery_mode=True,
+                user_min_seconds=user_min_seconds,
+                user_max_seconds=min(user_max_seconds, prof.max_clip_length),
+                max_candidates=max(60, shortlist_max * 2),
+                existing=local,
+                min_gap_seconds=14.0,
+            )
+            stats["discovery_scan"] = scan_stats.to_dict()
+            if forensics:
+                forensics.merge_scan_stats(scan_stats.to_dict())
+                forensics.record_stage(
+                    "gpu_transcript_scan_rescue",
+                    input_count=len(local),
+                    output_count=len(local) + len(rescue),
+                    rejected_count=scan_stats.windows_rejected,
+                    rejection_reasons=scan_stats.rejection_reasons,
+                )
+            if rescue:
+                logger.warning(
+                    "[GPU PREFILTER] local discovery starved (%d) — transcript scan added %d",
+                    len(local),
+                    len(rescue),
+                )
+                local.extend(rescue)
+                local.sort(key=lambda x: int(x.get("composite_score", 0)), reverse=True)
 
         raw_count = len(local)
         stats["local_prefilter_count"] = raw_count
         stats["raw_candidates"] = raw_count
+        if forensics:
+            forensics.gpu_candidates_generated = raw_count
         logger.info("[GPU PREFILTER] raw_candidates=%d", raw_count)
 
         local = boost_candidates_from_transcript_speakers(local, segments)
@@ -254,6 +297,8 @@ def run_gpu_prefilter_pipeline(
                 local, texts, similarity_threshold=similarity_threshold
             )
             stats["semantic_dedupe_removed"] = dedupe_removed
+            if forensics and dedupe_removed:
+                forensics.record_gpu_rejection("semantic_dedupe", dedupe_removed)
             logger.info("[GPU PREFILTER] semantic_dedupe_removed=%d", dedupe_removed)
 
             try:
@@ -271,10 +316,14 @@ def run_gpu_prefilter_pipeline(
             for _, c in enumerate(local):
                 c["_semantic_score"] = round(float(c.get("local_rank_score", 0)) / 100.0, 3)
 
-        # Enforce timeline spread so shortlist covers the full video duration.
+        before_spread = len(local)
         local = _shortlist_with_timeline_spread(
             local, media_duration=media_duration, shortlist_max=shortlist_max
         )
+        if forensics and before_spread > len(local):
+            forensics.record_gpu_rejection(
+                "timeline_spread_prune", before_spread - len(local)
+            )
 
         kept_ids = set(range(len(local)))
         active_regions = sorted({str(c.get("_region", "")) for c in local if c.get("_region")})
@@ -295,10 +344,14 @@ def run_gpu_prefilter_pipeline(
 
             allowed = set(active_regions)
             pruned: list[dict] = []
+            region_pruned = 0
             for c in local:
                 r = str(c.get("_region", ""))
                 if r and r not in allowed:
                     c["_reject_reason"] = "region_cap"
+                    region_pruned += 1
+                    if forensics:
+                        forensics.record_gpu_rejection("region_cap", 1)
                     continue
                 pruned.append(c)
             local = pruned
@@ -311,6 +364,8 @@ def run_gpu_prefilter_pipeline(
         )
         if est_tokens > prof.max_tokens:
             while len(local) > shortlist_min and est_tokens > prof.max_tokens:
+                if forensics:
+                    forensics.record_gpu_rejection("token_budget_prune", 1)
                 local.pop()
                 est_tokens = _estimate_refinement_tokens(
                     len(local),
@@ -325,6 +380,14 @@ def run_gpu_prefilter_pipeline(
             )
 
         stats["shortlist_count"] = len(local)
+        if forensics:
+            forensics.record_stage(
+                "gpu_prefilter_shortlist",
+                input_count=raw_count,
+                output_count=len(local),
+                rejected_count=max(0, raw_count - len(local)),
+                rejection_reasons=dict(forensics.gpu_rejection_reasons),
+            )
         stats["estimated_refinement_tokens"] = est_tokens
         stats["active_regions"] = active_regions
         stats["semantic"] = sem_status
@@ -355,18 +418,63 @@ def run_gpu_prefilter_pipeline(
         stats["semantic_prefilter_fallback"] = True
         stats["local_ranking_enabled"] = False
         stats["semantic_prefilter_error"] = f"{type(fatal_exc).__name__}: {fatal_exc}"
-        stats["shortlist_count"] = 0
         stats["estimated_refinement_tokens"] = 0
         stats["active_regions"] = []
         stats["semantic"] = {"_error": stats["semantic_prefilter_error"]}
         stats["speaker"] = {}
-        stats["explorer_rows"] = []
         logger.error(
-            "[GPU PREFILTER FATAL] Falling back to empty shortlist: %s\n%s",
+            "[GPU PREFILTER FATAL] embedding path failed: %s\n%s",
             fatal_exc,
             traceback.format_exc(),
         )
-        return [], stats
+        try:
+            from clip_engine.transcript_candidate_scanner import scan_transcript_candidates
+
+            rescue, scan_stats = scan_transcript_candidates(
+                segments,
+                media_duration,
+                discovery_mode=True,
+                user_min_seconds=user_min_seconds,
+                user_max_seconds=min(user_max_seconds, prof.max_clip_length),
+                max_candidates=max(40, shortlist_max),
+            )
+            stats["discovery_scan"] = scan_stats.to_dict()
+            if forensics:
+                forensics.merge_scan_stats(scan_stats.to_dict())
+                forensics.gpu_candidates_generated = len(rescue)
+                forensics.record_stage(
+                    "gpu_prefilter_fatal_rescue",
+                    input_count=0,
+                    output_count=len(rescue[:shortlist_max]),
+                    rejection_reasons=scan_stats.rejection_reasons,
+                    note=stats["semantic_prefilter_error"],
+                )
+            stats["raw_candidates"] = len(rescue)
+            stats["local_prefilter_count"] = len(rescue)
+            stats["shortlist_count"] = len(rescue[:shortlist_max])
+            stats["explorer_rows"] = _build_explorer_rows(
+                rescue[:shortlist_max],
+                segments,
+                shortlist_max=shortlist_max,
+            )
+            logger.warning(
+                "[GPU PREFILTER FATAL] recovered %d transcript-only candidates",
+                stats["shortlist_count"],
+            )
+            return rescue[:shortlist_max], stats
+        except Exception as rescue_exc:
+            logger.error("[GPU PREFILTER] transcript rescue failed: %s", rescue_exc)
+            stats["shortlist_count"] = 0
+            stats["explorer_rows"] = []
+            if forensics:
+                forensics.record_stage(
+                    "gpu_prefilter_fatal_failed",
+                    input_count=0,
+                    output_count=0,
+                    rejection_reasons={"transcript_rescue_failed": 1},
+                    note=str(rescue_exc),
+                )
+            return [], stats
 
 
 

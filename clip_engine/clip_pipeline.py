@@ -97,6 +97,10 @@ class PipelineStats:
     finalizer_rejected: int = 0
     finalizer_hooks_repaired: int = 0
     finalizer_report: dict = field(default_factory=dict)
+    discovery_scan: dict = field(default_factory=dict)
+    discovery_forensics: dict = field(default_factory=dict)
+    duration_governor: dict = field(default_factory=dict)
+    timeline_occupancy: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -143,6 +147,10 @@ class PipelineStats:
             "finalizer_rejected": self.finalizer_rejected,
             "finalizer_hooks_repaired": self.finalizer_hooks_repaired,
             "finalizer_report": self.finalizer_report,
+            "discovery_scan": self.discovery_scan,
+            "discovery_forensics": self.discovery_forensics,
+            "duration_governor": self.duration_governor,
+            "timeline_occupancy": self.timeline_occupancy,
             "estimated_tokens": self.estimated_tokens,
             "model_fast": self.model_fast,
             "model_quality": self.model_quality,
@@ -183,10 +191,19 @@ from clip_engine.clip_split import split_long_clips
 from clip_engine.clip_boundaries import apply_boundary_repairs
 from clip_engine.clip_scoring import apply_virality_to_clips, ensure_all_clip_hooks
 from clip_engine.clip_finalizer import finalize_clips_with_report
+from clip_engine.clip_duration_governor import (
+    HARD_CAP_SECONDS,
+    SOFT_CAP_SECONDS,
+    apply_duration_policy_batch,
+    compute_timeline_occupancy,
+    log_over_soft_justifications,
+    refresh_expansion_diagnostics,
+)
 from clip_engine.clip_quality_gate import run_quality_gate
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
 from clip_engine.ai_profiles import get_ai_profile
 from clip_engine.clip_discovery import empty_pool_stats, generate_local_fallback_candidates
+from clip_engine.discovery_forensics import DiscoveryForensics
 from clip_engine.gpu_pipeline import run_gpu_prefilter_pipeline
 from clip_engine.clip_signals import apply_signal_boosts_to_clips
 from clip_engine.speaker_signals import apply_speaker_signals_to_clips
@@ -466,14 +483,20 @@ def run_full_clip_pipeline(
             if cached_clips and segments:
                 cached_clips, cached_hook_fixes = ensure_all_clip_hooks(cached_clips, segments)
                 stats.title_repairs = int(cached.get("stats", {}).get("title_repairs", 0)) + cached_hook_fixes
-            hard_max_cached = min(user_max_seconds, ai_prof.max_clip_length, 120.0)
+            hard_max_cached = min(user_max_seconds, ai_prof.max_clip_length, HARD_CAP_SECONDS)
+            soft_cached = min(SOFT_CAP_SECONDS, hard_max_cached)
             cached_clips = _apply_clip_quality_finalizer(
                 cached_clips,
                 segments,
                 stats,
                 user_min_seconds=user_min_seconds,
-                hard_max=hard_max_cached,
+                hard_max=soft_cached,
             )
+            if cached_clips and media_duration > 0:
+                cached_clips, gov_cached = apply_duration_policy_batch(
+                    cached_clips, media_duration, pre_virality=False,
+                )
+                stats.duration_governor["cache_rehydrate"] = gov_cached.to_dict()
             stats.final_clips = len(cached_clips)
             cached_stats = cached.get("stats") or {}
             stats.boundary_repairs = int(cached_stats.get("boundary_repairs", 0))
@@ -557,9 +580,27 @@ def run_full_clip_pipeline(
 
     min_acceptable = max(12, int(target_count * 0.6))
 
+    forensics = DiscoveryForensics()
+    forensics.record_stage(
+        "pipeline_inputs",
+        input_count=len(segments or []),
+        output_count=len(segments or []) if segments and media_duration > 0 else 0,
+        note=(
+            f"media_duration={media_duration:.0f}s discovery_mode={discovery_mode} "
+            f"gpu_prefilter={oai.enable_gpu_prefilter} pool_target={pool_target}"
+        ),
+    )
+    if not segments or media_duration <= 0:
+        forensics.notes.append("Starvation: no transcript segments or zero media duration.")
+        stats.discovery_forensics = forensics.to_dict()
+        stats.warnings.append(
+            f"Discovery forensic: first zero at '{forensics.first_zero_stage}' — no transcript."
+        )
+
     gpu_shortlist: list[dict] = []
     region_filter_gpu: tuple[str, ...] | None = None
     gpu_explorer_rows: list[dict] = []
+    gpu_stats: dict = {}
     if oai.enable_gpu_prefilter and segments and media_duration > 0:
         try:
             log_gpu_memory("before_embeddings")
@@ -574,6 +615,8 @@ def run_full_clip_pipeline(
                 target_count=target_count,
                 pool_target=pool_target,
                 ai_profile=ai_prof,
+                discovery_mode=discovery_mode,
+                forensics=forensics,
                 )
             log_gpu_memory("after_embeddings")
             stats.gpu_local_candidates = int(gpu_stats.get("local_prefilter_count", 0))
@@ -599,14 +642,42 @@ def run_full_clip_pipeline(
                 f"(raw={stats.gpu_local_candidates}, est refine tokens≈{est_refine:,}, "
                 f"embeddings GPU: {gpu_stats.get('embeddings_on_gpu', False)})."
             )
+            stats.discovery_scan = dict(gpu_stats.get("discovery_scan") or stats.discovery_scan)
+            forensics.merge_scan_stats(stats.discovery_scan)
         except Exception as exc:
             logger.warning("GPU prefilter skipped: %s", exc)
             stats.warnings.append(f"GPU prefilter unavailable: {exc}")
-    stats.gpu_explorer_rows = gpu_explorer_rows
+            stats.gpu_explorer_rows = gpu_explorer_rows
+            stats.discovery_scan = dict(gpu_stats.get("discovery_scan") or {})
+            forensics.record_stage(
+                "gpu_prefilter_exception",
+                input_count=len(segments),
+                output_count=0,
+                rejection_reasons={"exception": 1},
+                note=str(exc)[:200],
+            )
+    else:
+        forensics.record_stage(
+            "gpu_prefilter_skipped",
+            input_count=len(segments or []),
+            output_count=0,
+            rejection_reasons={
+                "disabled": int(not oai.enable_gpu_prefilter),
+                "no_segments": int(not bool(segments)),
+                "no_duration": int(media_duration <= 0),
+            },
+            note="GPU prefilter not run",
+        )
 
     try:
         candidates: list[dict] = list(gpu_shortlist)
+        forensics.record_stage(
+            "gpu_shortlist_to_pool",
+            input_count=stats.gpu_shortlist,
+            output_count=len(gpu_shortlist),
+        )
         with pipeline_phase("openai_refinement"):
+            before_openai = len(candidates)
             ai_candidates = collect_candidates_multipass(
                 formatted,
                 api_key,
@@ -625,13 +696,43 @@ def run_full_clip_pipeline(
                 passes_override=passes_override,
                 region_filter_override=region_filter_gpu,
             )
+        forensics.record_stage(
+            "openai_multipass",
+            input_count=before_openai,
+            output_count=len(ai_candidates),
+            rejected_count=max(
+                0,
+                pool_stats.get("rejected_invalid_time", 0)
+                + pool_stats.get("rejected_duration", 0)
+                + pool_stats.get("rejected_empty_transcript", 0),
+            ),
+            rejection_reasons={
+                "invalid_time": pool_stats.get("rejected_invalid_time", 0),
+                "duration": pool_stats.get("rejected_duration", 0),
+                "empty_transcript": pool_stats.get("rejected_empty_transcript", 0),
+            },
+            note=f"raw_ai={pool_stats.get('raw_ai_candidates', 0)} valid={pool_stats.get('valid_after_schema', 0)}",
+        )
         pool_stats["local_prefilter_candidates"] = stats.gpu_shortlist
         candidates.extend(ai_candidates)
+        forensics.record_stage(
+            "pool_after_openai",
+            input_count=before_openai,
+            output_count=len(candidates),
+        )
         # Early pool dedupe: start times within 5s only (not user min_gap_seconds).
         before_early = len(candidates)
         candidates = dedupe_candidates_exact_start(candidates)
+        overlap_removed = before_early - len(candidates)
         stats.rejected_overlap_early = int(pool_stats.get("rejected_overlap_early", 0)) + (
-            before_early - len(candidates)
+            overlap_removed
+        )
+        forensics.record_stage(
+            "early_start_dedupe",
+            input_count=before_early,
+            output_count=len(candidates),
+            rejected_count=overlap_removed,
+            rejection_reasons={"duplicate_start_within_5s": overlap_removed},
         )
         stats.json_telemetry = get_json_telemetry()
         stats.raw_candidates = len(candidates)
@@ -681,8 +782,12 @@ def run_full_clip_pipeline(
             stats.valid_after_schema = pool_stats.get("valid_after_schema", stats.valid_after_schema)
             stats.rescued_candidates = pool_stats.get("rescued_candidates", stats.rescued_candidates)
 
-        min_acceptable = max(12, int(target_count * 0.6))
-        if len(candidates) < min_acceptable and segments:
+        fallback_trigger = max(10, int(target_count * 0.5))
+        if discovery_mode:
+            fallback_trigger = max(10, int(target_count * 0.75))
+        needs_fallback = len(candidates) < fallback_trigger
+        if segments and (needs_fallback or (discovery_mode and stats.gpu_shortlist < 5)):
+            before_fb_pool = len(candidates)
             fallback = generate_local_fallback_candidates(
                 segments,
                 media_duration,
@@ -690,9 +795,17 @@ def run_full_clip_pipeline(
                 profile=profile,
                 target_count=target_count,
                 existing=candidates,
-                min_gap_seconds=max(25.0, min_gap_seconds * 0.85),
+                min_gap_seconds=max(18.0, min_gap_seconds * 0.7) if discovery_mode else max(25.0, min_gap_seconds * 0.85),
                 user_min_seconds=user_min_seconds,
                 user_max_seconds=user_max_seconds,
+                discovery_mode=discovery_mode,
+                forensics=forensics,
+            )
+            forensics.record_stage(
+                "local_fallback_triggered",
+                input_count=before_fb_pool,
+                output_count=before_fb_pool + len(fallback),
+                note=f"needs_fallback={needs_fallback} generated={len(fallback)}",
             )
             if fallback:
                 before_fb = len(candidates)
@@ -700,9 +813,40 @@ def run_full_clip_pipeline(
                 stats.rejected_overlap_early += before_fb + len(fallback) - len(candidates)
                 stats.local_fallback_candidates = len(fallback)
                 stats.raw_candidates = len(candidates)
+                if not stats.discovery_scan:
+                    stats.discovery_scan = forensics.to_dict()
                 stats.warnings.append(
                     f"Added {len(fallback)} local transcript-window fallback candidate(s) (no extra GPT calls)."
                 )
+        elif needs_fallback or (discovery_mode and stats.gpu_shortlist < 5):
+            forensics.record_stage(
+                "local_fallback_empty",
+                input_count=len(candidates),
+                output_count=len(candidates),
+                note="fallback trigger fired but generate_local_fallback returned 0",
+            )
+
+        forensics.record_stage(
+            "pre_diversity_pool",
+            input_count=stats.raw_candidates,
+            output_count=len(candidates),
+        )
+        stats.discovery_forensics = forensics.to_dict()
+        if forensics.first_zero_stage:
+            stats.warnings.append(
+                f"Discovery forensic: first zero-output stage='{forensics.first_zero_stage}' "
+                f"(gpu_shortlist={stats.gpu_shortlist}, raw={stats.raw_candidates}, "
+                f"fallback={stats.local_fallback_candidates})."
+            )
+        logger.info(
+            "[DISCOVERY FORENSIC] first_zero=%s gpu_gen=%d gpu_rej=%d windows_scanned=%d "
+            "fallback_gen=%d",
+            forensics.first_zero_stage or "none",
+            forensics.gpu_candidates_generated,
+            forensics.gpu_candidates_rejected,
+            forensics.windows_scanned,
+            forensics.fallback_candidates_generated,
+        )
 
         # Diversity on AI core windows BEFORE expansion
         selected, div_stats = run_diversity_pipeline(
@@ -805,9 +949,10 @@ def run_full_clip_pipeline(
                 profile=profile,
                 target_count=target_count,
                 existing=candidates,
-                min_gap_seconds=max(25.0, min_gap_seconds * 0.75),
+                min_gap_seconds=max(18.0, min_gap_seconds * 0.7) if discovery_mode else max(25.0, min_gap_seconds * 0.75),
                 user_min_seconds=user_min_seconds,
                 user_max_seconds=user_max_seconds,
+                discovery_mode=discovery_mode,
             )
             if fallback_sel:
                 before_m = len(candidates)
@@ -863,6 +1008,13 @@ def run_full_clip_pipeline(
             allow_exceed_max=allow_exceed_max,
         )
         selected = finalize_clips_after_ai(selected, media_duration, segments, exp)
+        selected, gov_pre = apply_duration_policy_batch(
+            selected, media_duration, pre_virality=True,
+        )
+        stats.duration_governor["after_context_expand"] = gov_pre.to_dict()
+        stats.timeline_occupancy["after_context_expand"] = compute_timeline_occupancy(
+            selected, media_duration,
+        )
 
         selected = split_long_clips(
             selected,
@@ -938,14 +1090,19 @@ def run_full_clip_pipeline(
             selected, segments, enabled=enable_speaker_signals,
         )
 
-        hard_max = min(user_max_seconds, ai_prof.max_clip_length, 120.0)
+        hard_max = min(user_max_seconds, ai_prof.max_clip_length, HARD_CAP_SECONDS)
+        soft_max = min(SOFT_CAP_SECONDS, hard_max, profile.expansion_max_seconds)
         with pipeline_phase("boundary_repair"):
             selected, stats.boundary_repairs = apply_boundary_repairs(
                 selected,
                 segments,
-                max_duration=hard_max,
+                max_duration=soft_max,
                 min_duration=user_min_seconds,
             )
+        selected, gov_boundary = apply_duration_policy_batch(
+            selected, media_duration, pre_virality=True,
+        )
+        stats.duration_governor["after_boundary_repair"] = gov_boundary.to_dict()
 
         with pipeline_phase("virality_scoring"):
             selected, stats.title_repairs = apply_virality_to_clips(
@@ -956,12 +1113,17 @@ def run_full_clip_pipeline(
                 title_style=title_style,
             )
 
+        selected, gov_viral = apply_duration_policy_batch(
+            selected, media_duration, pre_virality=False,
+        )
+        stats.duration_governor["after_virality"] = gov_viral.to_dict()
+
         with pipeline_phase("quality_gate"):
             selected, qg_stats = run_quality_gate(
                 selected,
                 segments,
                 media_duration=media_duration,
-                max_duration=hard_max,
+                max_duration=soft_max,
                 min_duration=user_min_seconds,
             )
             stats.quality_gate_repaired = qg_stats.repaired
@@ -990,8 +1152,24 @@ def run_full_clip_pipeline(
             segments,
             stats,
             user_min_seconds=user_min_seconds,
-            hard_max=hard_max,
+            hard_max=soft_max,
         )
+
+        selected, gov_final = apply_duration_policy_batch(
+            selected, media_duration, pre_virality=False,
+        )
+        stats.duration_governor["after_finalizer"] = gov_final.to_dict()
+        stats.timeline_occupancy["final"] = compute_timeline_occupancy(
+            selected, media_duration,
+        )
+        selected = [refresh_expansion_diagnostics(c) for c in selected]
+        log_over_soft_justifications(selected, stage="final_export_window")
+        if gov_final.over_soft_before or gov_final.clamped_soft or gov_final.clamped_hard:
+            stats.warnings.append(
+                f"Duration governor: {gov_final.clamped_soft} soft-clamp(s), "
+                f"{gov_final.clamped_hard} hard-clamp(s) "
+                f"({gov_final.over_soft_before} clip(s) exceeded {SOFT_CAP_SECONDS:.0f}s before final pass)."
+            )
 
         stats.final_clips = len(selected)
         export_usage = tracker.to_export_dict(

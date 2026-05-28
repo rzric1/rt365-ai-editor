@@ -1491,6 +1491,54 @@ def main() -> None:
                     f"- **OpenAI calls (this analysis):** {diag.get('openai_calls_used', pipe_stats.get('openai_calls_used', 0))}\n"
                     f"- **Fingerprint:** `{diag.get('analysis_fingerprint', '')}`"
                 )
+                dsc = pipe_stats.get("discovery_scan") or {}
+                if dsc or pipe_stats.get("gpu_local_candidates") is not None:
+                    with st.expander("Discovery scan diagnostics", expanded=False):
+                        st.markdown(
+                            f"- **Windows scanned:** {dsc.get('windows_scanned', 0)}\n"
+                            f"- **Windows kept:** {dsc.get('windows_kept', 0)}\n"
+                            f"- **Windows rejected:** {dsc.get('windows_rejected', 0)}\n"
+                            f"- **Emotion triggers:** {dsc.get('emotion_triggers', 0)}\n"
+                            f"- **Curiosity triggers:** {dsc.get('curiosity_triggers', 0)}\n"
+                            f"- **Pacing triggers:** {dsc.get('pacing_triggers', 0)}\n"
+                            f"- **Hook triggers:** {dsc.get('hook_triggers', 0)}\n"
+                            f"- **Story phrase triggers:** {dsc.get('story_phrase_triggers', 0)}\n"
+                            f"- **Transcript-only candidates:** {dsc.get('transcript_only_candidates', 0)}\n"
+                            f"- **Fallback generated:** {dsc.get('fallback_generated', 0)}\n"
+                            f"- **Discovery boosts:** {dsc.get('discovery_boost_activations', 0)}"
+                        )
+                        rej = dsc.get("rejection_reasons") or {}
+                        if rej:
+                            st.caption(
+                                "**Rejection reasons**\n"
+                                + "\n".join(f"  - {k}: {v}" for k, v in sorted(rej.items(), key=lambda x: -x[1]))
+                            )
+
+            dg = pipe_stats.get("duration_governor") or {}
+            occ = pipe_stats.get("timeline_occupancy") or {}
+            if dg or occ:
+                with st.expander("Duration / expansion governor", expanded=False):
+                    for stage, stg in dg.items():
+                        if isinstance(stg, dict):
+                            st.markdown(
+                                f"**{stage}**: checked {stg.get('checked', 0)} | "
+                                f"soft-clamped {stg.get('clamped_soft', 0)} | "
+                                f"hard-clamped {stg.get('clamped_hard', 0)} | "
+                                f"over soft before {stg.get('over_soft_before', 0)}"
+                            )
+                    fin = occ.get("final") or {}
+                    if fin:
+                        st.markdown(
+                            f"**Timeline (final):** {fin.get('clip_count', 0)} clips | "
+                            f"union {fin.get('union_seconds', 0)}s | "
+                            f"overlap {fin.get('overlap_seconds', 0)}s "
+                            f"(ratio {fin.get('overlap_ratio', 0)}) | "
+                            f">{fin.get('over_soft_cap', 0)} over 90s | "
+                            f"max {fin.get('max_duration', 0)}s"
+                        )
+                        durs = fin.get("durations") or []
+                        if durs:
+                            st.caption(f"Durations (s): {', '.join(str(d) for d in durs[:14])}")
 
             fr = pipe_stats.get("finalizer_report") or {}
             if fr or any(pipe_stats.get(k) for k in (
@@ -1653,10 +1701,20 @@ def main() -> None:
                         boundary_label = "repaired"
                     elif c.get("boundary_warning"):
                         boundary_label = "warning"
+                    exp_s = float(c.get("expanded_start", fs_default))
+                    exp_e = float(c.get("expanded_end", fe_default))
+                    orig_dur = float(c.get("original_duration", max(0.0, o_e - o_s)))
+                    exp_dur = float(c.get("expanded_duration", dur_val))
+                    growth_s = float(c.get("growth_seconds", max(0.0, exp_dur - orig_dur)))
+                    growth_pct = float(c.get("growth_percent", 0))
+                    merge_n = int(c.get("merge_source_count", 1))
                     st.caption(
-                        f"Duration: **{dur_val:.1f}s** | AI core: {o_s:.1f}s - {o_e:.1f}s "
-                        f"({max(0.0, o_e-o_s):.1f}s) | Boundary: **{boundary_label}**"
+                        f"Duration: **{dur_val:.1f}s** | Original: **{orig_dur:.1f}s** → "
+                        f"Expanded: **{exp_dur:.1f}s** (+{growth_s:.1f}s, {growth_pct:.0f}%) | "
+                        f"Merge sources: **{merge_n}** | Boundary: **{boundary_label}**"
                     )
+                    if c.get("expansion_justification"):
+                        st.caption(f"Expansion: {c['expansion_justification']}")
 
                     grounding = int(c.get("grounding_confidence", 0))
                     if grounding > 0:

@@ -221,24 +221,27 @@ def snap_clip_to_sentence_boundaries(
     repaired = False
     warning: str | None = None
     new_t0, new_t1 = t0, t1
+    growth_slack = min(6.0, max(2.0, max_duration * 0.08))
+    expand_ceiling = min(max_duration, dur + growth_slack)
 
     first_start = _first_sentence_start(spans, min_start=t0)
     if first_start is not None and first_start > t0 + 0.25 and first_start < t1 - min_duration:
-        new_t0 = first_start
-        repaired = True
+        if t1 - first_start <= expand_ceiling:
+            new_t0 = first_start
+            repaired = True
 
-    max_end = new_t0 + max_duration
+    max_end = new_t0 + expand_ceiling
     last_end = _last_complete_sentence_end(spans, max_end=min(new_t1, max_end))
     if last_end is not None and last_end > new_t0 + min_duration:
         if last_end < new_t1 - 0.2:
             new_t1 = last_end
             repaired = True
-    elif new_t1 - new_t0 > max_duration and last_end is not None:
-        new_t1 = min(last_end, new_t0 + max_duration)
+    elif new_t1 - new_t0 > expand_ceiling and last_end is not None:
+        new_t1 = min(last_end, new_t0 + expand_ceiling)
         repaired = True
 
-    if new_t1 - new_t0 > max_duration:
-        new_t1 = new_t0 + max_duration
+    if new_t1 - new_t0 > expand_ceiling:
+        new_t1 = new_t0 + expand_ceiling
         repaired = True
 
     if new_t1 - new_t0 < min_duration:

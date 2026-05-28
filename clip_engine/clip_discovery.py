@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from clip_engine.discovery_forensics import DiscoveryForensics
 
 from clip_engine.clip_signals import compute_signal_boosts
 from clip_engine.clip_split_parts import flag_split_recommended
@@ -284,27 +287,84 @@ def generate_local_fallback_candidates(
     min_gap_seconds: float = 35.0,
     user_min_seconds: float = 15.0,
     user_max_seconds: float = 90.0,
+    discovery_mode: bool = False,
+    forensics: DiscoveryForensics | None = None,
 ) -> list[dict]:
     """
     Build additional candidates from transcript sentence windows using local signal scoring.
     """
     if not segments or media_duration <= 0:
+        if forensics:
+            forensics.record_stage(
+                "local_fallback",
+                input_count=len(segments or []),
+                output_count=0,
+                rejection_reasons={"no_segments_or_duration": 1},
+            )
         return []
+
+    from clip_engine.transcript_candidate_scanner import scan_transcript_candidates
+
+    scanned, scan_stats = scan_transcript_candidates(
+        segments,
+        media_duration,
+        discovery_mode=discovery_mode,
+        user_min_seconds=user_min_seconds,
+        user_max_seconds=min(user_max_seconds, profile.ai_max_clip_seconds),
+        max_candidates=max(target_count * 3, 40),
+        existing=existing,
+        min_gap_seconds=max(14.0, min_gap_seconds * 0.6) if discovery_mode else min_gap_seconds,
+    )
+    if scanned:
+        if forensics:
+            forensics.merge_scan_stats(scan_stats.to_dict())
+            forensics.fallback_candidates_generated = len(scanned)
+            forensics.record_stage(
+                "local_fallback_scanner",
+                input_count=len(existing),
+                output_count=len(scanned),
+                rejected_count=scan_stats.windows_rejected,
+                rejection_reasons=scan_stats.rejection_reasons,
+            )
+        logger.info(
+            "Local fallback (transcript scanner): %d candidates (discovery_mode=%s)",
+            len(scanned),
+            discovery_mode,
+        )
+        return scanned
 
     style = clip_style if clip_style in ("Balanced", "Micro clips", "Long story clips") else "Balanced"
     win_min, win_max, step = _window_duration_bounds(style)  # type: ignore[arg-type]
-    win_min = max(user_min_seconds, win_min)
-    win_max = min(user_max_seconds, win_max, profile.ai_max_clip_seconds)
+    if discovery_mode:
+        win_min = max(15.0, user_min_seconds, 18.0)
+        win_max = min(user_max_seconds, win_max, profile.ai_max_clip_seconds)
+        step = min(step, 16.0)
+    else:
+        win_min = max(user_min_seconds, win_min)
+        win_max = min(user_max_seconds, win_max, profile.ai_max_clip_seconds)
 
-    sentences = merge_segments_into_sentences(segments)
+    sentences = merge_segments_into_sentences(
+        segments,
+        min_sentence_words=3 if discovery_mode else 4,
+    )
     if not sentences:
+        if forensics:
+            forensics.record_stage(
+                "local_fallback_sentence_windows",
+                input_count=len(segments),
+                output_count=0,
+                rejection_reasons={"no_sentences": 1},
+            )
         return []
 
     existing_ranges = [_clip_range(c) for c in existing]
     candidates: list[dict] = []
+    fb_rejects: dict[str, int] = {}
+    windows_scanned = 0
 
     t = float(sentences[0].get("start", 0))
     while t < media_duration - win_min:
+        windows_scanned += 1
         end_target = min(t + win_max, media_duration)
         end_min = t + win_min
 
@@ -313,6 +373,7 @@ def generate_local_fallback_candidates(
             if float(s.get("end", 0)) > t and float(s.get("start", 0)) < end_target
         ]
         if not window_sents:
+            fb_rejects["no_sentences_in_window"] = fb_rejects.get("no_sentences_in_window", 0) + 1
             t += step
             continue
 
@@ -320,22 +381,27 @@ def generate_local_fallback_candidates(
         s1 = float(window_sents[-1].get("end", end_target))
         dur = s1 - s0
         if dur < win_min:
+            fb_rejects["duration_below_min"] = fb_rejects.get("duration_below_min", 0) + 1
             t += step * 0.5
             continue
         if dur > win_max * 1.05:
+            fb_rejects["duration_above_max"] = fb_rejects.get("duration_above_max", 0) + 1
             t += step
             continue
 
         r = (s0, s1)
         if any(_ranges_overlap(r, er, min_gap_seconds) for er in existing_ranges):
+            fb_rejects["overlap_existing"] = fb_rejects.get("overlap_existing", 0) + 1
             t += step
             continue
         if any(_ranges_overlap(r, _clip_range(c), min_gap_seconds * 0.5) for c in candidates):
+            fb_rejects["overlap_candidate"] = fb_rejects.get("overlap_candidate", 0) + 1
             t += step
             continue
 
         text = " ".join(str(s.get("text", "")).strip() for s in window_sents).strip()
-        if len(text.split()) < 8:
+        if len(text.split()) < (5 if discovery_mode else 8):
+            fb_rejects["too_few_words"] = fb_rejects.get("too_few_words", 0) + 1
             t += step
             continue
 
@@ -375,7 +441,23 @@ def generate_local_fallback_candidates(
     need = max(target_count * 2 - len(existing), target_count - len(existing), 0)
     need = min(need, max(target_count, 15))
     selected = candidates[:need]
-    logger.info("Local fallback generated %d candidates (scanned windows)", len(selected))
+    if forensics:
+        forensics.windows_scanned += windows_scanned
+        forensics.windows_rejected += sum(fb_rejects.values())
+        forensics.fallback_candidates_generated = len(selected)
+        forensics.record_stage(
+            "local_fallback_sentence_windows",
+            input_count=windows_scanned,
+            output_count=len(selected),
+            rejected_count=sum(fb_rejects.values()),
+            rejection_reasons=fb_rejects,
+        )
+    logger.info(
+        "Local fallback generated %d candidates (scanned=%d rejected=%d)",
+        len(selected),
+        windows_scanned,
+        sum(fb_rejects.values()),
+    )
     return selected
 
 

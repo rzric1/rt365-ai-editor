@@ -592,11 +592,20 @@ def expand_clip_to_sentence_or_thought_boundary(
     max_duration: float,
     *,
     min_duration: float = 25.0,
+    growth_slack_seconds: float = 8.0,
 ) -> dict:
     c = dict(clip)
     t0, t1 = _clip_times(c)
+    initial_dur = t1 - t0
     if not transcript_segments:
         return c
+
+    # Do not grow an already-long clip toward the hard cap (reduces timeline overlap).
+    if initial_dur >= max_duration - 2.0:
+        growth_slack_seconds = 2.0
+    elif initial_dur >= max_duration * 0.85:
+        growth_slack_seconds = min(growth_slack_seconds, 4.0)
+    expand_ceiling = min(max_duration, initial_dur + growth_slack_seconds)
 
     spans = _sentence_spans(transcript_segments, t0 - 45, t1 + 45)
     if not spans:
@@ -621,7 +630,7 @@ def expand_clip_to_sentence_or_thought_boundary(
         cur_text = spans[first_i][2]
         if not (starts_mid_sentence(cur_text) or clip_starts_with_filler(c, transcript_segments)):
             break
-        if spans[last_i][1] - spans[first_i - 1][0] > max_duration:
+        if spans[last_i][1] - spans[first_i - 1][0] > expand_ceiling:
             break
         if SENTENCE_END_RE.search(prev_text):
             first_i -= 1
@@ -632,22 +641,25 @@ def expand_clip_to_sentence_or_thought_boundary(
         cur_text = spans[last_i][2]
         if SENTENCE_END_RE.search(cur_text) and not ends_with_dangling_word(cur_text):
             break
-        if spans[last_i + 1][1] - spans[first_i][0] > max_duration:
+        if spans[last_i + 1][1] - spans[first_i][0] > expand_ceiling:
             break
         last_i += 1
 
     new_t0 = spans[first_i][0]
     new_t1 = spans[last_i][1]
 
-    if new_t1 - new_t0 > max_duration:
+    if new_t1 - new_t0 > expand_ceiling:
         trimmed_end = new_t0
         for start, end, text in spans[first_i : last_i + 1]:
-            if end - new_t0 > max_duration:
+            if end - new_t0 > expand_ceiling:
                 break
             if SENTENCE_END_RE.search(text) and not ends_with_dangling_word(text):
                 trimmed_end = end
         if trimmed_end > new_t0 + min_duration * 0.6:
             new_t1 = trimmed_end
+
+    if new_t1 - new_t0 > expand_ceiling:
+        new_t1 = new_t0 + expand_ceiling
 
     if new_t1 - new_t0 < min_duration * 0.85:
         return c
@@ -687,6 +699,9 @@ def _merge_two_clips(
     )
     merged["finalizer_action"] = "merged"
     merged["finalizer_reason"] = "same story beat"
+    merged["merge_source_count"] = int(a.get("merge_source_count", 1) or 1) + int(
+        b.get("merge_source_count", 1) or 1
+    )
     merged["merged_from"] = list(dict.fromkeys(
         (merged.get("merged_from") or [])
         + [str(a.get("_wid", a.get("clip_id", ""))), str(b.get("_wid", b.get("clip_id", "")))]
@@ -710,6 +725,12 @@ def merge_adjacent_story_fragments(
     if len(clips) < 2:
         return clips, []
 
+    from clip_engine.clip_duration_governor import (
+        SOFT_CAP_SECONDS,
+        merge_allowed_max_duration,
+        refresh_expansion_diagnostics,
+    )
+
     log = log or logger
     sorted_clips = sorted(clips, key=lambda c: _clip_times(c)[0])
     merged_pairs: list[tuple[int, int]] = []
@@ -717,22 +738,34 @@ def merge_adjacent_story_fragments(
         return [], merged_pairs
 
     out: list[dict] = []
-    current = sorted_clips[0]
+    current = refresh_expansion_diagnostics(sorted_clips[0])
     for j in range(1, len(sorted_clips)):
-        nxt = sorted_clips[j]
-        combined_dur = _clip_times(nxt)[1] - _clip_times(current)[0]
+        nxt = refresh_expansion_diagnostics(sorted_clips[j])
+        cur_t0, cur_t1 = _clip_times(current)
+        nxt_t0, nxt_t1 = _clip_times(nxt)
+        combined_dur = nxt_t1 - cur_t0
+        cur_dur = cur_t1 - cur_t0
+        nxt_dur = nxt_t1 - nxt_t0
+        merge_cap = merge_allowed_max_duration(current, nxt, max_duration)
+        # Skip merge when either fragment is already long or union would dominate timeline.
+        already_long = cur_dur > SOFT_CAP_SECONDS * 0.82 or nxt_dur > SOFT_CAP_SECONDS * 0.82
         if (
             clips_are_same_story_beat(
                 current, nxt, transcript_segments, merge_gap_seconds=merge_gap_seconds
             )
-            and combined_dur <= max_duration
+            and combined_dur <= merge_cap
+            and not already_long
         ):
             current = _merge_two_clips(current, nxt, transcript_segments)
+            current = refresh_expansion_diagnostics(current)
             merged_pairs.append((j - 1, j))
             log.info(
-                '[CLIP FINALIZER] merged clips=%d,%d reason="same story beat"',
+                '[CLIP FINALIZER] merged clips=%d,%d combined=%.1fs cap=%.1fs sources=%d',
                 j - 1,
                 j,
+                combined_dur,
+                merge_cap,
+                int(current.get("merge_source_count", 2)),
             )
         else:
             out.append(current)
@@ -1013,7 +1046,13 @@ def _finalize_clips_core(
         report.merged = len(merge_pairs)
         report.merge_pairs = merge_pairs
 
-        # 3) Re-expand merged clips
+        # 3) Re-expand merged clips (growth-limited; pipeline governor clamps after)
+        from clip_engine.clip_duration_governor import (
+            clamp_clip_to_duration_policy,
+            clip_virality_score,
+            refresh_expansion_diagnostics,
+        )
+
         re_expanded: list[dict] = []
         for clip in working:
             if clip.get("finalizer_action") == "merged" and transcript_segments:
@@ -1022,7 +1061,14 @@ def _finalize_clips_core(
                     transcript_segments,
                     max_duration,
                     min_duration=min_duration,
+                    growth_slack_seconds=4.0,
                 )
+                clip, _ = clamp_clip_to_duration_policy(
+                    clip,
+                    0.0,
+                    pre_virality=clip_virality_score(clip) <= 90,
+                )
+                clip = refresh_expansion_diagnostics(clip)
             re_expanded.append(clip)
         working = re_expanded
 
