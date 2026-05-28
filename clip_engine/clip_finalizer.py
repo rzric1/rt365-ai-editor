@@ -100,6 +100,8 @@ FINALIZER_NORMAL_MIN_DURATION = 20.0
 FINALIZER_SOFT_SHORT_MAX_DURATION = 25.0
 FINALIZER_HARD_BROKEN_MAX_DURATION = 10.0
 GUEST_ANSWER_WINDOW_SECONDS = 15.0
+# Bump when rejection/warning rules change so cached clips re-finalize.
+FINALIZER_LOGIC_VERSION = 2
 
 
 @dataclass
@@ -117,6 +119,7 @@ class FinalizerReport:
     dangling_ending_warning: int = 0
     host_question_warning: int = 0
     metadata_grounding_warning: int = 0
+    incomplete_beginning_warning: int = 0
     merge_pairs: list[tuple[int, int]] = field(default_factory=list)
     expanded_indices: list[int] = field(default_factory=list)
     rejected_indices: list[tuple[int, str]] = field(default_factory=list)
@@ -138,6 +141,8 @@ class FinalizerReport:
             "dangling_ending_warning": self.dangling_ending_warning,
             "host_question_warning": self.host_question_warning,
             "metadata_grounding_warning": self.metadata_grounding_warning,
+            "incomplete_beginning_warning": self.incomplete_beginning_warning,
+            "finalizer_logic_version": FINALIZER_LOGIC_VERSION,
             "merge_pairs": self.merge_pairs,
             "expanded_indices": self.expanded_indices,
             "rejected_indices": self.rejected_indices,
@@ -240,13 +245,23 @@ def _hook_score(clip: dict) -> int:
     return int(clip.get("hook_quality_score", 0) or 0)
 
 
-def _hook_below_hard_threshold(clip: dict) -> bool:
+def _resolve_hook_score(clip: dict) -> int:
     score = _hook_score(clip)
     if score <= 0:
         title = str(clip.get("hook_title", ""))
         score, _ = assess_hook_quality(title)
         clip["hook_quality_score"] = score
-    return score < FINALIZER_HARD_HOOK_THRESHOLD
+    return score
+
+
+def _hook_below_hard_threshold(clip: dict) -> bool:
+    """Hard-reject pairing threshold only (55). Never use FINALIZER_SOFT_HOOK_THRESHOLD (70) here."""
+    return _resolve_hook_score(clip) < FINALIZER_HARD_HOOK_THRESHOLD
+
+
+def _hook_in_soft_warning_band(clip: dict) -> bool:
+    score = _resolve_hook_score(clip)
+    return FINALIZER_HARD_HOOK_THRESHOLD <= score < FINALIZER_SOFT_HOOK_THRESHOLD
 
 
 def _has_metadata_grounding_warning(clip: dict) -> bool:
@@ -290,11 +305,15 @@ def _always_hard_reject_reasons(clip: dict, segments: list[dict] | None) -> list
 
 
 def _collect_soft_warnings(clip: dict, segments: list[dict] | None) -> list[str]:
+    """
+    Single-issue quality problems become warnings — never hard-reject alone.
+    Hook scores 55–69 are warned; only scores < 55 pair with other failures for hard reject.
+    """
     warnings: list[str] = []
-    hook = _hook_score(clip)
     dur = _clip_duration(clip)
 
-    if hook and hook < FINALIZER_SOFT_HOOK_THRESHOLD:
+    hook_score = _resolve_hook_score(clip)
+    if hook_score < FINALIZER_SOFT_HOOK_THRESHOLD:
         warnings.append("Hook quality below ideal threshold")
 
     if FINALIZER_NORMAL_MIN_DURATION <= dur < FINALIZER_SOFT_SHORT_MAX_DURATION:
@@ -307,15 +326,21 @@ def _collect_soft_warnings(clip: dict, segments: list[dict] | None) -> list[str]
     if clip_has_dangling_ending(clip, segments) and not _hook_below_hard_threshold(clip):
         warnings.append("Possible dangling ending")
 
-    if clip_starts_with_host_question(clip, segments):
-        if not _host_question_only_without_guest(clip, segments):
+    if clip_has_incomplete_ending(clip, segments) and not clip_has_dangling_ending(clip, segments):
+        warnings.append("Possible incomplete ending")
+
+    if clip_has_incomplete_beginning(clip, segments):
+        if _host_question_only_without_guest(clip, segments):
+            pass
+        elif clip_starts_with_host_question(clip, segments):
             warnings.append("Host-question-heavy opening")
+        elif clip_starts_with_filler(clip, segments):
+            warnings.append("Clip may start mid-thought or with filler")
+        else:
+            warnings.append("Possible incomplete beginning")
 
     if _has_metadata_grounding_warning(clip):
         warnings.append("Metadata may not match final clip window")
-
-    if clip_starts_with_filler(clip, segments):
-        warnings.append("Clip may start mid-thought or with filler")
 
     return list(dict.fromkeys(warnings))
 
@@ -843,6 +868,8 @@ def _apply_warning_counts(report: FinalizerReport | None, warnings: list[str]) -
             report.host_question_warning += 1
         elif "metadata" in w:
             report.metadata_grounding_warning += 1
+        elif "incomplete beginning" in w:
+            report.incomplete_beginning_warning += 1
 
 
 def reject_unwatchable_clips(
@@ -850,19 +877,27 @@ def reject_unwatchable_clips(
     min_duration: float,
     *,
     segments: list[dict] | None = None,
-    min_hook_quality: float = FINALIZER_SOFT_HOOK_THRESHOLD,
     log: logging.Logger | None = None,
     report: FinalizerReport | None = None,
+    **kwargs: Any,
 ) -> tuple[list[dict], list[tuple[int, str]]]:
     """
     Keep clips unless genuinely broken or a compound production failure applies.
     Single-issue problems become soft warnings on the clip.
+
+    Hard hook threshold: FINALIZER_HARD_HOOK_THRESHOLD (55) — never 70.
+    Soft hook band 55–69: kept with warning only.
     """
+    if kwargs.get("min_hook_quality") is not None:
+        logger.warning(
+            "[CLIP FINALIZER] min_hook_quality=%s ignored; hard threshold is %s",
+            kwargs["min_hook_quality"],
+            FINALIZER_HARD_HOOK_THRESHOLD,
+        )
     log = log or logger
     kept: list[dict] = []
     rejected: list[tuple[int, str]] = []
     _ = min_duration  # expansion uses caller min; rejection uses FINALIZER_* constants
-    _ = min_hook_quality  # retained for API compatibility; hard threshold is 55
 
     for idx, clip in enumerate(clips):
         c = dict(clip)
@@ -910,6 +945,7 @@ def reject_unwatchable_clips(
             log.info('[CLIP FINALIZER] kept clip=%d reason="watchable story moment"', idx)
 
         c["finalizer_checked"] = True
+        c["finalizer_logic_version"] = FINALIZER_LOGIC_VERSION
         kept.append(c)
 
     return kept, rejected
@@ -1124,7 +1160,12 @@ def ensure_clips_finalized(
     """Run finalizer only when clips lack finalizer_checked metadata."""
     if not clips:
         return [], False
-    if all(bool(c.get("finalizer_checked")) for c in clips):
+    needs_finalize = any(
+        not bool(c.get("finalizer_checked"))
+        or int(c.get("finalizer_logic_version", 0)) < FINALIZER_LOGIC_VERSION
+        for c in clips
+    )
+    if not needs_finalize:
         return clips, False
     out = finalize_clips_for_ui(
         clips,
@@ -1138,6 +1179,9 @@ def ensure_clips_finalized(
 
 
 __all__ = [
+    "FINALIZER_HARD_HOOK_THRESHOLD",
+    "FINALIZER_SOFT_HOOK_THRESHOLD",
+    "FINALIZER_LOGIC_VERSION",
     "FinalizerReport",
     "clip_starts_with_filler",
     "clip_starts_with_host_question",

@@ -100,6 +100,28 @@ class TestClipFinalizerThresholds(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertIn("10", rejected[0][1])
 
+    def test_hook_67_kept_with_warning_not_hard_reject(self) -> None:
+        kept, rejected = self._reject(_clip(hook_score=67, end=35.0))
+        self.assertEqual(len(rejected), 0)
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(any("Hook quality" in w for w in kept[0].get("finalizer_warnings", [])))
+        self.assertNotIn("70", " ".join(kept[0].get("finalizer_warnings", [])))
+
+    def test_incomplete_beginning_alone_kept_with_warning(self) -> None:
+        kept, rejected = self._reject(
+            _clip(
+                hook_score=75,
+                window="and then she told me about her childhood growing up in Ohio",
+            )
+        )
+        self.assertEqual(len(rejected), 0)
+        self.assertTrue(
+            any(
+                "incomplete beginning" in w.lower() or "mid-thought" in w.lower()
+                for w in kept[0].get("finalizer_warnings", [])
+            )
+        )
+
 
 def _hook_score(clip: dict) -> int:
     return int(clip.get("hook_quality_score", 0))
