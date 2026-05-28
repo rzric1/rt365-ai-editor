@@ -278,8 +278,9 @@ Select-String -Path .\clip_engine\*.py -Pattern "client.chat.completions.create"
 | Field | Value |
 |-------|--------|
 | Branch | `feature/opus-quality-upgrade` |
+| Commit hash | `ce96740` |
 | Commit message | `Full diagnostic stabilization pass` |
-| Push | `origin/feature/opus-quality-upgrade` (see commit hash after push) |
+| Push | **Succeeded** → `origin/feature/opus-quality-upgrade` |
 
 ---
 
