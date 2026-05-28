@@ -488,8 +488,8 @@ def get_rtx_pipeline_status() -> dict[str, Any]:
         try:
             from clip_engine.ffmpeg_gpu import faster_whisper_cuda_available
             whisper_cuda = faster_whisper_cuda_available()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("faster_whisper_cuda_available probe failed: %s", exc)
 
         gpu_mem = None
         if torch_diag.get("torch_cuda_available"):
@@ -499,8 +499,8 @@ def get_rtx_pipeline_status() -> dict[str, Any]:
                     "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
                     "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
                 }
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("GPU memory stats unavailable: %s", exc)
 
         return {
             "cuda_available": sem.get("cuda_available", False),

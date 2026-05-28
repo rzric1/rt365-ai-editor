@@ -92,6 +92,11 @@ class PipelineStats:
     clip_strategy: str = "Balanced"
     platform_target: str = "TikTok/Reels/Shorts"
     title_style: str = "Curiosity"
+    finalizer_expanded: int = 0
+    finalizer_merged: int = 0
+    finalizer_rejected: int = 0
+    finalizer_hooks_repaired: int = 0
+    finalizer_report: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -133,6 +138,11 @@ class PipelineStats:
             "clip_strategy": self.clip_strategy,
             "platform_target": self.platform_target,
             "title_style": self.title_style,
+            "finalizer_expanded": self.finalizer_expanded,
+            "finalizer_merged": self.finalizer_merged,
+            "finalizer_rejected": self.finalizer_rejected,
+            "finalizer_hooks_repaired": self.finalizer_hooks_repaired,
+            "finalizer_report": self.finalizer_report,
             "estimated_tokens": self.estimated_tokens,
             "model_fast": self.model_fast,
             "model_quality": self.model_quality,
@@ -172,6 +182,7 @@ from clip_engine.clip_metadata import ground_all_clips_metadata
 from clip_engine.clip_split import split_long_clips
 from clip_engine.clip_boundaries import apply_boundary_repairs
 from clip_engine.clip_scoring import apply_virality_to_clips, ensure_all_clip_hooks
+from clip_engine.clip_finalizer import finalize_clips_with_report
 from clip_engine.clip_quality_gate import run_quality_gate
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
 from clip_engine.ai_profiles import get_ai_profile
@@ -282,6 +293,40 @@ def _run_expansion_passes(
         )
 
     return merged_candidates, selected, rounds
+
+
+def _apply_clip_quality_finalizer(
+    clips: list[dict],
+    segments: list[dict],
+    stats: PipelineStats,
+    *,
+    user_min_seconds: float,
+    hard_max: float,
+) -> list[dict]:
+    """Clip Quality Finalizer — last pass before UI/cache/export."""
+    if not clips:
+        return clips
+    before = len(clips)
+    with pipeline_phase("clip_quality_finalizer"):
+        finalized, report = finalize_clips_with_report(
+            clips,
+            transcript_segments=segments,
+            min_duration=user_min_seconds,
+            max_duration=hard_max,
+            merge_gap_seconds=20.0,
+            logger=logger,
+        )
+    stats.finalizer_expanded = report.expanded
+    stats.finalizer_merged = report.merged
+    stats.finalizer_rejected = report.rejected
+    stats.finalizer_hooks_repaired = report.hooks_repaired
+    stats.finalizer_report = report.to_dict()
+    stats.final_clips = len(finalized)
+    if before > len(finalized):
+        stats.warnings.append(
+            f"Clip finalizer removed {before - len(finalized)} weak or fragmented clip(s)."
+        )
+    return finalized
 
 
 def run_full_clip_pipeline(
@@ -421,6 +466,14 @@ def run_full_clip_pipeline(
             if cached_clips and segments:
                 cached_clips, cached_hook_fixes = ensure_all_clip_hooks(cached_clips, segments)
                 stats.title_repairs = int(cached.get("stats", {}).get("title_repairs", 0)) + cached_hook_fixes
+            hard_max_cached = min(user_max_seconds, ai_prof.max_clip_length, 120.0)
+            cached_clips = _apply_clip_quality_finalizer(
+                cached_clips,
+                segments,
+                stats,
+                user_min_seconds=user_min_seconds,
+                hard_max=hard_max_cached,
+            )
             stats.final_clips = len(cached_clips)
             cached_stats = cached.get("stats") or {}
             stats.boundary_repairs = int(cached_stats.get("boundary_repairs", 0))
@@ -429,6 +482,14 @@ def run_full_clip_pipeline(
             stats.openai_calls_used = 0
             stats.warnings.append("Loaded cached analysis — no OpenAI tokens used.")
             logger.info("[CACHE] hit — skipping OpenAI pipeline (cache reuse)")
+            if oai.use_cache and cached_clips:
+                save_cached_analysis(
+                    cache_key,
+                    clips=cached_clips,
+                    stats=stats.to_dict(),
+                    token_usage=cached.get("token_usage", {}),
+                    analysis_fingerprint=cache_key,
+                )
             return cached_clips, stats, tracker
         stats.cache_miss_reason = "no_cached_entry_or_version"
         logger.info("[CACHE] miss — running full pipeline")
@@ -924,6 +985,14 @@ def run_full_clip_pipeline(
             selected, final_hook_repairs = ensure_all_clip_hooks(selected, segments)
             stats.title_repairs += final_hook_repairs
 
+        selected = _apply_clip_quality_finalizer(
+            selected,
+            segments,
+            stats,
+            user_min_seconds=user_min_seconds,
+            hard_max=hard_max,
+        )
+
         stats.final_clips = len(selected)
         export_usage = tracker.to_export_dict(
             target_clips=target_count,
@@ -968,9 +1037,10 @@ def run_full_clip_pipeline(
             stats.estimated_tokens or token_estimate.estimated_total_tokens
         )
         logger.info(
-            "[PIPELINE] Analysis complete — %d final clips, cache_hit=%s",
+            "[PIPELINE] completed clips=%d cache_hit=%s finalizer_rejected=%d",
             stats.final_clips,
             stats.cache_hit,
+            stats.finalizer_rejected,
         )
 
         return selected, stats, tracker

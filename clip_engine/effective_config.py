@@ -242,6 +242,7 @@ def get_invalidation_reason(
     Return why analysis should re-run, or None if cached session analysis is still valid.
     """
     if session_state.get(SESSION_FORCE_REANALYZE):
+        logger.info("[CACHE] invalidation reason=explicit_reanalyze")
         return "explicit_reanalyze"
     if not session_state.get("cs_formatted"):
         return "missing_transcript"
@@ -249,13 +250,16 @@ def get_invalidation_reason(
         return "missing_video"
     prev_video = str(session_state.get("cs_analysis_video_identity", ""))
     if prev_video and prev_video != video_identity:
+        logger.info("[CACHE] invalidation reason=video_changed")
         return "video_changed"
     prev_hash = str(session_state.get("cs_analysis_transcript_hash", ""))
     if prev_hash and prev_hash != transcript_hash:
+        logger.info("[CACHE] invalidation reason=transcript_changed")
         return "transcript_changed"
     fp = build_analysis_fingerprint(session_state, video_identity=video_identity, transcript_hash=transcript_hash)
     prev_fp = str(session_state.get(SESSION_ANALYSIS_FINGERPRINT, ""))
     if prev_fp and prev_fp != fp:
+        logger.info("[CACHE] invalidation reason=ai_settings_changed")
         return "ai_settings_changed"
     if not session_state.get("cs_clips") and not prev_fp:
         return None
@@ -331,7 +335,7 @@ def log_widget_rerun_noop(session_state: Any) -> None:
     """Log when a Streamlit rerun does not invalidate analysis."""
     if session_state.get("cs_clips") and session_state.get(SESSION_ANALYSIS_FINGERPRINT):
         logger.info(
-            "[ANALYSIS] no-op widget rerun (fingerprint=%s, clips=%d)",
+            "[SESSION] no-op widget rerun (fingerprint=%s, clips=%d)",
             session_state.get(SESSION_ANALYSIS_FINGERPRINT),
             len(session_state.get("cs_clips") or []),
         )

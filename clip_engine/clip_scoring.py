@@ -89,7 +89,10 @@ def _core_message_from_window(window_text: str) -> str:
     if selected.lower().startswith(("what ", "why ", "how ")):
         selected = f"The Key Point Is {selected[0].lower() + selected[1:]}"
 
-    # Ensure terminal punctuation for complete-thought validation.
+    # Short-form titles: avoid trailing period when the phrase is already complete.
+    if len(words) <= 10 and not hook_title_is_incomplete(selected):
+        return selected.rstrip(".")
+
     if not re.search(r"[.!?]$", selected):
         selected = f"{selected}."
     return selected
@@ -127,6 +130,14 @@ def assess_hook_quality(title: str) -> tuple[int, str | None]:
         score += 8
     if re.search(r"\b(never|always|everyone|no one|shocking|insane)\b", t, re.I):
         score += 6
+    if re.search(
+        r"\b(key lesson|emotional moment|untitled clip|podcast moment)\b",
+        t,
+        re.I,
+    ):
+        score -= 25
+    if re.search(r"\b(?:about|have been|would have been)\s*$", t, re.I):
+        score -= 35
     return min(100, max(0, score)), warn
 
 
@@ -372,6 +383,17 @@ def apply_virality_to_clip(
     return c
 
 
+def _title_copied_from_window(title: str, window: str) -> bool:
+    t = (title or "").strip().lower()
+    w = (window or "").strip().lower()
+    if not t or not w or len(t) < 12:
+        return False
+    words = re.findall(r"[a-z0-9']+", t)
+    if len(words) >= 4 and " ".join(words[:6]) in w[: max(len(w), len(t) + 40)]:
+        return True
+    return False
+
+
 def ensure_all_clip_hooks(
     clips: list[dict],
     segments: list[dict],
@@ -381,15 +403,19 @@ def ensure_all_clip_hooks(
     """
     out: list[dict] = []
     repairs = 0
-    for clip in clips:
+    for idx, clip in enumerate(clips):
         c = dict(clip)
         title = str(c.get("hook_title", "")).strip()
-        if not hook_title_is_incomplete(title):
-            out.append(c)
-            continue
         t0 = float(c.get("start_seconds", c.get("start", 0)))
         t1 = float(c.get("end_seconds", c.get("end", t0)))
-        window = extract_transcript_window(segments, t0, t1)
+        window = extract_transcript_window(segments, t0, t1) if segments else ""
+        needs_repair = (
+            hook_title_is_incomplete(title)
+            or _title_copied_from_window(title, window)
+        )
+        if not needs_repair:
+            out.append(c)
+            continue
         repaired = repair_hook_title_local(title, window)
         if repaired != title:
             c["hook_title_before_repair"] = title
@@ -397,6 +423,15 @@ def ensure_all_clip_hooks(
             c["hook_title_repaired"] = True
             c.setdefault("warnings", []).append("Final hook title repair applied.")
             repairs += 1
+            new_score, _ = assess_hook_quality(repaired)
+            c["hook_quality_score"] = new_score
+            logger.info(
+                '[HOOK REPAIR] clip=%s old="%s" new="%s" score=%s',
+                c.get("_wid", c.get("clip_id", idx)),
+                title[:60],
+                repaired[:60],
+                new_score,
+            )
         out.append(c)
     return out, repairs
 

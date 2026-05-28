@@ -147,7 +147,7 @@ SESSION_DIAG_CACHE = "cs_ai_diag_cache"
 def _run_startup_diagnostics_once() -> None:
     """Run hardware/ffmpeg diagnostics once per Streamlit session."""
     if st.session_state.get(SESSION_DIAG_INIT):
-        logger.debug("diagnostics already initialized — skipping duplicate diagnostics")
+        logger.info("[DIAGNOSTICS] already initialized; skipping duplicate diagnostics")
         return
     ensure_ffmpeg_on_path(log=True)
     log_nvenc_probe_command_explicit()
@@ -1292,7 +1292,22 @@ def main() -> None:
                             transcript_hash=th,
                         )
                         if inv is None and st.session_state.get("cs_clips") and not st.session_state.get(SESSION_FORCE_REANALYZE):
-                            logger.info("[ANALYSIS] Skipping OpenAI — session clips still valid")
+                            from clip_engine.clip_finalizer import ensure_clips_finalized
+
+                            segs = st.session_state.get("cs_segments") or []
+                            export_max = min(
+                                float(st.session_state.get("cs_max_clip_seconds", 120)),
+                                120.0,
+                            )
+                            finalized, _did_finalize = ensure_clips_finalized(
+                                list(st.session_state.cs_clips),
+                                segs,
+                                min_duration=float(st.session_state.get("cs_min_clip_seconds", 25)),
+                                max_duration=export_max,
+                            )
+                            if _did_finalize:
+                                st.session_state.cs_clips = finalized
+                            logger.info("[SESSION] no-op analysis rerun — clips still valid")
                             st.session_state.cs_status = (
                                 f"Using existing {len(st.session_state.cs_clips)} clips "
                                 "(edit hooks/times freely — no new OpenAI calls)."
@@ -1380,6 +1395,19 @@ def main() -> None:
         # ------------------------------------------------------------------ CLIP CARDS
         clips: list = st.session_state.get("cs_clips") or []
         if clips:
+            if not all(bool(c.get("finalizer_checked")) for c in clips):
+                from clip_engine.clip_finalizer import ensure_clips_finalized
+
+                segs_for_finalize = st.session_state.get("cs_segments") or []
+                ui_max = min(float(st.session_state.get("cs_max_clip_seconds", 120)), 120.0)
+                clips, _ui_finalized = ensure_clips_finalized(
+                    clips,
+                    segs_for_finalize,
+                    min_duration=float(st.session_state.get("cs_min_clip_seconds", 25)),
+                    max_duration=ui_max,
+                )
+                if _ui_finalized:
+                    st.session_state.cs_clips = clips
             media_dur_for_map = float(st.session_state.get("cs_media_duration") or 0.0)
             pipe_stats = st.session_state.get("cs_pipeline_stats") or {}
             target_req = int(pipe_stats.get("target_clips", st.session_state.get("cs_target_clips", 20)))
@@ -1463,6 +1491,29 @@ def main() -> None:
                     f"- **OpenAI calls (this analysis):** {diag.get('openai_calls_used', pipe_stats.get('openai_calls_used', 0))}\n"
                     f"- **Fingerprint:** `{diag.get('analysis_fingerprint', '')}`"
                 )
+
+            fr = pipe_stats.get("finalizer_report") or {}
+            if fr or any(pipe_stats.get(k) for k in (
+                "finalizer_expanded", "finalizer_merged", "finalizer_rejected", "finalizer_hooks_repaired"
+            )):
+                with st.expander("Finalizer Report", expanded=False):
+                    st.markdown(
+                        f"- **Checked:** {fr.get('checked', pipe_stats.get('final_clips', len(clips)))}\n"
+                        f"- **Expanded:** {fr.get('expanded', pipe_stats.get('finalizer_expanded', 0))}\n"
+                        f"- **Merged:** {fr.get('merged', pipe_stats.get('finalizer_merged', 0))}\n"
+                        f"- **Rejected:** {fr.get('rejected', pipe_stats.get('finalizer_rejected', 0))}\n"
+                        f"- **Hooks repaired:** {fr.get('hooks_repaired', pipe_stats.get('finalizer_hooks_repaired', 0))}\n"
+                        f"- **Kept:** {fr.get('kept', len(clips))}"
+                    )
+                    repairs = fr.get("hook_repairs") or []
+                    if repairs:
+                        for row in repairs[:8]:
+                            st.caption(
+                                f"Hook #{int(row.get('index', 0)) + 1}: "
+                                f"\"{str(row.get('old', ''))[:50]}\" → "
+                                f"\"{str(row.get('new', ''))[:50]}\" "
+                                f"(score {row.get('score', '?')})"
+                            )
 
             tok = get_session_tokens()
             if tok["total"] > 0:
@@ -1718,6 +1769,28 @@ def main() -> None:
                     if not to_export:
                         st.warning("No clips selected for export. Check at least one 'Export' checkbox.")
                     else:
+                        from clip_engine.clip_finalizer import (
+                            ensure_clips_finalized,
+                            validate_clip_for_export,
+                        )
+
+                        export_min = float(st.session_state.get("cs_min_clip_seconds", 25))
+                        export_max = min(
+                            float(st.session_state.get("cs_max_clip_seconds", 120)),
+                            120.0,
+                        )
+                        to_export, _finalized_on_export = ensure_clips_finalized(
+                            to_export,
+                            segs,
+                            min_duration=export_min,
+                            max_duration=export_max,
+                        )
+                        if _finalized_on_export:
+                            logger.info(
+                                "[CLIP FINALIZER] export guard finalized %d clip(s) before export",
+                                len(to_export),
+                            )
+
                         exported = 0
                         failed = 0
                         prog = st.progress(0.0)
@@ -1727,6 +1800,36 @@ def main() -> None:
 
                         for idx, c in enumerate(to_export):
                             wid = c.get("_wid", str(idx))
+                            pre_t0 = float(st.session_state.get(f"start_{wid}", c.get("start_seconds", c.get("start", 0))))
+                            pre_t1 = float(st.session_state.get(f"end_{wid}", c.get("end_seconds", c.get("end", 0))))
+                            pre_hook = str(
+                                st.session_state.get(
+                                    f"hook_widget_{wid}",
+                                    st.session_state.get(
+                                        f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}")
+                                    ),
+                                )
+                            ).strip()
+                            pre_check = dict(c)
+                            pre_check["start_seconds"] = pre_t0
+                            pre_check["end_seconds"] = pre_t1
+                            pre_check["hook_title"] = pre_hook
+                            ok_export, skip_reason = validate_clip_for_export(
+                                pre_check,
+                                min_duration=max(1.0, export_min * 0.5),
+                                max_duration=export_max + 5.0,
+                            )
+                            if not ok_export:
+                                failed += 1
+                                st.warning(f"Skipped clip {idx + 1}: {skip_reason}")
+                                logger.warning(
+                                    "[EXPORT] skipped clip=%s reason=%s",
+                                    wid,
+                                    skip_reason,
+                                )
+                                prog.progress((idx + 1) / len(to_export))
+                                continue
+
                             user_hook = str(
                                 st.session_state.get(
                                     f"hook_widget_{wid}",
@@ -1800,11 +1903,10 @@ def main() -> None:
                                             clip["grounded_hook_title"] = corrected_title
                                             break
                                 logger.info(
-                                    "Exported %s - mode=%s encoder=%s res=%s",
-                                    out.name,
-                                    result.get("export_mode"),
+                                    "[EXPORT] completed path=%s encoder=%s mode=%s",
+                                    out,
                                     result.get("encoder_used"),
-                                    result.get("resolution"),
+                                    result.get("export_mode"),
                                 )
                             except Exception as e:
                                 failed += 1

@@ -43,6 +43,21 @@ PARTIAL_TITLE_PHRASE_END_RE = re.compile(
     re.IGNORECASE,
 )
 
+PARTIAL_HOOK_FRAGMENT_RE = re.compile(
+    r"(?:"
+    r"that would have been|would have been|ever since I was|she was|he was|"
+    r"so they|and I|and he|and she|so every day|pretty heartbreaking\.?\s*so|"
+    r"don't know about|do not know about|know about|"
+    r"threatening suicide again and I|shattered in her brain\.?\s*so"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+INCOMPLETE_ABOUT_TITLE_RE = re.compile(
+    r"\b(?:about|regarding|concerning)\s*$",
+    re.IGNORECASE,
+)
+
 
 def ends_with_dangling_word(text: str) -> bool:
     """True if text ends on a weak connector/article (mid-thought)."""
@@ -81,6 +96,12 @@ def hook_title_is_incomplete(title: str) -> bool:
         return True
 
     if PARTIAL_TITLE_PHRASE_END_RE.search(t):
+        return True
+
+    if PARTIAL_HOOK_FRAGMENT_RE.search(t):
+        return True
+
+    if INCOMPLETE_ABOUT_TITLE_RE.search(t) and len(words) >= 4:
         return True
 
     if len(words) >= 2 and words[-2].lower() in ARTICLE_WORDS:
