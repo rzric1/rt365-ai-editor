@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 from clip_engine.transcription_utils import extract_transcript_window
 
@@ -20,15 +19,77 @@ DANGLING_END_WORDS = frozenset({
     "even", "still", "yet", "nor", "though", "although", "unless", "until",
 })
 
+TITLE_TRAILING_CONNECTORS = frozenset({
+    "and", "but", "so", "into", "with", "for", "of",
+})
+
+ARTICLE_WORDS = frozenset({"a", "an", "the"})
+
 SENTENCE_END_RE = re.compile(r"[.!?][\"')\]]*\s*$")
+TITLE_TOKEN_RE = re.compile(r"[A-Za-z']+")
+ARTICLE_NOUN_END_RE = re.compile(
+    r"\b(?:a|an|the)\s+[A-Za-z][A-Za-z'-]*\s*$",
+    re.IGNORECASE,
+)
+
+# Common truncated medical stems/fragments frequently seen in clipped titles.
+MID_MEDICAL_TERM_END_RE = re.compile(
+    r"\b(?:cardio|neuro|gastro|immuno|dermato|osteo|pulmo|nephro|onco|endo|hemo|patho)\s*$",
+    re.IGNORECASE,
+)
+
+PARTIAL_TITLE_PHRASE_END_RE = re.compile(
+    r"(?:\bi'm sorry\b|\bi am sorry\b|\band shots\b|\ba pet\b)\s*$",
+    re.IGNORECASE,
+)
 
 
 def ends_with_dangling_word(text: str) -> bool:
     """True if text ends on a weak connector/article (mid-thought)."""
-    words = re.findall(r"[A-Za-z']+", (text or "").strip())
+    words = TITLE_TOKEN_RE.findall((text or "").strip())
     if not words:
         return False
     return words[-1].lower() in DANGLING_END_WORDS
+
+
+def hook_title_is_incomplete(title: str) -> bool:
+    """
+    Detect incomplete hook-title endings, including required edge patterns:
+    - trailing connectors (and, but, so, into, with, for, of)
+    - article + noun ending ("a PET", "an MRI", "the process")
+    - mid-medical-term fragments ("cardio", "neuro", ...)
+    - short partial phrases ("I'm sorry", "and shots", "a PET")
+    """
+    t = (title or "").strip()
+    if not t:
+        return True
+    if t[-1] in ",;:-":
+        return True
+
+    words = TITLE_TOKEN_RE.findall(t)
+    if not words:
+        return True
+
+    last = words[-1].lower()
+    if last in DANGLING_END_WORDS or last in TITLE_TRAILING_CONNECTORS:
+        return True
+
+    if ARTICLE_NOUN_END_RE.search(t):
+        return True
+
+    if MID_MEDICAL_TERM_END_RE.search(t):
+        return True
+
+    if PARTIAL_TITLE_PHRASE_END_RE.search(t):
+        return True
+
+    if len(words) >= 2 and words[-2].lower() in ARTICLE_WORDS:
+        return True
+
+    if not SENTENCE_END_RE.search(t) and len(words) <= 3:
+        return True
+
+    return False
 
 
 def starts_mid_sentence(text: str) -> bool:
@@ -84,7 +145,7 @@ def _last_complete_sentence_end(
     *,
     max_end: float,
 ) -> float | None:
-    for start, end, text in reversed(spans):
+    for _, end, text in reversed(spans):
         if end > max_end + 0.05:
             continue
         if SENTENCE_END_RE.search(text.strip()) and not ends_with_dangling_word(text):
@@ -97,7 +158,7 @@ def _first_sentence_start(
     *,
     min_start: float,
 ) -> float | None:
-    for start, end, text in spans:
+    for start, _, text in spans:
         if start < min_start - 0.05:
             continue
         t = text.strip()
@@ -164,7 +225,7 @@ def snap_clip_to_sentence_boundaries(
 
     final_text = extract_transcript_window(segments, new_t0, new_t1)
     if ends_with_dangling_word(final_text):
-        for start, end, text in reversed(spans):
+        for _, end, text in reversed(spans):
             if end <= new_t0 + min_duration:
                 continue
             if end > new_t0 + max_duration:
@@ -184,8 +245,10 @@ def snap_clip_to_sentence_boundaries(
         c["boundary_status"] = "warning"
     elif repaired:
         c["boundary_status"] = "repaired"
+        c.pop("boundary_warning", None)
     else:
         c["boundary_status"] = "ok"
+        c.pop("boundary_warning", None)
 
     if repaired and (abs(new_t0 - t0) > 0.1 or abs(new_t1 - t1) > 0.1):
         c["start_seconds"] = round(new_t0, 3)
@@ -234,6 +297,7 @@ __all__ = [
     "DANGLING_END_WORDS",
     "apply_boundary_repairs",
     "ends_with_dangling_word",
+    "hook_title_is_incomplete",
     "snap_clip_to_sentence_boundaries",
     "starts_mid_sentence",
 ]

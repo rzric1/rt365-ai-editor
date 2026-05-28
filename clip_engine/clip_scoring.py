@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 from clip_engine.clip_boundaries import (
     ends_with_dangling_word,
+    hook_title_is_incomplete,
     starts_mid_sentence,
 )
 from clip_engine.transcription_utils import extract_transcript_window
@@ -53,6 +53,48 @@ _STRATEGY_WEIGHTS: dict[str, dict[str, float]] = {
 }
 
 
+def _core_message_from_window(window_text: str) -> str:
+    """
+    Derive a short declarative core message from transcript window text.
+    """
+    text = (window_text or "").strip()
+    if not text:
+        return "Key Lesson From The Conversation"
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    selected = ""
+    for sentence in sentences:
+        s = sentence.strip()
+        words = s.split()
+        if len(words) >= 5:
+            selected = s
+            break
+    if not selected:
+        selected = " ".join(text.split()[:14]).strip()
+
+    selected = selected.strip(" \"'.,;:!?-")
+    selected = re.sub(r"\s+", " ", selected)
+    words = selected.split()
+    if len(words) > 11:
+        selected = " ".join(words[:11]).strip()
+
+    if not selected:
+        return "Key Lesson From The Conversation"
+
+    # Keep title-style casing while forcing complete declarative phrasing.
+    selected = selected[0].upper() + selected[1:] if len(selected) > 1 else selected.upper()
+
+    # Convert obvious question fragments into declarative framing.
+    selected = selected.rstrip("?")
+    if selected.lower().startswith(("what ", "why ", "how ")):
+        selected = f"The Key Point Is {selected[0].lower() + selected[1:]}"
+
+    # Ensure terminal punctuation for complete-thought validation.
+    if not re.search(r"[.!?]$", selected):
+        selected = f"{selected}."
+    return selected
+
+
 def assess_hook_quality(title: str) -> tuple[int, str | None]:
     """
     Score hook title 0-100. Returns (hook_quality_score, hook_warning).
@@ -64,8 +106,12 @@ def assess_hook_quality(title: str) -> tuple[int, str | None]:
     if len(words) < 3:
         return 35, "Hook title is very short"
     score = 72
-    if ends_with_dangling_word(t):
-        return max(20, score - 45), "Hook ends on a dangling word (incomplete thought)"
+
+    if hook_title_is_incomplete(t):
+        if ends_with_dangling_word(t):
+            return max(20, score - 45), "Hook ends on a dangling word (incomplete thought)"
+        return max(22, score - 42), "Hook ends mid-sentence (incomplete thought)"
+
     if t[-1] in ",;:":
         return max(25, score - 40), "Hook ends mid-sentence"
     if not re.search(r"[.!?]$", t) and len(words) > 6:
@@ -85,38 +131,35 @@ def assess_hook_quality(title: str) -> tuple[int, str | None]:
 
 
 def repair_hook_title_local(title: str, window_text: str = "") -> str:
-    """Rewrite a bad hook locally without OpenAI."""
+    """
+    Rewrite a bad hook locally as a complete declarative title summarizing
+    the clip's core message.
+    """
     t = (title or "").strip()
+
     if not t:
-        if window_text:
-            return repair_hook_title_local(
-                " ".join(window_text.split()[:8]).strip(".,;:!?"),
-                "",
-            )
-        return "Untitled Clip Moment"
+        return _core_message_from_window(window_text)
 
-    words = t.split()
-    while words and words[-1].lower().rstrip(".,;:") in {
-        "and", "but", "so", "because", "the", "a", "an", "to", "of", "with",
-        "that", "which", "when", "while", "or", "if", "about", "for",
-    }:
-        words.pop()
+    # If already good, keep it.
+    if not hook_title_is_incomplete(t):
+        return t
 
-    if not words and window_text:
-        sents = re.split(r"(?<=[.!?])\s+", window_text.strip())
-        for sent in sents:
-            w = sent.split()
-            if len(w) >= 4:
-                words = w[:10]
-                break
+    # For incomplete/partial hooks, synthesize declarative summary.
+    repaired = _core_message_from_window(window_text)
 
-    if not words:
-        return "Key Moment From This Episode"
+    # If transcript is unavailable, salvage the original words safely.
+    if not window_text.strip():
+        words = re.findall(r"[A-Za-z0-9']+", t)
+        if not words:
+            return "Key Lesson From The Conversation."
+        words = words[:10]
+        repaired = " ".join(words).strip()
+        if repaired:
+            repaired = repaired[0].upper() + repaired[1:]
+        if not re.search(r"[.!?]$", repaired):
+            repaired = f"{repaired}."
 
-    repaired = " ".join(words).strip(".,;:!? ")
-    if repaired:
-        repaired = repaired[0].upper() + repaired[1:]
-    return repaired[:80] or "Key Moment From This Episode"
+    return repaired[:100] or "Key Lesson From The Conversation."
 
 
 def _dim_score(base: float, hits: int, cap: int = 3) -> int:
@@ -134,6 +177,8 @@ def compute_virality_score(
 ) -> tuple[int, dict[str, int], str]:
     """
     Compute virality_score 0-100, breakdown dict, and short explanation.
+    Penalties for boundary/title quality apply only when issues remain broken
+    after repair attempts.
     """
     t0 = float(clip.get("start_seconds", clip.get("start", 0)))
     t1 = float(clip.get("end_seconds", clip.get("end", t0)))
@@ -178,19 +223,34 @@ def compute_virality_score(
     penalties = 0
     boosts = 0
 
-    if starts_mid_sentence(text):
-        penalties += 12
-        complete_thought -= 8
-    if ends_with_dangling_word(text):
-        penalties += 12
-        complete_thought -= 8
-    if clip.get("boundary_warning") or clip.get("boundary_status") == "warning":
+    boundary_repaired = bool(clip.get("boundary_repaired"))
+    boundary_still_broken = (
+        not boundary_repaired
+        and (
+            bool(clip.get("boundary_warning"))
+            or clip.get("boundary_status") == "warning"
+            or starts_mid_sentence(text)
+            or ends_with_dangling_word(text)
+        )
+    )
+
+    title_repaired = bool(clip.get("hook_title_repaired"))
+    title_still_broken = (not title_repaired) and hook_title_is_incomplete(title)
+
+    if boundary_still_broken:
+        if starts_mid_sentence(text):
+            penalties += 12
+            complete_thought -= 8
+        if ends_with_dangling_word(text):
+            penalties += 12
+            complete_thought -= 8
         penalties += 6
-    if hook_q < 50:
-        penalties += 8
-        hook_strength -= 4
-    if ends_with_dangling_word(title):
+
+    if title_still_broken:
         penalties += 10
+        if hook_q < 50:
+            penalties += 8
+            hook_strength -= 4
 
     if re.search(r"\b(lesson|learned|realize|turned out|here's what)\b", text):
         boosts += 6
@@ -254,9 +314,9 @@ def compute_virality_score(
         parts.append("curiosity gap")
     if breakdown["debate"] >= 7:
         parts.append("debate potential")
-    if complete_thought >= 12 and not clip.get("boundary_warning"):
+    if complete_thought >= 12 and not boundary_still_broken:
         parts.append("complete thought")
-    if penalties >= 10:
+    if penalties >= 10 and (boundary_still_broken or title_still_broken):
         parts.append("boundary/title penalties applied")
     explanation = ", ".join(parts) if parts else "balanced moment across clarity and pacing"
 
@@ -275,12 +335,16 @@ def apply_virality_to_clip(
     c = dict(clip)
     title = str(c.get("hook_title", ""))
     hook_score, hook_warn = assess_hook_quality(title)
-    if hook_score < 55 or ends_with_dangling_word(title):
-        repaired = repair_hook_title_local(title, extract_transcript_window(
-            segments,
-            float(c.get("start_seconds", 0)),
-            float(c.get("end_seconds", 0)),
-        ))
+
+    if hook_score < 55 or hook_title_is_incomplete(title):
+        repaired = repair_hook_title_local(
+            title,
+            extract_transcript_window(
+                segments,
+                float(c.get("start_seconds", 0)),
+                float(c.get("end_seconds", 0)),
+            ),
+        )
         if repaired != title:
             c["hook_title_before_repair"] = title
             c["hook_title"] = repaired
@@ -292,6 +356,8 @@ def apply_virality_to_clip(
     if hook_warn:
         c["hook_warning"] = hook_warn
         c.setdefault("warnings", []).append(f"Hook: {hook_warn}")
+    elif c.get("hook_warning"):
+        c.pop("hook_warning", None)
 
     virality, breakdown, explanation = compute_virality_score(
         c,
