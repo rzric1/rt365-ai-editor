@@ -215,11 +215,23 @@ def candidate_window_text(c: dict, segments: list[dict]) -> str:
 
 
 def semantic_pipeline_status() -> dict[str, Any]:
-    return {
-        "embeddings_available": embeddings_available(),
-        "cuda_available": cuda_available(),
-        "device": get_embedding_device(),
-        "gpu_name": get_gpu_device_name(),
-        "model": _MODEL_NAME,
-        "loaded": _MODEL is not None,
-    }
+    try:
+        return {
+            "embeddings_available": embeddings_available(),
+            "cuda_available": cuda_available(),
+            "device": get_embedding_device(),
+            "gpu_name": get_gpu_device_name(),
+            "model": _MODEL_NAME,
+            "loaded": _MODEL is not None,
+        }
+    except Exception as exc:
+        logger.warning("semantic_pipeline_status failed: %s", exc)
+        return {
+            "embeddings_available": False,
+            "cuda_available": False,
+            "device": "cpu",
+            "gpu_name": "CPU",
+            "model": _MODEL_NAME,
+            "loaded": False,
+            "_error": str(exc)[:200],
+        }

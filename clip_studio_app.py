@@ -118,11 +118,6 @@ st.set_page_config(page_title="AI Clip Studio", layout="wide", initial_sidebar_s
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("clip_studio")
-ensure_directories()
-configure_rotating_logs(LOGS_DIR)
-ensure_ffmpeg_on_path(log=True)
-log_nvenc_probe_command_explicit()
-log_ai_acceleration_startup()
 
 CAPTION_PRESET_OPTIONS: list[CaptionPreset] = [
     "Clean", "Bold Viral", "Podcast", "Minimal",
@@ -515,6 +510,11 @@ def _render_score_breakdown(c: dict) -> None:
 
 def main() -> None:
     try:
+        ensure_directories()
+        configure_rotating_logs(LOGS_DIR)
+        ensure_ffmpeg_on_path(log=True)
+        log_nvenc_probe_command_explicit()
+        log_ai_acceleration_startup()
         _init_state()
         _flush_pending_long_defaults()
         ensure_ffmpeg_on_path(log=False)
@@ -696,45 +696,61 @@ def main() -> None:
             )
 
             with st.expander("RTX 4090 AI Pipeline Status", expanded=False):
-                rtx = get_rtx_pipeline_status()
-                if rtx.get("_error"):
-                    st.warning(
-                        "Pipeline status check failed (non-fatal). "
-                        f"Embeddings may be unavailable: {rtx['_error']}"
+                if st.button("Refresh GPU status", key="cs_rtx_refresh"):
+                    with st.spinner("Probing torch, embeddings, and CUDA…"):
+                        try:
+                            st.session_state.cs_rtx_status = get_rtx_pipeline_status()
+                        except Exception as exc:
+                            st.session_state.cs_rtx_status = {
+                                "_error": str(exc),
+                                "python_version": "?",
+                                "torch_installed": False,
+                            }
+                rtx = st.session_state.get("cs_rtx_status")
+                if rtx is None:
+                    st.caption(
+                        "GPU pipeline probes are deferred until you click **Refresh GPU status** "
+                        "(avoids torchcodec/sentence-transformers import failures during startup)."
                     )
-                st.markdown(f"**Python:** `{rtx.get('python_version', '?')}`")
-                st.markdown(f"**torch installed:** `{rtx.get('torch_installed')}`")
-                if rtx.get("torch_installed"):
-                    st.markdown(f"**torch version:** `{rtx.get('torch_version')}`")
-                    st.markdown(f"**torch CUDA available:** `{rtx.get('torch_cuda_available')}`")
-                    st.markdown(f"**torch CUDA device count:** `{rtx.get('torch_cuda_device_count')}`")
-                    if rtx.get("torch_cuda_device_name"):
-                        st.markdown(f"**torch CUDA device:** `{rtx.get('torch_cuda_device_name')}`")
-                st.markdown(
-                    f"**sentence-transformers installed:** `{rtx.get('sentence_transformers_installed')}`"
-                )
-                st.markdown(
-                    f"**Embeddings device (selected):** `{rtx.get('embeddings_device_selected', 'cpu')}`"
-                )
-                st.markdown(f"**Embeddings on GPU:** `{rtx.get('embeddings_on_gpu')}`")
-                st.markdown(f"**GPU (semantic):** `{rtx.get('gpu_name', 'n/a')}`")
-                st.markdown(f"**Diarization on GPU:** `{rtx.get('diarization_on_gpu')}`")
-                st.markdown(f"**faster-whisper CUDA:** `{rtx.get('faster_whisper_cuda')}`")
-                st.markdown(f"**Local ranking enabled:** `{rtx.get('local_ranking_enabled')}`")
-                if rtx.get("torch_installed") and not rtx.get("torch_cuda_available"):
-                    st.warning(
-                        "PyTorch is installed but CUDA is not available. Embeddings will run on CPU. "
-                        "For best RTX 4090 performance, use a Python 3.11 virtual environment with "
-                        "CUDA-enabled PyTorch (`scripts/setup_python311_ai_env.ps1`)."
-                    )
-                if rtx.get("gpu_memory"):
-                    st.markdown(f"**GPU memory:** `{rtx['gpu_memory']}`")
-                tel = get_json_telemetry()
-                if tel.get("gpt5_success") or tel.get("json_fallback"):
+                else:
+                    if rtx.get("_error"):
+                        st.warning(
+                            "Pipeline status check failed (non-fatal). "
+                            f"Embeddings may be unavailable: {rtx['_error']}"
+                        )
+                    st.markdown(f"**Python:** `{rtx.get('python_version', '?')}`")
+                    st.markdown(f"**torch installed:** `{rtx.get('torch_installed')}`")
+                    if rtx.get("torch_installed"):
+                        st.markdown(f"**torch version:** `{rtx.get('torch_version')}`")
+                        st.markdown(f"**torch CUDA available:** `{rtx.get('torch_cuda_available')}`")
+                        st.markdown(f"**torch CUDA device count:** `{rtx.get('torch_cuda_device_count')}`")
+                        if rtx.get("torch_cuda_device_name"):
+                            st.markdown(f"**torch CUDA device:** `{rtx.get('torch_cuda_device_name')}`")
                     st.markdown(
-                        f"**GPT-5 JSON success rate:** `{tel.get('gpt5_success_rate_pct')}%` | "
-                        f"**Fallback rate:** `{tel.get('fallback_rate_pct')}%`"
+                        f"**sentence-transformers installed:** `{rtx.get('sentence_transformers_installed')}`"
                     )
+                    st.markdown(
+                        f"**Embeddings device (selected):** `{rtx.get('embeddings_device_selected', 'cpu')}`"
+                    )
+                    st.markdown(f"**Embeddings on GPU:** `{rtx.get('embeddings_on_gpu')}`")
+                    st.markdown(f"**GPU (semantic):** `{rtx.get('gpu_name', 'n/a')}`")
+                    st.markdown(f"**Diarization on GPU:** `{rtx.get('diarization_on_gpu')}`")
+                    st.markdown(f"**faster-whisper CUDA:** `{rtx.get('faster_whisper_cuda')}`")
+                    st.markdown(f"**Local ranking enabled:** `{rtx.get('local_ranking_enabled')}`")
+                    if rtx.get("torch_installed") and not rtx.get("torch_cuda_available"):
+                        st.warning(
+                            "PyTorch is installed but CUDA is not available. Embeddings will run on CPU. "
+                            "For best RTX 4090 performance, use a Python 3.11 virtual environment with "
+                            "CUDA-enabled PyTorch (`scripts/setup_python311_ai_env.ps1`)."
+                        )
+                    if rtx.get("gpu_memory"):
+                        st.markdown(f"**GPU memory:** `{rtx['gpu_memory']}`")
+                    tel = get_json_telemetry()
+                    if tel.get("gpt5_success") or tel.get("json_fallback"):
+                        st.markdown(
+                            f"**GPT-5 JSON success rate:** `{tel.get('gpt5_success_rate_pct')}%` | "
+                            f"**Fallback rate:** `{tel.get('fallback_rate_pct')}%`"
+                        )
 
             with st.expander("GPU Candidate Explorer", expanded=False):
                 explorer = (st.session_state.get("cs_pipeline_stats") or {}).get("gpu_explorer_rows") or []
@@ -1376,7 +1392,13 @@ def main() -> None:
                     # Editable fields row
                     e1, e2, e3, e4 = st.columns([2, 1, 1, 1])
                     with e1:
-                        st.text_input("Hook / title", value=str(c.get("hook_title", "") or ""), key=f"hook_{wid}")
+                        st.text_input(
+                            "Hook / title",
+                            value=st.session_state.get(
+                                f"hook_{wid}", str(c.get("hook_title", "") or "")
+                            ),
+                            key=f"hook_widget_{wid}",
+                        )
                     with e2:
                         st.number_input(
                             "Start (s)",
@@ -1542,7 +1564,12 @@ def main() -> None:
                         for idx, c in enumerate(to_export):
                             wid = c.get("_wid", str(idx))
                             user_hook = str(
-                                st.session_state.get(f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}"))
+                                st.session_state.get(
+                                    f"hook_widget_{wid}",
+                                    st.session_state.get(
+                                        f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}")
+                                    ),
+                                )
                             )
                             t0 = float(st.session_state.get(f"start_{wid}", c.get("start_seconds", c.get("start", 0))))
                             t1 = float(st.session_state.get(f"end_{wid}", c.get("end_seconds", c.get("end", 0))))
@@ -1651,5 +1678,5 @@ def main() -> None:
             st.code(traceback.format_exc())
 
 
-main()
-
+if __name__ == "__main__":
+    main()
