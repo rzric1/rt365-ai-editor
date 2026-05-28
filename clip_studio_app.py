@@ -1501,10 +1501,25 @@ def main() -> None:
                         f"- **Checked:** {fr.get('checked', pipe_stats.get('final_clips', len(clips)))}\n"
                         f"- **Expanded:** {fr.get('expanded', pipe_stats.get('finalizer_expanded', 0))}\n"
                         f"- **Merged:** {fr.get('merged', pipe_stats.get('finalizer_merged', 0))}\n"
-                        f"- **Rejected:** {fr.get('rejected', pipe_stats.get('finalizer_rejected', 0))}\n"
+                        f"- **Soft warnings:** {fr.get('soft_warnings', 0)}\n"
+                        f"- **Hard rejections:** {fr.get('hard_rejections', fr.get('rejected', pipe_stats.get('finalizer_rejected', 0)))}\n"
                         f"- **Hooks repaired:** {fr.get('hooks_repaired', pipe_stats.get('finalizer_hooks_repaired', 0))}\n"
                         f"- **Kept:** {fr.get('kept', len(clips))}"
                     )
+                    warn_counts = [
+                        ("low_hook_warning", "Hook below ideal"),
+                        ("short_duration_warning", "Short 20–25s"),
+                        ("dangling_ending_warning", "Dangling ending"),
+                        ("host_question_warning", "Host-question opening"),
+                        ("metadata_grounding_warning", "Metadata grounding"),
+                    ]
+                    warn_lines = [
+                        f"  - {label}: {fr.get(key, 0)}"
+                        for key, label in warn_counts
+                        if int(fr.get(key, 0)) > 0
+                    ]
+                    if warn_lines:
+                        st.caption("**Warning counts**\n" + "\n".join(warn_lines))
                     repairs = fr.get("hook_repairs") or []
                     if repairs:
                         for row in repairs[:8]:

@@ -93,6 +93,14 @@ EMOTION_KEYWORDS = frozenset({
 
 TOKEN_RE = re.compile(r"[A-Za-z']+")
 
+# Production rejection / warning thresholds (finalizer-only)
+FINALIZER_HARD_HOOK_THRESHOLD = 55
+FINALIZER_SOFT_HOOK_THRESHOLD = 70
+FINALIZER_NORMAL_MIN_DURATION = 20.0
+FINALIZER_SOFT_SHORT_MAX_DURATION = 25.0
+FINALIZER_HARD_BROKEN_MAX_DURATION = 10.0
+GUEST_ANSWER_WINDOW_SECONDS = 15.0
+
 
 @dataclass
 class FinalizerReport:
@@ -100,11 +108,18 @@ class FinalizerReport:
     expanded: int = 0
     merged: int = 0
     rejected: int = 0
+    hard_rejections: int = 0
+    soft_warnings: int = 0
     hooks_repaired: int = 0
     kept: int = 0
+    low_hook_warning: int = 0
+    short_duration_warning: int = 0
+    dangling_ending_warning: int = 0
+    host_question_warning: int = 0
+    metadata_grounding_warning: int = 0
     merge_pairs: list[tuple[int, int]] = field(default_factory=list)
     expanded_indices: list[int] = field(default_factory=list)
-    rejected_indices: list[int] = field(default_factory=list)
+    rejected_indices: list[tuple[int, str]] = field(default_factory=list)
     hook_repairs: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -114,8 +129,15 @@ class FinalizerReport:
             "expanded": self.expanded,
             "merged": self.merged,
             "rejected": self.rejected,
+            "hard_rejections": self.hard_rejections,
+            "soft_warnings": self.soft_warnings,
             "hooks_repaired": self.hooks_repaired,
             "kept": self.kept,
+            "low_hook_warning": self.low_hook_warning,
+            "short_duration_warning": self.short_duration_warning,
+            "dangling_ending_warning": self.dangling_ending_warning,
+            "host_question_warning": self.host_question_warning,
+            "metadata_grounding_warning": self.metadata_grounding_warning,
             "merge_pairs": self.merge_pairs,
             "expanded_indices": self.expanded_indices,
             "rejected_indices": self.rejected_indices,
@@ -138,6 +160,164 @@ def _clip_times(clip: dict) -> tuple[float, float]:
 def _clip_duration(clip: dict) -> float:
     t0, t1 = _clip_times(clip)
     return max(0.0, t1 - t0)
+
+
+def _clip_has_invalid_timestamps(clip: dict) -> bool:
+    try:
+        t0 = float(clip.get("start_seconds", clip.get("start", 0)))
+        t1 = float(clip.get("end_seconds", clip.get("end", 0)))
+    except (TypeError, ValueError):
+        return True
+    return t1 <= t0
+
+
+def _clip_has_empty_transcript(clip: dict, segments: list[dict] | None) -> bool:
+    if segments:
+        t0, t1 = _clip_times(clip)
+        return not bool(extract_transcript_window(segments, t0, t1).strip())
+    excerpt = str(
+        clip.get("grounded_transcript_excerpt")
+        or clip.get("selection_reason")
+        or ""
+    ).strip()
+    return not excerpt
+
+
+def clip_has_dangling_ending(clip: dict, segments: list[dict] | None = None) -> bool:
+    """True when the clip window ends on a dangling phrase (not full incomplete-beginning)."""
+    text = _window_text(clip, segments).strip()
+    if not text:
+        return False
+    if ends_with_dangling_word(text):
+        return True
+    words = [w.lower() for w in TOKEN_RE.findall(text)]
+    if words and not SENTENCE_END_RE.search(text):
+        if words[-1] in {
+            "was", "were", "is", "are", "am", "be", "been", "being",
+            "had", "have", "has", "did", "do", "does",
+        }:
+            return True
+        if len(words) >= 2 and words[-2] in {"and", "but", "so", "or", "the", "a", "an"}:
+            return True
+    if not SENTENCE_END_RE.search(text):
+        tail = text[-100:]
+        return ends_with_dangling_word(tail)
+    return False
+
+
+def _guest_answer_follows_within(
+    clip: dict,
+    segments: list[dict],
+    *,
+    within_seconds: float = GUEST_ANSWER_WINDOW_SECONDS,
+) -> bool:
+    if not segments:
+        return True
+    t0, t1 = _clip_times(clip)
+    window_segs = _segments_in_range(segments, t0, min(t1, t0 + within_seconds))
+    for seg in window_segs:
+        seg_text = str(seg.get("text", "")).strip()
+        if not seg_text:
+            continue
+        if HOST_QUESTION_START_RE.search(seg_text) and "?" in seg_text[: min(60, len(seg_text))]:
+            continue
+        if FILLER_START_RE.match(seg_text) and len(TOKEN_RE.findall(seg_text)) < 5:
+            continue
+        if len(TOKEN_RE.findall(seg_text)) >= 4:
+            return True
+    return False
+
+
+def _host_question_only_without_guest(clip: dict, segments: list[dict] | None) -> bool:
+    if not clip_starts_with_host_question(clip, segments):
+        return False
+    if not segments:
+        return False
+    return not _guest_answer_follows_within(clip, segments)
+
+
+def _hook_score(clip: dict) -> int:
+    return int(clip.get("hook_quality_score", 0) or 0)
+
+
+def _hook_below_hard_threshold(clip: dict) -> bool:
+    score = _hook_score(clip)
+    if score <= 0:
+        title = str(clip.get("hook_title", ""))
+        score, _ = assess_hook_quality(title)
+        clip["hook_quality_score"] = score
+    return score < FINALIZER_HARD_HOOK_THRESHOLD
+
+
+def _has_metadata_grounding_warning(clip: dict) -> bool:
+    if clip.get("boundary_warning") or clip.get("ungrounded_metadata"):
+        return True
+    for w in clip.get("warnings") or []:
+        w_l = str(w).lower()
+        if "metadata" in w_l or "ground" in w_l or "transcript" in w_l:
+            return True
+    return False
+
+
+def _production_hard_reject_conditions(
+    clip: dict,
+    segments: list[dict] | None,
+) -> list[str]:
+    """Compound production failures; any one triggers hard rejection (after always-broken checks)."""
+    conditions: list[str] = []
+    if clip_has_dangling_ending(clip, segments) and _hook_below_hard_threshold(clip):
+        conditions.append("dangling ending with hook below 55")
+    if _host_question_only_without_guest(clip, segments):
+        conditions.append("host-question-only start without guest answer within 15s")
+    dur = _clip_duration(clip)
+    if dur < FINALIZER_NORMAL_MIN_DURATION and _hook_below_hard_threshold(clip):
+        conditions.append("duration under 20 seconds with hook below 55")
+    if _clip_has_empty_transcript(clip, segments):
+        conditions.append("empty transcript window")
+    return conditions
+
+
+def _always_hard_reject_reasons(clip: dict, segments: list[dict] | None) -> list[str]:
+    reasons: list[str] = []
+    if _clip_has_invalid_timestamps(clip):
+        reasons.append("invalid timestamps")
+    dur = _clip_duration(clip)
+    if dur < FINALIZER_HARD_BROKEN_MAX_DURATION:
+        reasons.append("duration under 10 seconds")
+    if _clip_has_empty_transcript(clip, segments):
+        reasons.append("empty transcript window")
+    return reasons
+
+
+def _collect_soft_warnings(clip: dict, segments: list[dict] | None) -> list[str]:
+    warnings: list[str] = []
+    hook = _hook_score(clip)
+    dur = _clip_duration(clip)
+
+    if hook and hook < FINALIZER_SOFT_HOOK_THRESHOLD:
+        warnings.append("Hook quality below ideal threshold")
+
+    if FINALIZER_NORMAL_MIN_DURATION <= dur < FINALIZER_SOFT_SHORT_MAX_DURATION:
+        if not (
+            clip_has_dangling_ending(clip, segments)
+            and _hook_below_hard_threshold(clip)
+        ):
+            warnings.append("Short clip between 20–25 seconds")
+
+    if clip_has_dangling_ending(clip, segments) and not _hook_below_hard_threshold(clip):
+        warnings.append("Possible dangling ending")
+
+    if clip_starts_with_host_question(clip, segments):
+        if not _host_question_only_without_guest(clip, segments):
+            warnings.append("Host-question-heavy opening")
+
+    if _has_metadata_grounding_warning(clip):
+        warnings.append("Metadata may not match final clip window")
+
+    if clip_starts_with_filler(clip, segments):
+        warnings.append("Clip may start mid-thought or with filler")
+
+    return list(dict.fromkeys(warnings))
 
 
 def _window_text(clip: dict, segments: list[dict] | None) -> str:
@@ -541,28 +721,48 @@ def merge_adjacent_story_fragments(
 # ---------------------------------------------------------------------------
 
 
-def _watchability_score(clip: dict, segments: list[dict] | None) -> int:
+def _watchability_score(
+    clip: dict,
+    segments: list[dict] | None,
+    *,
+    soft_warnings: list[str] | None = None,
+) -> int:
     score = 70
     text = _window_text(clip, segments)
     dur = _clip_duration(clip)
 
-    if clip_has_incomplete_ending(clip, segments):
-        score -= 25
-    if clip_has_incomplete_beginning(clip, segments):
-        score -= 20
-    if clip_starts_with_host_question(clip, segments):
-        score -= 15
-    if clip_starts_with_filler(clip, segments):
+    if clip_has_dangling_ending(clip, segments):
+        score -= 12
+    elif clip_has_incomplete_ending(clip, segments):
         score -= 8
-    if dur < min(25.0, float(clip.get("_min_duration", 25))):
+    if clip_has_incomplete_beginning(clip, segments):
         score -= 10
+    if clip_starts_with_host_question(clip, segments):
+        score -= 8
+    if clip_starts_with_filler(clip, segments):
+        score -= 5
+    if dur < FINALIZER_NORMAL_MIN_DURATION:
+        score -= 15
+    elif dur < FINALIZER_SOFT_SHORT_MAX_DURATION:
+        score -= 6
     if SENTENCE_END_RE.search(text) and not starts_mid_sentence(text):
         score += 8
     if any(k in text.lower() for k in EMOTION_KEYWORDS):
         score += 6
-    hook_q = int(clip.get("hook_quality_score", 0))
+    hook_q = _hook_score(clip)
     if hook_q:
         score = int(round((score + hook_q) / 2))
+    for warn in soft_warnings or []:
+        if "Hook quality" in warn:
+            score -= 6
+        elif "Short clip" in warn:
+            score -= 4
+        elif "dangling" in warn.lower():
+            score -= 8
+        elif "Host-question" in warn:
+            score -= 5
+        elif "Metadata" in warn:
+            score -= 4
     return max(0, min(100, score))
 
 
@@ -628,59 +828,89 @@ def _declarative_title_from_window(window: str) -> str:
     return "A Story Worth Hearing"
 
 
+def _apply_warning_counts(report: FinalizerReport | None, warnings: list[str]) -> None:
+    if report is None or not warnings:
+        return
+    for warn in warnings:
+        w = warn.lower()
+        if "hook quality" in w:
+            report.low_hook_warning += 1
+        elif "short clip" in w:
+            report.short_duration_warning += 1
+        elif "dangling" in w:
+            report.dangling_ending_warning += 1
+        elif "host-question" in w:
+            report.host_question_warning += 1
+        elif "metadata" in w:
+            report.metadata_grounding_warning += 1
+
+
 def reject_unwatchable_clips(
     clips: list[dict],
     min_duration: float,
     *,
     segments: list[dict] | None = None,
-    min_hook_quality: float = 70.0,
+    min_hook_quality: float = FINALIZER_SOFT_HOOK_THRESHOLD,
     log: logging.Logger | None = None,
+    report: FinalizerReport | None = None,
 ) -> tuple[list[dict], list[tuple[int, str]]]:
+    """
+    Keep clips unless genuinely broken or a compound production failure applies.
+    Single-issue problems become soft warnings on the clip.
+    """
     log = log or logger
     kept: list[dict] = []
     rejected: list[tuple[int, str]] = []
+    _ = min_duration  # expansion uses caller min; rejection uses FINALIZER_* constants
+    _ = min_hook_quality  # retained for API compatibility; hard threshold is 55
 
     for idx, clip in enumerate(clips):
-        reasons: list[str] = []
-        if clip_has_incomplete_ending(clip, segments):
-            reasons.append("incomplete ending")
-        if clip_has_incomplete_beginning(clip, segments):
-            reasons.append("incomplete beginning")
-        if clip_starts_with_host_question(clip, segments) and _clip_duration(clip) < 45:
-            reasons.append("host-question-only start")
-        if clip_has_low_payoff(clip, segments):
-            reasons.append("low payoff")
-        if _clip_duration(clip) < min_duration and not any(
-            k in _window_text(clip, segments).lower() for k in EMOTION_KEYWORDS
-        ):
-            reasons.append("too short without standalone moment")
+        c = dict(clip)
+        hard_reasons = _always_hard_reject_reasons(c, segments)
+        if not hard_reasons:
+            production = _production_hard_reject_conditions(c, segments)
+            if production:
+                hard_reasons = production
 
-        watch = _watchability_score(clip, segments)
-        clip["watchability_score"] = watch
-        hook_score = int(clip.get("hook_quality_score", 0))
-        virality = int(clip.get("virality_score", clip.get("composite_score", 0)))
-        strong_moment = virality >= 75 and watch >= 55
-        if hook_score and hook_score < min_hook_quality and not strong_moment:
-            reasons.append(f"hook quality {hook_score}<{min_hook_quality:.0f}")
-        elif hook_title_is_incomplete(str(clip.get("hook_title", ""))) and not strong_moment:
-            reasons.append("incomplete hook title")
-        if watch < 45 and reasons:
-            reasons.append("low watchability")
-
-        if reasons:
-            rejected.append((idx, "; ".join(reasons)))
+        if hard_reasons:
+            reason = "; ".join(hard_reasons)
+            rejected.append((idx, reason))
+            if report:
+                report.hard_rejections += 1
             log.info(
                 '[CLIP FINALIZER] rejected clip=%d reason="%s"',
                 idx,
-                reasons[0],
+                hard_reasons[0],
             )
             continue
 
-        clip["finalizer_checked"] = True
-        clip.setdefault("finalizer_action", "kept")
-        clip.setdefault("finalizer_reason", "watchable story moment")
-        kept.append(clip)
-        log.info('[CLIP FINALIZER] kept clip=%d reason="watchable story moment"', idx)
+        soft = _collect_soft_warnings(c, segments)
+        watch = _watchability_score(c, segments, soft_warnings=soft)
+        c["watchability_score"] = watch
+        if soft:
+            c["finalizer_warnings"] = soft
+            c.setdefault("warnings", [])
+            for w in soft:
+                entry = f"Finalizer: {w}"
+                if entry not in c["warnings"]:
+                    c["warnings"].append(entry)
+            if report:
+                report.soft_warnings += 1
+                _apply_warning_counts(report, soft)
+            c["finalizer_action"] = "kept_with_warnings"
+            c["finalizer_reason"] = soft[0]
+            log.info(
+                '[CLIP FINALIZER] kept clip=%d with warnings: %s',
+                idx,
+                "; ".join(soft[:2]),
+            )
+        else:
+            c["finalizer_action"] = "kept"
+            c["finalizer_reason"] = "watchable story moment"
+            log.info('[CLIP FINALIZER] kept clip=%d reason="watchable story moment"', idx)
+
+        c["finalizer_checked"] = True
+        kept.append(c)
 
     return kept, rejected
 
@@ -694,7 +924,7 @@ def _finalize_clips_core(
     clips: list[dict],
     transcript_segments: list[dict] | None = None,
     transcript_text: str | None = None,
-    min_duration: float = 25.0,
+    min_duration: float = 20.0,
     max_duration: float = 90.0,
     merge_gap_seconds: float = 20.0,
     log: logging.Logger | None = None,
@@ -785,17 +1015,21 @@ def _finalize_clips_core(
             min_duration,
             segments=transcript_segments,
             log=log,
+            report=report,
         )
         report.rejected = len(rejected)
+        report.hard_rejections = len(rejected)
         report.rejected_indices = rejected
         report.kept = len(kept)
 
         log.info(
-            "[CLIP FINALIZER] checked clips=%d expanded=%d merged=%d rejected=%d hooks_repaired=%d kept=%d",
+            "[CLIP FINALIZER] checked clips=%d expanded=%d merged=%d "
+            "hard_rejected=%d soft_warnings=%d hooks_repaired=%d kept=%d",
             report.checked,
             report.expanded,
             report.merged,
-            report.rejected,
+            report.hard_rejections,
+            report.soft_warnings,
             report.hooks_repaired,
             report.kept,
         )
@@ -811,7 +1045,7 @@ def finalize_clips_for_ui(
     clips: list[dict],
     transcript_segments: list[dict] | None = None,
     transcript_text: str | None = None,
-    min_duration: float = 25.0,
+    min_duration: float = 20.0,
     max_duration: float = 90.0,
     merge_gap_seconds: float = 20.0,
     logger: logging.Logger | None = None,
@@ -882,7 +1116,7 @@ def ensure_clips_finalized(
     clips: list[dict],
     transcript_segments: list[dict] | None = None,
     *,
-    min_duration: float = 25.0,
+    min_duration: float = 20.0,
     max_duration: float = 90.0,
     merge_gap_seconds: float = 20.0,
     logger: logging.Logger | None = None,
@@ -909,6 +1143,7 @@ __all__ = [
     "clip_starts_with_host_question",
     "clip_has_incomplete_beginning",
     "clip_has_incomplete_ending",
+    "clip_has_dangling_ending",
     "clip_has_low_payoff",
     "clips_are_same_story_beat",
     "expand_clip_to_sentence_or_thought_boundary",
