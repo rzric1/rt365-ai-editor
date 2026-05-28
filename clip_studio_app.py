@@ -45,7 +45,10 @@ from clip_engine.telemetry import (  # noqa: E402
 from clip_engine.clip_analysis import get_session_tokens  # noqa: E402
 from clip_engine.clip_pipeline import run_full_clip_pipeline, PipelineOpenAIConfig  # noqa: E402
 from clip_engine.openai_resilience import OpenAIRateLimitError, token_saver_pass_config
-from clip_engine.effective_config import plan_analysis_token_estimate  # noqa: E402
+from clip_engine.effective_config import (  # noqa: E402
+    get_cached_token_plan,
+    plan_analysis_token_estimate,
+)
 from clip_engine.analysis_cache import clear_all_analysis_cache, hash_transcript  # noqa: E402
 from clip_engine.ai_profiles import (  # noqa: E402
     PROFILE_LABELS,
@@ -58,6 +61,7 @@ from clip_engine.effective_config import (  # noqa: E402
     SESSION_ANALYSIS_DIAGNOSTICS,
     SESSION_CLIP_EDITS,
     SESSION_FORCE_REANALYZE,
+    SESSION_RESOLVED_MODELS,
     apply_profile_non_widget_keys,
     apply_profile_widget_defaults,
     build_analysis_fingerprint,
@@ -136,6 +140,36 @@ CAPTION_PRESET_OPTIONS: list[CaptionPreset] = [
     "Viral", "Podcast Pro", "Documentary", "Gaming", "Cinematic",
 ]
 PREVIEW_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "previews"
+SESSION_DIAG_INIT = "cs_diagnostics_initialized"
+SESSION_DIAG_CACHE = "cs_ai_diag_cache"
+
+
+def _run_startup_diagnostics_once() -> None:
+    """Run hardware/ffmpeg diagnostics once per Streamlit session."""
+    if st.session_state.get(SESSION_DIAG_INIT):
+        logger.debug("diagnostics already initialized — skipping duplicate diagnostics")
+        return
+    ensure_ffmpeg_on_path(log=True)
+    log_nvenc_probe_command_explicit()
+    log_ai_acceleration_startup()
+    st.session_state[SESSION_DIAG_INIT] = True
+    logger.info("diagnostics initialized for session")
+
+
+def _get_ai_diagnostics(*, refresh: bool = False):
+    """Cached AI acceleration diagnostics (refreshed only on explicit user action)."""
+    if refresh:
+        invalidate_cuda_runtime_probe_cache()
+        from clip_engine.ffmpeg_gpu import invalidate_nvenc_cache
+
+        invalidate_nvenc_cache()
+        st.session_state.pop(SESSION_DIAG_CACHE, None)
+    cached = st.session_state.get(SESSION_DIAG_CACHE)
+    if cached is not None and not refresh:
+        return cached
+    diag = collect_ai_acceleration_diagnostics(refresh_cuda_probe=refresh)
+    st.session_state[SESSION_DIAG_CACHE] = diag
+    return diag
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +402,7 @@ def _run_clip_analysis(
         get_ai_profile(effective.profile_name),
         target_count=target_count,
         clip_style=style_name,
+        emit_logs=True,
     )
     st.session_state.cs_token_estimate = est.to_dict()
 
@@ -582,11 +617,9 @@ def main() -> None:
     try:
         ensure_directories()
         configure_rotating_logs(LOGS_DIR)
-        ensure_ffmpeg_on_path(log=True)
-        log_nvenc_probe_command_explicit()
-        log_ai_acceleration_startup()
         _init_state()
         _flush_pending_long_defaults()
+        _run_startup_diagnostics_once()
         log_widget_rerun_noop(st.session_state)
         ensure_ffmpeg_on_path(log=False)
 
@@ -601,7 +634,7 @@ def main() -> None:
         ffmpeg_ver = get_ffmpeg_version_line()
         gpu_status = get_gpu_acceleration_status()
         cuda_whisper = faster_whisper_cuda_available()
-        ai_diag = collect_ai_acceleration_diagnostics()
+        ai_diag = _get_ai_diagnostics()
 
         # ------------------------------------------------------------------ SIDEBAR
         with st.sidebar:
@@ -705,9 +738,7 @@ def main() -> None:
 
             with st.expander("AI acceleration diagnostics", expanded=False):
                 if st.button("Refresh CUDA / NVENC probes", width="stretch", key="cs_ai_diag_refresh"):
-                    invalidate_cuda_runtime_probe_cache()
-                    from clip_engine.ffmpeg_gpu import invalidate_nvenc_cache
-                    invalidate_nvenc_cache()
+                    _get_ai_diagnostics(refresh=True)
                     st.rerun()
                 st.markdown(ai_diag.to_detail_markdown())
                 with st.expander("CUDA reference"):
@@ -828,7 +859,7 @@ def main() -> None:
                 if not explorer:
                     st.caption("Run **Analyze for high-retention clips** with GPU prefilter enabled to populate.")
                 else:
-                    st.dataframe(explorer, use_container_width=True, hide_index=True)
+                    st.dataframe(explorer, width="stretch", hide_index=True)
 
             st.divider()
             st.subheader("OpenAI usage & safety")
@@ -1101,11 +1132,13 @@ def main() -> None:
                 )
             if api_key and st.session_state.cs_formatted:
                 _prof = profile_from_ui_label(st.session_state.get("cs_ai_profile_label", ""))
-                _plan = plan_analysis_token_estimate(
+                _plan = get_cached_token_plan(
+                    st.session_state,
                     st.session_state.cs_formatted,
                     _prof,
                     target_count=int(st.session_state.get("cs_target_clips", 20)),
                     clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
+                    emit_logs=False,
                 )
                 _budget = _prof.max_tokens
                 _pruned = _plan.after_prune
@@ -1266,15 +1299,6 @@ def main() -> None:
                             )
                             st.session_state.cs_openai_status = ""
                             st.rerun()
-                        if st.session_state.cs_formatted:
-                            _prof_run = profile_from_ui_label(st.session_state.get("cs_ai_profile_label", ""))
-                            pre_est = plan_analysis_token_estimate(
-                                st.session_state.cs_formatted,
-                                _prof_run,
-                                target_count=int(st.session_state.get("cs_target_clips", 20)),
-                                clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
-                            )
-                            st.session_state.cs_token_estimate = pre_est.to_dict()
                         clips, pipe_stats = _run_clip_analysis(**params, status_callback=_status_cb)
                         pipe_stats = pipe_stats or {}
                         st.session_state.cs_clips = clips or []
@@ -1284,14 +1308,18 @@ def main() -> None:
                         else:
                             st.session_state.cs_status = f"Suggested {len(clips)} clips."
                         st.session_state.cs_openai_status = ""
+                        logger.info(
+                            "[lifecycle] Clip analysis finished — %d clips; app remains active",
+                            len(clips or []),
+                        )
                         # Release GPU memory after heavy analysis to prevent post-analysis crash
                         try:
                             import torch
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
                                 logger.info("[cuda] empty_cache() called after clip analysis")
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("CUDA cache release skipped: %s", exc)
                     except OpenAIRateLimitError as e:
                         logger.exception("Clip analysis rate limited")
                         st.error(
@@ -1794,6 +1822,11 @@ def main() -> None:
                             final_clip_count=exported,
                         )
 
+                        logger.info(
+                            "[lifecycle] Export batch finished — exported=%d failed=%d; app remains active",
+                            exported,
+                            failed,
+                        )
                         if exported:
                             st.success(f"Exported **{exported}** clip(s) to `{session.relative_to(PROJECT_ROOT)}`")
                         if failed:
@@ -1817,6 +1850,8 @@ def main() -> None:
         st.error(f"**Clip Studio error:** {e}")
         with st.expander("Technical details", expanded=True):
             st.code(traceback.format_exc())
+    finally:
+        logger.debug("[lifecycle] Streamlit render cycle complete")
 
 
 if __name__ == "__main__":

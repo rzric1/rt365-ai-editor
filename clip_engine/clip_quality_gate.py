@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from clip_engine.clip_boundaries import ends_with_dangling_word
+from clip_engine.clip_boundaries import ends_with_dangling_word, hook_title_is_incomplete
 from clip_engine.clip_scoring import assess_hook_quality, repair_hook_title_local
 from clip_engine.transcription_utils import extract_transcript_window
 
@@ -69,10 +69,15 @@ def _repair_clip_once(
         c["hook_title"] = repair_hook_title_local("", window)
         c.setdefault("warnings", []).append("Generated title from transcript.")
         c["quality_repaired"] = True
-    elif ends_with_dangling_word(title):
-        c["hook_title"] = repair_hook_title_local(title, extract_transcript_window(segments, t0, t1))
-        c.setdefault("warnings", []).append("Repaired dangling hook title.")
-        c["quality_repaired"] = True
+    elif hook_title_is_incomplete(title) or ends_with_dangling_word(title):
+        window = extract_transcript_window(segments, t0, t1)
+        repaired_title = repair_hook_title_local(title, window)
+        if repaired_title != title:
+            c["hook_title_before_repair"] = title
+            c["hook_title"] = repaired_title
+            c["hook_title_repaired"] = True
+            c.setdefault("warnings", []).append("Repaired incomplete hook title.")
+            c["quality_repaired"] = True
 
     hook_score, hook_warn = assess_hook_quality(str(c.get("hook_title", "")))
     c["hook_quality_score"] = hook_score

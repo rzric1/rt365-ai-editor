@@ -171,7 +171,7 @@ from clip_engine.clip_expand import ClipExpansionSettings, finalize_clips_after_
 from clip_engine.clip_metadata import ground_all_clips_metadata
 from clip_engine.clip_split import split_long_clips
 from clip_engine.clip_boundaries import apply_boundary_repairs
-from clip_engine.clip_scoring import apply_virality_to_clips
+from clip_engine.clip_scoring import apply_virality_to_clips, ensure_all_clip_hooks
 from clip_engine.clip_quality_gate import run_quality_gate
 from clip_engine.clip_style import ClipStyle, get_clip_style_profile
 from clip_engine.ai_profiles import get_ai_profile
@@ -417,14 +417,19 @@ def run_full_clip_pipeline(
         if cached:
             tracker.record_cache_hit(cached.get("token_usage", {}).get("total_tokens", stats.estimated_tokens))
             stats.cache_hit = True
-            stats.final_clips = len(cached.get("clips", []))
+            cached_clips = list(cached.get("clips", []))
+            if cached_clips and segments:
+                cached_clips, cached_hook_fixes = ensure_all_clip_hooks(cached_clips, segments)
+                stats.title_repairs = int(cached.get("stats", {}).get("title_repairs", 0)) + cached_hook_fixes
+            stats.final_clips = len(cached_clips)
             cached_stats = cached.get("stats") or {}
             stats.boundary_repairs = int(cached_stats.get("boundary_repairs", 0))
-            stats.title_repairs = int(cached_stats.get("title_repairs", 0))
+            if not stats.title_repairs:
+                stats.title_repairs = int(cached_stats.get("title_repairs", 0))
             stats.openai_calls_used = 0
             stats.warnings.append("Loaded cached analysis — no OpenAI tokens used.")
-            logger.info("[CACHE] hit — skipping OpenAI pipeline")
-            return cached["clips"], stats, tracker
+            logger.info("[CACHE] hit — skipping OpenAI pipeline (cache reuse)")
+            return cached_clips, stats, tracker
         stats.cache_miss_reason = "no_cached_entry_or_version"
         logger.info("[CACHE] miss — running full pipeline")
 
@@ -915,6 +920,10 @@ def run_full_clip_pipeline(
         selected = _assign_clip_ids(selected)
         selected, stats.removed_weak_hook = filter_minimum_hook_score(selected)
 
+        with pipeline_phase("final_hook_repair"):
+            selected, final_hook_repairs = ensure_all_clip_hooks(selected, segments)
+            stats.title_repairs += final_hook_repairs
+
         stats.final_clips = len(selected)
         export_usage = tracker.to_export_dict(
             target_clips=target_count,
@@ -955,13 +964,14 @@ def run_full_clip_pipeline(
                 analysis_fingerprint=cache_key,
             )
 
-        token_plan = plan_analysis_token_estimate(
-            formatted,
-            ai_prof,
-            target_count=target_count,
-            clip_style=style_name,
+        stats.estimated_tokens = int(
+            stats.estimated_tokens or token_estimate.estimated_total_tokens
         )
-        stats.estimated_tokens = token_plan.after_prune
+        logger.info(
+            "[PIPELINE] Analysis complete — %d final clips, cache_hit=%s",
+            stats.final_clips,
+            stats.cache_hit,
+        )
 
         return selected, stats, tracker
 

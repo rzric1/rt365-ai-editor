@@ -372,6 +372,35 @@ def apply_virality_to_clip(
     return c
 
 
+def ensure_all_clip_hooks(
+    clips: list[dict],
+    segments: list[dict],
+) -> tuple[list[dict], int]:
+    """
+    Final pass before UI/export: guarantee hooks are complete declarative titles.
+    """
+    out: list[dict] = []
+    repairs = 0
+    for clip in clips:
+        c = dict(clip)
+        title = str(c.get("hook_title", "")).strip()
+        if not hook_title_is_incomplete(title):
+            out.append(c)
+            continue
+        t0 = float(c.get("start_seconds", c.get("start", 0)))
+        t1 = float(c.get("end_seconds", c.get("end", t0)))
+        window = extract_transcript_window(segments, t0, t1)
+        repaired = repair_hook_title_local(title, window)
+        if repaired != title:
+            c["hook_title_before_repair"] = title
+            c["hook_title"] = repaired
+            c["hook_title_repaired"] = True
+            c.setdefault("warnings", []).append("Final hook title repair applied.")
+            repairs += 1
+        out.append(c)
+    return out, repairs
+
+
 def apply_virality_to_clips(
     clips: list[dict],
     segments: list[dict],
@@ -409,6 +438,7 @@ __all__ = [
     "TITLE_STYLES",
     "apply_virality_to_clip",
     "apply_virality_to_clips",
+    "ensure_all_clip_hooks",
     "assess_hook_quality",
     "compute_virality_score",
     "repair_hook_title_local",
