@@ -299,6 +299,8 @@ def run_full_clip_pipeline(
     """
     tracker = reset_tracker(video_filename=video_filename)
     reset_session_telemetry()
+    if media_duration is None or media_duration <= 0:
+        media_duration = 300.0
     stats = PipelineStats(target_clips=target_count, discovery_mode=discovery_mode)
     oai = openai_config or PipelineOpenAIConfig()
     pool_stats = empty_pool_stats()

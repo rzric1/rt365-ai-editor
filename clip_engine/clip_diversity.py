@@ -45,10 +45,16 @@ class TimelineRegion(NamedTuple):
     end: float     # seconds
 
 
+def _safe_media_duration(media_duration: float | None) -> float:
+    """Normalize duration for gap/region math (None/zero -> 5 min default)."""
+    if media_duration is None or media_duration <= 0:
+        return 300.0
+    return float(media_duration)
+
+
 def build_timeline_regions(media_duration: float, n_regions: int = 5) -> list[TimelineRegion]:
     """Divide media duration into N equal regions."""
-    if media_duration <= 0:
-        media_duration = 3600.0  # fallback 1hr
+    media_duration = _safe_media_duration(media_duration)
     chunk = media_duration / n_regions
     names = REGION_NAMES if n_regions == 5 else [f"region_{i+1}" for i in range(n_regions)]
     return [
@@ -521,11 +527,12 @@ def run_diversity_pipeline(
     60-second no-go zones on short clips and keeps them sane on very long ones.
     """
     stats = DiversityPipelineStats(input_count=len(clips))
+    media_duration = _safe_media_duration(media_duration)
 
     # Relative gap: 0.5% of media duration, clamped to [10s, min_gap_seconds].
     # Never exceeds the caller-requested min_gap_seconds so the pipeline
     # argument still acts as a ceiling — just not an artificially large floor.
-    relative_gap = max(10.0, media_duration * 0.005) if media_duration > 0 else min_gap_seconds
+    relative_gap = max(10.0, media_duration * 0.005)
     effective_gap = min(min_gap_seconds, relative_gap)
 
     logger.info(
