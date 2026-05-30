@@ -11,9 +11,12 @@ Optional: faster-whisper + CUDA for local GPU transcription when "GPU accelerati
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import traceback
 import uuid
 from datetime import datetime
@@ -45,8 +48,11 @@ from clip_engine.telemetry import (  # noqa: E402
 from clip_engine.clip_analysis import get_session_tokens  # noqa: E402
 from clip_engine.clip_pipeline import run_full_clip_pipeline, PipelineOpenAIConfig  # noqa: E402
 from clip_engine.openai_resilience import OpenAIRateLimitError, token_saver_pass_config
-from clip_engine.effective_config import plan_analysis_token_estimate  # noqa: E402
-from clip_engine.analysis_cache import clear_all_analysis_cache  # noqa: E402
+from clip_engine.effective_config import (  # noqa: E402
+    get_cached_token_plan,
+    plan_analysis_token_estimate,
+)
+from clip_engine.analysis_cache import clear_all_analysis_cache, hash_transcript  # noqa: E402
 from clip_engine.ai_profiles import (  # noqa: E402
     PROFILE_LABELS,
     get_ai_profile,
@@ -55,16 +61,29 @@ from clip_engine.ai_profiles import (  # noqa: E402
 )
 from clip_engine.effective_config import (  # noqa: E402
     ClipStudioEffectiveConfig,
+    SESSION_ANALYSIS_DIAGNOSTICS,
+    SESSION_CLIP_EDITS,
+    SESSION_FORCE_REANALYZE,
+    SESSION_RESOLVED_MODELS,
     apply_profile_non_widget_keys,
     apply_profile_widget_defaults,
-    resolve_models_from_effective_config,
+    build_analysis_fingerprint,
+    get_invalidation_reason,
+    log_widget_rerun_noop,
+    resolve_models_for_session,
+    store_analysis_snapshot,
+)
+from clip_engine.clip_scoring import (  # noqa: E402
+    CLIP_STRATEGIES,
+    PLATFORM_TARGETS,
+    TITLE_STYLES,
 )
 try:
     from clip_engine.gpu_pipeline import get_rtx_pipeline_status  # noqa: E402
 except Exception as _gpu_pipeline_import_err:
     import logging as _logging
     _logging.getLogger("clip_studio").warning(
-        "gpu_pipeline import failed (%s) — RTX status panel will show defaults.",
+        "gpu_pipeline import failed (%s) â€” RTX status panel will show defaults.",
         _gpu_pipeline_import_err,
     )
     def get_rtx_pipeline_status():  # type: ignore[misc]
@@ -76,6 +95,7 @@ from clip_engine.clip_metadata import (  # noqa: E402
     write_clip_audit_json,
 )
 from clip_engine.token_tracking import get_tracker  # noqa: E402
+from clip_engine.resolve_export import build_edl  # noqa: E402
 from clip_engine.export_vertical import (  # noqa: E402
     EXPORT_MODE_LABELS,
     export_clip_preview,
@@ -124,6 +144,36 @@ CAPTION_PRESET_OPTIONS: list[CaptionPreset] = [
     "Viral", "Podcast Pro", "Documentary", "Gaming", "Cinematic",
 ]
 PREVIEW_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "previews"
+SESSION_DIAG_INIT = "cs_diagnostics_initialized"
+SESSION_DIAG_CACHE = "cs_ai_diag_cache"
+
+
+def _run_startup_diagnostics_once() -> None:
+    """Run hardware/ffmpeg diagnostics once per Streamlit session."""
+    if st.session_state.get(SESSION_DIAG_INIT):
+        logger.info("[DIAGNOSTICS] already initialized; skipping duplicate diagnostics")
+        return
+    ensure_ffmpeg_on_path(log=True)
+    log_nvenc_probe_command_explicit()
+    log_ai_acceleration_startup()
+    st.session_state[SESSION_DIAG_INIT] = True
+    logger.info("diagnostics initialized for session")
+
+
+def _get_ai_diagnostics(*, refresh: bool = False):
+    """Cached AI acceleration diagnostics (refreshed only on explicit user action)."""
+    if refresh:
+        invalidate_cuda_runtime_probe_cache()
+        from clip_engine.ffmpeg_gpu import invalidate_nvenc_cache
+
+        invalidate_nvenc_cache()
+        st.session_state.pop(SESSION_DIAG_CACHE, None)
+    cached = st.session_state.get(SESSION_DIAG_CACHE)
+    if cached is not None and not refresh:
+        return cached
+    diag = collect_ai_acceleration_diagnostics(refresh_cuda_probe=refresh)
+    st.session_state[SESSION_DIAG_CACHE] = diag
+    return diag
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +223,11 @@ def _init_state() -> None:
         "cs_session_telemetry": {},
         "cs_diarization_turns": [],
         "cs_speaker_names": {},
+        "cs_clip_strategy": "Balanced",
+        "cs_platform_target": "TikTok/Reels/Shorts",
+        "cs_title_style": "Curiosity",
+        SESSION_CLIP_EDITS: {},
+        SESSION_ANALYSIS_DIAGNOSTICS: {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -216,7 +271,7 @@ def _flush_pending_long_defaults() -> None:
         return
     st.session_state.cs_discovery_mode = True
     st.session_state.cs_min_clip_seconds = 15
-    st.session_state.cs_max_clip_seconds = 90
+    st.session_state.cs_max_clip_seconds = 120
     st.session_state.cs_min_gap_seconds = 35
     st.session_state.cs_similarity_threshold = 85
     apply_profile_non_widget_keys(
@@ -293,6 +348,27 @@ def _expand_export_selection(clips: list, selected: list[dict]) -> list[dict]:
     return out
 
 
+def _clips_for_resolve_payload(clips: list) -> list[dict]:
+    """Map UI-edited clip times to start_time/end_time for Resolve bridge + EDL."""
+    out: list[dict] = []
+    for idx, c in enumerate(clips):
+        wid = c.get("_wid", str(idx))
+        t0 = float(st.session_state.get(f"start_{wid}", c.get("start_seconds", c.get("start", 0))))
+        t1 = float(st.session_state.get(f"end_{wid}", c.get("end_seconds", c.get("end", 0))))
+        hook = str(
+            st.session_state.get(
+                f"hook_widget_{wid}",
+                st.session_state.get(f"hook_{wid}", c.get("hook_title", f"clip_{idx + 1}")),
+            )
+        ).strip()
+        clip = dict(c)
+        clip["start_time"] = t0
+        clip["end_time"] = t1
+        clip["hook_title"] = hook
+        out.append(clip)
+    return out
+
+
 def _assign_speakers_to_segments(
     segments: list[dict],
     turns: list[dict],
@@ -343,7 +419,7 @@ def _run_clip_analysis(
     reset_session_telemetry()
 
     effective = ClipStudioEffectiveConfig.from_session(st.session_state)
-    models = resolve_models_from_effective_config(effective)
+    models = resolve_models_for_session(st.session_state)
     token_saver = effective.token_saver
     style_name = str(clip_style)
     est = plan_analysis_token_estimate(
@@ -351,6 +427,7 @@ def _run_clip_analysis(
         get_ai_profile(effective.profile_name),
         target_count=target_count,
         clip_style=style_name,
+        emit_logs=True,
     )
     st.session_state.cs_token_estimate = est.to_dict()
 
@@ -393,8 +470,44 @@ def _run_clip_analysis(
         enable_speaker_signals=bool(st.session_state.get("cs_enable_signal_boosts", True)),
         openai_config=openai_config,
         discovery_mode=effective.discovery_mode,
+        clip_strategy=effective.clip_strategy,
+        platform_target=effective.platform_target,
+        title_style=effective.title_style,
     )
     pipe_stats = stats.to_dict() if hasattr(stats, "to_dict") else {}
+
+    video_id = video_filename or str(st.session_state.get("cs_video_path", ""))
+    t_hash = hash_transcript(formatted, segments)
+    fp = build_analysis_fingerprint(
+        st.session_state,
+        video_identity=video_id,
+        transcript_hash=t_hash,
+    )
+    diag = {
+        "cache_hit": bool(pipe_stats.get("cache_hit")),
+        "cache_miss_reason": pipe_stats.get("cache_miss_reason", ""),
+        "invalidation_reason": st.session_state.pop(SESSION_FORCE_REANALYZE, False) and "explicit_reanalyze" or None,
+        "model_fast": models.fast_model,
+        "model_quality": models.quality_model,
+        "json_fallback": models.json_fallback_model,
+        "json_telemetry": pipe_stats.get("json_telemetry") or get_json_telemetry(),
+        "transcript_duration": media_dur,
+        "raw_candidates": pipe_stats.get("raw_candidates", 0),
+        "rescued_candidates": pipe_stats.get("rescued_candidates", 0),
+        "final_clips": len(clips),
+        "boundary_repairs": pipe_stats.get("boundary_repairs", 0),
+        "title_repairs": pipe_stats.get("title_repairs", 0),
+        "openai_calls_used": pipe_stats.get("openai_calls_used", 0),
+        "analysis_fingerprint": fp,
+    }
+    store_analysis_snapshot(
+        st.session_state,
+        effective=effective,
+        fingerprint=fp,
+        video_identity=video_id,
+        transcript_hash=t_hash,
+        diagnostics=diag,
+    )
 
     export_dict = tracker.to_export_dict(
         target_clips=target_count,
@@ -469,6 +582,23 @@ def _render_score_breakdown(c: dict) -> None:
     scores = c.get("scores", {})
     signal_scores = c.get("signal_scores", {})
     speaker_signals = c.get("speaker_signals", {})
+    virality = int(c.get("virality_score", 0))
+    if virality:
+        st.metric("Virality", f"{virality}/100")
+        if c.get("virality_explanation"):
+            st.caption(c["virality_explanation"])
+        breakdown = c.get("virality_breakdown") or {}
+        if breakdown:
+            cols = st.columns(4)
+            for i, (k, v) in enumerate(breakdown.items()):
+                cols[i % 4].caption(f"{k.replace('_', ' ').title()}: **{v}**")
+    hook_q = int(c.get("hook_quality_score", 0))
+    if hook_q:
+        st.caption(f"Hook quality: **{hook_q}/100**" + (f" â€” {c['hook_warning']}" if c.get("hook_warning") else ""))
+    if c.get("boundary_status") == "repaired" or c.get("boundary_repaired"):
+        st.info("Boundary repaired to nearest complete sentence.")
+    elif c.get("boundary_warning"):
+        st.warning(c["boundary_warning"])
     with st.expander("Score breakdown", expanded=False):
         if scores:
             cols = st.columns(3)
@@ -478,7 +608,7 @@ def _render_score_breakdown(c: dict) -> None:
         composite = int(c.get("composite_score", 0))
         orig = c.get("original_composite_score")
         if orig and orig != composite:
-            st.caption(f"GPT score: {orig}/100 → boosted: {composite}/100")
+            st.caption(f"GPT score: {orig}/100 â†’ boosted: {composite}/100")
         st.progress(composite / 100, text=f"Composite: {composite}/100")
 
         if signal_scores:
@@ -512,11 +642,10 @@ def main() -> None:
     try:
         ensure_directories()
         configure_rotating_logs(LOGS_DIR)
-        ensure_ffmpeg_on_path(log=True)
-        log_nvenc_probe_command_explicit()
-        log_ai_acceleration_startup()
         _init_state()
         _flush_pending_long_defaults()
+        _run_startup_diagnostics_once()
+        log_widget_rerun_noop(st.session_state)
         ensure_ffmpeg_on_path(log=False)
 
         st.title("AI Clip Studio")
@@ -530,7 +659,7 @@ def main() -> None:
         ffmpeg_ver = get_ffmpeg_version_line()
         gpu_status = get_gpu_acceleration_status()
         cuda_whisper = faster_whisper_cuda_available()
-        ai_diag = collect_ai_acceleration_diagnostics()
+        ai_diag = _get_ai_diagnostics()
 
         # ------------------------------------------------------------------ SIDEBAR
         with st.sidebar:
@@ -573,7 +702,7 @@ def main() -> None:
             st.checkbox(
                 "Enable AI signal boosts",
                 key="cs_enable_signal_boosts",
-                help="Local heuristic scoring for emotion, pacing, hooks — no extra LLM calls.",
+                help="Local heuristic scoring for emotion, pacing, hooks â€” no extra LLM calls.",
             )
             st.checkbox(
                 "Enable advanced captions",
@@ -612,9 +741,9 @@ def main() -> None:
             with st.expander('Why "listed=True, probe=False"?', expanded=False):
                 st.markdown(
                     "- **listed** = ffmpeg advertises `h264_nvenc` in `-encoders`.\n"
-                    "- **probe** = a real NVENC encode at **640×360** succeeded (minimum frame size for many drivers).\n"
+                    "- **probe** = a real NVENC encode at **640Ã—360** succeeded (minimum frame size for many drivers).\n"
                     "- A probe failure with *Frame Dimension less than the minimum* was a **test-size issue**, not a broken GPU encoder.\n"
-                    "- Other failures may mean GPU busy, old driver, or remote desktop — see **Last NVENC probe log** stderr tail.\n"
+                    "- Other failures may mean GPU busy, old driver, or remote desktop â€” see **Last NVENC probe log** stderr tail.\n"
                     "- Try **Force GPU export** or set `FORCE_NVENC_EXPORT=1` in `.env`."
                 )
             with st.expander("Last NVENC probe log", expanded=False):
@@ -634,9 +763,7 @@ def main() -> None:
 
             with st.expander("AI acceleration diagnostics", expanded=False):
                 if st.button("Refresh CUDA / NVENC probes", width="stretch", key="cs_ai_diag_refresh"):
-                    invalidate_cuda_runtime_probe_cache()
-                    from clip_engine.ffmpeg_gpu import invalidate_nvenc_cache
-                    invalidate_nvenc_cache()
+                    _get_ai_diagnostics(refresh=True)
                     st.rerun()
                 st.markdown(ai_diag.to_detail_markdown())
                 with st.expander("CUDA reference"):
@@ -652,7 +779,7 @@ def main() -> None:
             st.divider()
             st.subheader("Clip duration")
             st.number_input("Minimum clip length (core, s)", min_value=5, max_value=600, step=1, key="cs_min_clip_seconds")
-            st.number_input("Maximum clip length (cap, s)", min_value=10, max_value=600, step=1, key="cs_max_clip_seconds")
+            st.number_input("Maximum clip length (cap, s)", min_value=10, max_value=120, step=1, key="cs_max_clip_seconds")
             st.number_input("Context before clip (s)", min_value=0, max_value=120, step=1, key="cs_context_before")
             st.number_input("Context after clip (s)", min_value=0, max_value=120, step=1, key="cs_context_after")
             st.checkbox("Allow final clip to exceed max length", value=False, key="cs_allow_exceed_max")
@@ -685,7 +812,7 @@ def main() -> None:
                     f"`{int(_active_profile.context_after)}` s after"
                 )
                 st.markdown(
-                    f"**GPU shortlist:** `{_active_profile.target_gpu_shortlist_min}`–"
+                    f"**GPU shortlist:** `{_active_profile.target_gpu_shortlist_min}`â€“"
                     f"`{_active_profile.target_gpu_shortlist_max}` | "
                     f"**Max GPT regions:** `{_active_profile.max_active_gpt_regions}`"
                 )
@@ -697,7 +824,7 @@ def main() -> None:
 
             with st.expander("RTX 4090 AI Pipeline Status", expanded=False):
                 if st.button("Refresh GPU status", key="cs_rtx_refresh"):
-                    with st.spinner("Probing torch, embeddings, and CUDA…"):
+                    with st.spinner("Probing torch, embeddings, and CUDAâ€¦"):
                         try:
                             st.session_state.cs_rtx_status = get_rtx_pipeline_status()
                         except Exception as exc:
@@ -757,7 +884,7 @@ def main() -> None:
                 if not explorer:
                     st.caption("Run **Analyze for high-retention clips** with GPU prefilter enabled to populate.")
                 else:
-                    st.dataframe(explorer, use_container_width=True, hide_index=True)
+                    st.dataframe(explorer, width="stretch", hide_index=True)
 
             st.divider()
             st.subheader("OpenAI usage & safety")
@@ -794,7 +921,13 @@ def main() -> None:
                 st.caption(f"Rotating logs: `{LOGS_DIR}` (app.log, openai.log, gpu.log, exports.log)")
 
             if float(st.session_state.get("cs_media_duration") or 0) >= 30 * 60:
-                st.caption("Long video detected — SAFE profile + GPU prefilter recommended.")
+                st.caption("Long video detected â€” SAFE profile + GPU prefilter recommended.")
+            st.divider()
+            st.subheader("Creator controls (Opus-style+)")
+            st.selectbox("Clip strategy", list(CLIP_STRATEGIES), key="cs_clip_strategy")
+            st.selectbox("Platform target", list(PLATFORM_TARGETS), key="cs_platform_target")
+            st.selectbox("Title style", list(TITLE_STYLES), key="cs_title_style")
+
             st.divider()
             st.subheader("Diversity & coverage")
             st.selectbox(
@@ -856,6 +989,8 @@ def main() -> None:
                     else:
                         resolved = lp.resolve()
                         st.session_state.cs_video_path = resolved
+                        st.session_state["source_video_path"] = str(resolved)
+                        st.session_state[SESSION_FORCE_REANALYZE] = True
                         try:
                             st.session_state.cs_media_duration = get_media_duration_seconds(resolved)
                             _apply_long_podcast_defaults()
@@ -894,13 +1029,16 @@ def main() -> None:
                     try:
                         path, reused = save_upload_once(up, progress_bar=bar)
                         st.session_state.cs_video_path = path
+                        st.session_state["source_video_path"] = str(path)
                         st.session_state.cs_upload_reused = reused
                         if not reused:
                             st.session_state.cs_segments = []
                             st.session_state.cs_formatted = ""
                             st.session_state.cs_clips = []
+                            st.session_state["final_clips"] = []
                             st.session_state.cs_session_dir = None
                             st.session_state.cs_media_duration = 0.0
+                            st.session_state[SESSION_FORCE_REANALYZE] = True
                         try:
                             st.session_state.cs_media_duration = get_media_duration_seconds(path)
                             _apply_long_podcast_defaults()
@@ -985,6 +1123,8 @@ def main() -> None:
                             st.session_state.cs_segments
                         )
                         st.session_state.cs_clips = []
+                        st.session_state["final_clips"] = []
+                        st.session_state[SESSION_FORCE_REANALYZE] = True
                         try:
                             st.session_state.cs_media_duration = get_media_duration_seconds(
                                 Path(st.session_state.cs_video_path)
@@ -1021,11 +1161,13 @@ def main() -> None:
                 )
             if api_key and st.session_state.cs_formatted:
                 _prof = profile_from_ui_label(st.session_state.get("cs_ai_profile_label", ""))
-                _plan = plan_analysis_token_estimate(
+                _plan = get_cached_token_plan(
+                    st.session_state,
                     st.session_state.cs_formatted,
                     _prof,
                     target_count=int(st.session_state.get("cs_target_clips", 20)),
                     clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
+                    emit_logs=False,
                 )
                 _budget = _prof.max_tokens
                 _pruned = _plan.after_prune
@@ -1102,7 +1244,7 @@ def main() -> None:
                 st.session_state.cs_segments = _labeled_segs
                 st.session_state.cs_formatted = segments_to_prompt_transcript(_labeled_segs)
                 st.caption(
-                    "Speaker labels applied — re-run **Analyze** to include "
+                    "Speaker labels applied â€” re-run **Analyze** to include "
                     "`[Host]`/`[Guest]` context in the GPT prompt."
                 )
 
@@ -1124,7 +1266,7 @@ def main() -> None:
             height=68,
         )
 
-        col_analyze, col_rescore, col_more = st.columns([2, 1, 1])
+        col_analyze, col_reanalyze, col_rescore, col_more = st.columns([2, 1, 1, 1])
 
         def _get_analysis_params() -> dict:
             min_c = float(st.session_state.get("cs_min_clip_seconds", 25))
@@ -1168,40 +1310,67 @@ def main() -> None:
                     st.session_state.cs_openai_status = msg
                     status_slot.info(msg)
 
-                with st.spinner("Scoring clips (multi-pass — may take 30-120s on long podcasts)"):
+                with st.spinner("Scoring clips (multi-pass â€” may take 30-120s on long podcasts)"):
                     try:
                         params = _get_analysis_params()
-                        if st.session_state.cs_formatted:
-                            _prof_run = profile_from_ui_label(st.session_state.get("cs_ai_profile_label", ""))
-                            pre_est = plan_analysis_token_estimate(
-                                st.session_state.cs_formatted,
-                                _prof_run,
-                                target_count=int(st.session_state.get("cs_target_clips", 20)),
-                                clip_style=str(st.session_state.get("cs_clip_style", "Balanced")),
+                        vid = params.get("video_filename") or str(st.session_state.get("cs_video_path", ""))
+                        th = hash_transcript(params["formatted"], params["segments"])
+                        inv = get_invalidation_reason(
+                            st.session_state,
+                            video_identity=vid,
+                            transcript_hash=th,
+                        )
+                        if inv is None and st.session_state.get("cs_clips") and not st.session_state.get(SESSION_FORCE_REANALYZE):
+                            from clip_engine.clip_finalizer import ensure_clips_finalized
+
+                            segs = st.session_state.get("cs_segments") or []
+                            export_max = min(
+                                float(st.session_state.get("cs_max_clip_seconds", 120)),
+                                120.0,
                             )
-                            st.session_state.cs_token_estimate = pre_est.to_dict()
+                            finalized, _did_finalize = ensure_clips_finalized(
+                                list(st.session_state.cs_clips),
+                                segs,
+                                min_duration=float(st.session_state.get("cs_min_clip_seconds", 25)),
+                                max_duration=export_max,
+                            )
+                            if _did_finalize:
+                                st.session_state.cs_clips = finalized
+                                st.session_state["final_clips"] = finalized
+                            logger.info("[SESSION] no-op analysis rerun â€” clips still valid")
+                            st.session_state.cs_status = (
+                                f"Using existing {len(st.session_state.cs_clips)} clips "
+                                "(edit hooks/times freely â€” no new OpenAI calls)."
+                            )
+                            st.session_state.cs_openai_status = ""
+                            st.rerun()
                         clips, pipe_stats = _run_clip_analysis(**params, status_callback=_status_cb)
                         pipe_stats = pipe_stats or {}
                         st.session_state.cs_clips = clips or []
+                        st.session_state["final_clips"] = clips or []
                         st.session_state.cs_pipeline_stats = pipe_stats
                         if pipe_stats.get("cache_hit"):
-                            st.session_state.cs_status = "Loaded cached analysis — no OpenAI tokens used."
+                            st.session_state.cs_status = "Loaded cached analysis â€” no OpenAI tokens used."
                         else:
                             st.session_state.cs_status = f"Suggested {len(clips)} clips."
                         st.session_state.cs_openai_status = ""
+                        logger.info(
+                            "[lifecycle] Clip analysis finished â€” %d clips; app remains active",
+                            len(clips or []),
+                        )
                         # Release GPU memory after heavy analysis to prevent post-analysis crash
                         try:
                             import torch
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
                                 logger.info("[cuda] empty_cache() called after clip analysis")
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("CUDA cache release skipped: %s", exc)
                     except OpenAIRateLimitError as e:
                         logger.exception("Clip analysis rate limited")
                         st.error(
                             f"OpenAI rate limit at **{e.stage}** (model `{e.model}`). "
-                            f"{e.mitigation} Partial progress saved — click Analyze again to resume."
+                            f"{e.mitigation} Partial progress saved â€” click Analyze again to resume."
                         )
                     except Exception as e:
                         logger.exception("Clip analysis failed")
@@ -1211,14 +1380,22 @@ def main() -> None:
                 if not api_key:
                     st.info("Add **OPENAI_API_KEY** to `.env` to run clip analysis.")
 
+        with col_reanalyze:
+            if st.session_state.cs_formatted and api_key:
+                if st.button("Re-analyze", width="stretch", help="Force fresh OpenAI analysis (ignores cache)"):
+                    st.session_state[SESSION_FORCE_REANALYZE] = True
+                    st.rerun()
+
         with col_rescore:
             if st.session_state.cs_clips:
                 if st.button("Re-score clips", width="stretch", disabled=not can_analyze):
+                    st.session_state[SESSION_FORCE_REANALYZE] = True
                     with st.spinner("Re-scoring..."):
                         try:
                             clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
                             pipe_stats = pipe_stats or {}
                             st.session_state.cs_clips = clips or []
+                            st.session_state["final_clips"] = clips or []
                             st.session_state.cs_pipeline_stats = pipe_stats
                             st.session_state.cs_status = f"Re-scored: {len(clips)} clips."
                             st.rerun()
@@ -1241,6 +1418,7 @@ def main() -> None:
                                 if (c.get("start_seconds"), c.get("end_seconds")) not in existing_ranges
                             ]
                             st.session_state.cs_clips.extend(new_clips)
+                            st.session_state["final_clips"] = list(st.session_state.cs_clips)
                             st.session_state.cs_pipeline_stats = extra_stats
                             st.session_state.cs_status = f"Added {len(new_clips)} new clips ({len(st.session_state.cs_clips)} total)."
                             st.rerun()
@@ -1249,7 +1427,23 @@ def main() -> None:
 
         # ------------------------------------------------------------------ CLIP CARDS
         clips: list = st.session_state.get("cs_clips") or []
+        if clips and not st.session_state.get("final_clips"):
+            st.session_state["final_clips"] = clips
         if clips:
+            if not all(bool(c.get("finalizer_checked")) for c in clips):
+                from clip_engine.clip_finalizer import ensure_clips_finalized
+
+                segs_for_finalize = st.session_state.get("cs_segments") or []
+                ui_max = min(float(st.session_state.get("cs_max_clip_seconds", 120)), 120.0)
+                clips, _ui_finalized = ensure_clips_finalized(
+                    clips,
+                    segs_for_finalize,
+                    min_duration=float(st.session_state.get("cs_min_clip_seconds", 25)),
+                    max_duration=ui_max,
+                )
+                if _ui_finalized:
+                    st.session_state.cs_clips = clips
+                    st.session_state["final_clips"] = clips
             media_dur_for_map = float(st.session_state.get("cs_media_duration") or 0.0)
             pipe_stats = st.session_state.get("cs_pipeline_stats") or {}
             target_req = int(pipe_stats.get("target_clips", st.session_state.get("cs_target_clips", 20)))
@@ -1316,6 +1510,110 @@ def main() -> None:
                 for w in pipe_stats.get("warnings", []):
                     st.warning(w)
 
+            diag = st.session_state.get(SESSION_ANALYSIS_DIAGNOSTICS) or {}
+            with st.expander("Analysis diagnostics", expanded=False):
+                st.markdown(
+                    f"- **Cache:** {'hit' if diag.get('cache_hit') else 'miss'} "
+                    f"{('(' + str(diag.get('cache_miss_reason')) + ')') if diag.get('cache_miss_reason') else ''}\n"
+                    f"- **Invalidation:** {diag.get('invalidation_reason') or 'none (widgets do not invalidate)'}\n"
+                    f"- **Models:** `{diag.get('model_fast', 'n/a')}` / `{diag.get('model_quality', 'n/a')}`\n"
+                    f"- **JSON fallback used:** {bool((diag.get('json_telemetry') or {}).get('json_fallback'))}\n"
+                    f"- **Transcript duration:** {diag.get('transcript_duration', 0):.0f}s\n"
+                    f"- **Raw candidates:** {diag.get('raw_candidates', pipe_stats.get('raw_candidates', 0))}\n"
+                    f"- **Rescued:** {diag.get('rescued_candidates', pipe_stats.get('rescued_candidates', 0))}\n"
+                    f"- **Final clips:** {diag.get('final_clips', len(clips))}\n"
+                    f"- **Boundary repairs:** {diag.get('boundary_repairs', pipe_stats.get('boundary_repairs', 0))}\n"
+                    f"- **Title repairs:** {diag.get('title_repairs', pipe_stats.get('title_repairs', 0))}\n"
+                    f"- **OpenAI calls (this analysis):** {diag.get('openai_calls_used', pipe_stats.get('openai_calls_used', 0))}\n"
+                    f"- **Fingerprint:** `{diag.get('analysis_fingerprint', '')}`"
+                )
+                dsc = pipe_stats.get("discovery_scan") or {}
+                if dsc or pipe_stats.get("gpu_local_candidates") is not None:
+                    with st.expander("Discovery scan diagnostics", expanded=False):
+                        st.markdown(
+                            f"- **Windows scanned:** {dsc.get('windows_scanned', 0)}\n"
+                            f"- **Windows kept:** {dsc.get('windows_kept', 0)}\n"
+                            f"- **Windows rejected:** {dsc.get('windows_rejected', 0)}\n"
+                            f"- **Emotion triggers:** {dsc.get('emotion_triggers', 0)}\n"
+                            f"- **Curiosity triggers:** {dsc.get('curiosity_triggers', 0)}\n"
+                            f"- **Pacing triggers:** {dsc.get('pacing_triggers', 0)}\n"
+                            f"- **Hook triggers:** {dsc.get('hook_triggers', 0)}\n"
+                            f"- **Story phrase triggers:** {dsc.get('story_phrase_triggers', 0)}\n"
+                            f"- **Transcript-only candidates:** {dsc.get('transcript_only_candidates', 0)}\n"
+                            f"- **Fallback generated:** {dsc.get('fallback_generated', 0)}\n"
+                            f"- **Discovery boosts:** {dsc.get('discovery_boost_activations', 0)}"
+                        )
+                        rej = dsc.get("rejection_reasons") or {}
+                        if rej:
+                            st.caption(
+                                "**Rejection reasons**\n"
+                                + "\n".join(f"  - {k}: {v}" for k, v in sorted(rej.items(), key=lambda x: -x[1]))
+                            )
+
+            dg = pipe_stats.get("duration_governor") or {}
+            occ = pipe_stats.get("timeline_occupancy") or {}
+            if dg or occ:
+                with st.expander("Duration / expansion governor", expanded=False):
+                    for stage, stg in dg.items():
+                        if isinstance(stg, dict):
+                            st.markdown(
+                                f"**{stage}**: checked {stg.get('checked', 0)} | "
+                                f"soft-clamped {stg.get('clamped_soft', 0)} | "
+                                f"hard-clamped {stg.get('clamped_hard', 0)} | "
+                                f"over soft before {stg.get('over_soft_before', 0)}"
+                            )
+                    fin = occ.get("final") or {}
+                    if fin:
+                        st.markdown(
+                            f"**Timeline (final):** {fin.get('clip_count', 0)} clips | "
+                            f"union {fin.get('union_seconds', 0)}s | "
+                            f"overlap {fin.get('overlap_seconds', 0)}s "
+                            f"(ratio {fin.get('overlap_ratio', 0)}) | "
+                            f">{fin.get('over_soft_cap', 0)} over 90s | "
+                            f"max {fin.get('max_duration', 0)}s"
+                        )
+                        durs = fin.get("durations") or []
+                        if durs:
+                            st.caption(f"Durations (s): {', '.join(str(d) for d in durs[:14])}")
+
+            fr = pipe_stats.get("finalizer_report") or {}
+            if fr or any(pipe_stats.get(k) for k in (
+                "finalizer_expanded", "finalizer_merged", "finalizer_rejected", "finalizer_hooks_repaired"
+            )):
+                with st.expander("Finalizer Report", expanded=False):
+                    st.markdown(
+                        f"- **Checked:** {fr.get('checked', pipe_stats.get('final_clips', len(clips)))}\n"
+                        f"- **Expanded:** {fr.get('expanded', pipe_stats.get('finalizer_expanded', 0))}\n"
+                        f"- **Merged:** {fr.get('merged', pipe_stats.get('finalizer_merged', 0))}\n"
+                        f"- **Soft warnings:** {fr.get('soft_warnings', 0)}\n"
+                        f"- **Hard rejections:** {fr.get('hard_rejections', fr.get('rejected', pipe_stats.get('finalizer_rejected', 0)))}\n"
+                        f"- **Hooks repaired:** {fr.get('hooks_repaired', pipe_stats.get('finalizer_hooks_repaired', 0))}\n"
+                        f"- **Kept:** {fr.get('kept', len(clips))}"
+                    )
+                    warn_counts = [
+                        ("low_hook_warning", "Hook below ideal"),
+                        ("short_duration_warning", "Short 20â€“25s"),
+                        ("dangling_ending_warning", "Dangling ending"),
+                        ("host_question_warning", "Host-question opening"),
+                        ("metadata_grounding_warning", "Metadata grounding"),
+                    ]
+                    warn_lines = [
+                        f"  - {label}: {fr.get(key, 0)}"
+                        for key, label in warn_counts
+                        if int(fr.get(key, 0)) > 0
+                    ]
+                    if warn_lines:
+                        st.caption("**Warning counts**\n" + "\n".join(warn_lines))
+                    repairs = fr.get("hook_repairs") or []
+                    if repairs:
+                        for row in repairs[:8]:
+                            st.caption(
+                                f"Hook #{int(row.get('index', 0)) + 1}: "
+                                f"\"{str(row.get('old', ''))[:50]}\" â†’ "
+                                f"\"{str(row.get('new', ''))[:50]}\" "
+                                f"(score {row.get('score', '?')})"
+                            )
+
             tok = get_session_tokens()
             if tok["total"] > 0:
                 cost = tok.get("estimated_cost_usd") or (
@@ -1373,12 +1671,18 @@ def main() -> None:
                             except Exception:
                                 st.markdown(f"**Part {part_n} of {part_total}**")
                             st.caption(
-                                "This clip is part of a series — both parts will export together"
+                                "This clip is part of a series â€” both parts will export together"
                             )
                         st.caption(f"Platform: **{platform_str}** | Signal: `{c.get('dominant_signal', 'n/a')}` | Style: `{c.get('caption_style', 'n/a')}`")
                     with score_col:
-                        color = "High" if score >= 80 else ("Mid" if score >= 65 else "Low")
-                        st.metric(f"{color} Score", f"{score}/100")
+                        virality = int(c.get("virality_score", score))
+                        color = "High" if virality >= 80 else ("Mid" if virality >= 65 else "Low")
+                        st.metric(f"{color} Virality", f"{virality}/100")
+                        if c.get("virality_explanation"):
+                            st.caption(str(c["virality_explanation"])[:72])
+                        hook_q = int(c.get("hook_quality_score", 0))
+                        if hook_q:
+                            st.caption(f"Hook: {hook_q}/100")
                     with export_col:
                         series_wids = series_export_wids.get(str(c.get("series_id", "")), [wid])
                         st.checkbox(
@@ -1392,11 +1696,13 @@ def main() -> None:
                     # Editable fields row
                     e1, e2, e3, e4 = st.columns([2, 1, 1, 1])
                     with e1:
+                        edits = st.session_state.get(SESSION_CLIP_EDITS) or {}
+                        default_hook = edits.get(wid, {}).get(
+                            "hook_title", str(c.get("hook_title", "") or "")
+                        )
                         st.text_input(
-                            "Hook / title",
-                            value=st.session_state.get(
-                                f"hook_{wid}", str(c.get("hook_title", "") or "")
-                            ),
+                            "Hook / title (export only â€” does not re-run AI)",
+                            value=default_hook,
                             key=f"hook_widget_{wid}",
                         )
                     with e2:
@@ -1426,7 +1732,27 @@ def main() -> None:
                     t0_val = float(st.session_state.get(f"start_{wid}", fs_default))
                     t1_val = float(st.session_state.get(f"end_{wid}", fe_default))
                     dur_val = max(0.0, t1_val - t0_val)
-                    st.caption(f"Duration: **{dur_val:.1f}s** | AI core: {o_s:.1f}s - {o_e:.1f}s ({max(0.0, o_e-o_s):.1f}s)")
+                    boundary_label = c.get("boundary_status", "ok")
+                    if c.get("boundary_repaired") or boundary_label == "repaired":
+                        boundary_label = "repaired"
+                    elif c.get("boundary_warning"):
+                        boundary_label = "warning"
+                    exp_s = float(c.get("expanded_start", fs_default))
+                    exp_e = float(c.get("expanded_end", fe_default))
+                    orig_dur = float(c.get("original_duration", max(0.0, o_e - o_s)))
+                    exp_dur = float(c.get("expanded_duration", dur_val))
+                    growth_s = float(c.get("growth_seconds", max(0.0, exp_dur - orig_dur)))
+                    growth_pct = float(c.get("growth_percent", 0))
+                    merge_n = int(c.get("merge_source_count", 1))
+                    st.caption(
+                        f"Duration: **{dur_val:.1f}s** | Original: **{orig_dur:.1f}s** â†’ "
+                        f"Expanded: **{exp_dur:.1f}s** (+{growth_s:.1f}s, {growth_pct:.0f}%) | "
+                        f"Merge sources: **{merge_n}** | Boundary: **{boundary_label}**"
+                    )
+                    if c.get("expansion_reason"):
+                        st.caption(f"Expansion reason: {c['expansion_reason']}")
+                    if c.get("expansion_justification"):
+                        st.caption(f"Expansion: {c['expansion_justification']}")
 
                     grounding = int(c.get("grounding_confidence", 0))
                     if grounding > 0:
@@ -1554,6 +1880,28 @@ def main() -> None:
                     if not to_export:
                         st.warning("No clips selected for export. Check at least one 'Export' checkbox.")
                     else:
+                        from clip_engine.clip_finalizer import (
+                            ensure_clips_finalized,
+                            validate_clip_for_export,
+                        )
+
+                        export_min = float(st.session_state.get("cs_min_clip_seconds", 25))
+                        export_max = min(
+                            float(st.session_state.get("cs_max_clip_seconds", 120)),
+                            120.0,
+                        )
+                        to_export, _finalized_on_export = ensure_clips_finalized(
+                            to_export,
+                            segs,
+                            min_duration=export_min,
+                            max_duration=export_max,
+                        )
+                        if _finalized_on_export:
+                            logger.info(
+                                "[CLIP FINALIZER] export guard finalized %d clip(s) before export",
+                                len(to_export),
+                            )
+
                         exported = 0
                         failed = 0
                         prog = st.progress(0.0)
@@ -1563,6 +1911,36 @@ def main() -> None:
 
                         for idx, c in enumerate(to_export):
                             wid = c.get("_wid", str(idx))
+                            pre_t0 = float(st.session_state.get(f"start_{wid}", c.get("start_seconds", c.get("start", 0))))
+                            pre_t1 = float(st.session_state.get(f"end_{wid}", c.get("end_seconds", c.get("end", 0))))
+                            pre_hook = str(
+                                st.session_state.get(
+                                    f"hook_widget_{wid}",
+                                    st.session_state.get(
+                                        f"hook_{wid}", c.get("hook_title", f"clip_{idx+1}")
+                                    ),
+                                )
+                            ).strip()
+                            pre_check = dict(c)
+                            pre_check["start_seconds"] = pre_t0
+                            pre_check["end_seconds"] = pre_t1
+                            pre_check["hook_title"] = pre_hook
+                            ok_export, skip_reason = validate_clip_for_export(
+                                pre_check,
+                                min_duration=max(1.0, export_min * 0.5),
+                                max_duration=export_max + 5.0,
+                            )
+                            if not ok_export:
+                                failed += 1
+                                st.warning(f"Skipped clip {idx + 1}: {skip_reason}")
+                                logger.warning(
+                                    "[EXPORT] skipped clip=%s reason=%s",
+                                    wid,
+                                    skip_reason,
+                                )
+                                prog.progress((idx + 1) / len(to_export))
+                                continue
+
                             user_hook = str(
                                 st.session_state.get(
                                     f"hook_widget_{wid}",
@@ -1583,13 +1961,18 @@ def main() -> None:
                             export_title = user_hook
                             corrected_title = user_hook.strip()
 
-                            if api_key:
+                            if api_key and bool(st.session_state.get("cs_reground_on_export", False)):
+                                from clip_engine.effective_config import resolve_models_from_effective_config
+                                from clip_engine.effective_config import get_durable_effective_config
+                                _durable = get_durable_effective_config(st.session_state)
+                                _models = resolve_models_from_effective_config(_durable)
                                 export_clip = ground_clip_metadata_against_window(
                                     export_clip,
                                     segs,
                                     api_key,
                                     tracker=tracker,
                                     force_regenerate=True,
+                                    resolved_models=_models,
                                 )
                                 corrected_title = str(export_clip.get("hook_title", user_hook)).strip() or user_hook
                                 export_clip["hook_title"] = corrected_title
@@ -1631,11 +2014,10 @@ def main() -> None:
                                             clip["grounded_hook_title"] = corrected_title
                                             break
                                 logger.info(
-                                    "Exported %s - mode=%s encoder=%s res=%s",
-                                    out.name,
-                                    result.get("export_mode"),
+                                    "[EXPORT] completed path=%s encoder=%s mode=%s",
+                                    out,
                                     result.get("encoder_used"),
-                                    result.get("resolution"),
+                                    result.get("export_mode"),
                                 )
                             except Exception as e:
                                 failed += 1
@@ -1653,6 +2035,11 @@ def main() -> None:
                             final_clip_count=exported,
                         )
 
+                        logger.info(
+                            "[lifecycle] Export batch finished â€” exported=%d failed=%d; app remains active",
+                            exported,
+                            failed,
+                        )
                         if exported:
                             st.success(f"Exported **{exported}** clip(s) to `{session.relative_to(PROJECT_ROOT)}`")
                         if failed:
@@ -1670,12 +2057,129 @@ def main() -> None:
                 st.code(str(Path(out_dir).relative_to(PROJECT_ROOT)), language=None)
                 if st.button("Open latest export in Explorer"):
                     open_folder(Path(out_dir))
+
+            if st.session_state.get("final_clips") and st.session_state.get("source_video_path"):
+                st.subheader("Send to DaVinci Resolve")
+                fps_options = [24.0, 29.97, 30.0, 50.0, 60.0]
+                fps_labels = ["24fps", "29.97fps (NTSC)", "30fps", "50fps", "60fps"]
+                fps_to_project = {24.0: "24", 29.97: "29.97 DF", 30.0: "30", 50.0: "50", 60.0: "60"}
+                resolve_col1, resolve_col2, resolve_col3 = st.columns(3)
+                with resolve_col1:
+                    handle_secs = st.slider(
+                        "Handles (seconds each end)",
+                        min_value=0.0,
+                        max_value=10.0,
+                        value=2.0,
+                        step=0.5,
+                        key="resolve_handle_secs",
+                    )
+                with resolve_col2:
+                    fps_choice = st.selectbox(
+                        "Timeline FPS",
+                        options=fps_options,
+                        index=2,
+                        format_func=lambda x: fps_labels[fps_options.index(x)],
+                        key="resolve_fps_choice",
+                    )
+                with resolve_col3:
+                    timeline_name = st.text_input(
+                        "Timeline name",
+                        value=Path(st.session_state["source_video_path"]).stem + "_AI",
+                        key="resolve_timeline_name",
+                    )
+
+                if st.button("ðŸš€ Send to DaVinci Resolve", type="primary", key="resolve_send_btn"):
+                    resolve_clips = _clips_for_resolve_payload(st.session_state["final_clips"])
+                    payload = {
+                        "source_path": st.session_state["source_video_path"],
+                        "clips": resolve_clips,
+                        "fps": fps_choice,
+                        "handle_seconds": handle_secs,
+                        "timeline_name": timeline_name,
+                        "project_fps": fps_to_project.get(fps_choice, "30"),
+                        "color_tag": "Blue",
+                    }
+                    candidates = [
+                        r"C:\Users\rzric\AppData\Local\Programs\Python\Python311\python.exe",
+                        r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Python\python.exe",
+                        r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Python3\python.exe",
+                        r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Python310\python.exe",
+                        sys.executable,
+                    ]
+                    resolve_python = next((p for p in candidates if Path(p).exists()), sys.executable)
+                    st.session_state["resolve_python_path"] = resolve_python
+                    try:
+                        result = subprocess.run(
+                            [resolve_python, str(Path(__file__).parent / "resolve_bridge.py")],
+                            input=json.dumps(payload),
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        if result.returncode == 0:
+                            try:
+                                resp = json.loads(result.stdout.strip() or "{}")
+                            except json.JSONDecodeError:
+                                resp = {"status": "error", "message": result.stdout or "Invalid JSON from bridge"}
+                            if resp.get("status") == "ok":
+                                st.success(
+                                    f"Timeline **{resp.get('timeline_name', timeline_name)}** created with "
+                                    f"**{resp.get('clips_placed', len(resolve_clips))}** clip(s) in DaVinci Resolve."
+                                )
+                                with st.expander("ðŸ“‹ Build log", expanded=False):
+                                    for line in resp.get("log") or []:
+                                        st.text(line)
+                            else:
+                                st.error(resp.get("message", "Unknown error from Resolve bridge."))
+                                st.info(
+                                    "- DaVinci Resolve Studio is open\n"
+                                    "- Preferences â†’ System â†’ General â†’ Enable Fusion page scripting is checked\n"
+                                    "- You are using DaVinci Resolve Studio (not the free version)"
+                                )
+                        else:
+                            try:
+                                resp = json.loads(result.stdout.strip() or result.stderr.strip() or "{}")
+                                err_msg = resp.get("message", result.stderr or result.stdout or "Bridge failed")
+                            except json.JSONDecodeError:
+                                err_msg = result.stderr or result.stdout or "Bridge failed"
+                            st.error(err_msg)
+                            st.info(
+                                "- DaVinci Resolve Studio is open\n"
+                                "- Preferences â†’ System â†’ General â†’ Enable Fusion page scripting is checked\n"
+                                "- You are using DaVinci Resolve Studio (not the free version)"
+                            )
+                    except subprocess.TimeoutExpired:
+                        st.error("Timed out connecting to Resolve (30s). Is Resolve open?")
+
+                with st.expander("ðŸ“„ Export EDL instead (DaVinci Resolve free version)"):
+                    if st.button("Generate EDL file", key="resolve_edl_generate"):
+                        edl_clips = _clips_for_resolve_payload(st.session_state["final_clips"])
+                        edl_text = build_edl(
+                            edl_clips,
+                            st.session_state["source_video_path"],
+                            fps=fps_choice,
+                            handle_seconds=handle_secs,
+                            title=timeline_name,
+                        )
+                        st.session_state["resolve_edl_text"] = edl_text
+                        edl_stem = Path(st.session_state["source_video_path"]).stem
+                        st.session_state["resolve_edl_filename"] = f"{edl_stem}_resolve.edl"
+                    if st.session_state.get("resolve_edl_text"):
+                        st.download_button(
+                            label="Download EDL file",
+                            data=st.session_state["resolve_edl_text"],
+                            file_name=st.session_state.get("resolve_edl_filename", "clips_resolve.edl"),
+                            mime="text/plain",
+                            key="resolve_edl_download",
+                        )
     except Exception as e:
         logger.exception("Clip Studio UI failed")
         print(traceback.format_exc())
         st.error(f"**Clip Studio error:** {e}")
         with st.expander("Technical details", expanded=True):
             st.code(traceback.format_exc())
+    finally:
+        logger.debug("[lifecycle] Streamlit render cycle complete")
 
 
 if __name__ == "__main__":

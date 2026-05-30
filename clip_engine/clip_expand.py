@@ -10,6 +10,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from clip_engine.clip_duration_governor import (
+    HARD_CAP_SECONDS,
+    MAX_GROWTH_PERCENT,
+    SOFT_CAP_SECONDS,
+    clamp_clip_to_duration_policy,
+    max_allowed_span_for_core,
+    pin_ai_core_window,
+    refresh_expansion_diagnostics,
+    scaled_context_padding,
+)
+
 logger = logging.getLogger("clip_engine.clip_expand")
 
 
@@ -18,7 +29,7 @@ class ClipExpansionSettings:
     context_before: float = 8.0
     context_after: float = 12.0
     min_clip_seconds: float = 25.0
-    max_clip_seconds: float = 160.0
+    max_clip_seconds: float = 90.0
     hard_max_seconds: float | None = None
     allow_exceed_max: bool = False
     pause_snap_tolerance: float = 2.0   # seconds to look for a pause boundary
@@ -37,67 +48,97 @@ def finalize_clips_after_ai(
     if settings is None:
         settings = ClipExpansionSettings()
 
-    # Build pause list for boundary snapping
     from clip_engine.transcription_utils import detect_pauses, find_nearest_pause_boundary
     pauses = detect_pauses(segments) if segments else []
 
+    effective_max = min(
+        settings.max_clip_seconds,
+        settings.hard_max_seconds or HARD_CAP_SECONDS,
+        SOFT_CAP_SECONDS,
+    )
+    if settings.allow_exceed_max:
+        effective_max = min(
+            settings.max_clip_seconds,
+            settings.hard_max_seconds or HARD_CAP_SECONDS,
+        )
+
     finalized: list[dict] = []
-    for c in clips:
-        c = dict(c)
-        core_start = float(c.get("start_seconds", c.get("start", 0)))
-        core_end = float(c.get("end_seconds", c.get("end", 0)))
+    for raw in clips:
+        c = pin_ai_core_window(dict(raw))
+        core_start = float(c["ai_core_start"])
+        core_end = float(c["ai_core_end"])
+        core_dur = max(0.01, core_end - core_start)
+        effective_max = min(
+            settings.max_clip_seconds,
+            settings.hard_max_seconds or HARD_CAP_SECONDS,
+            SOFT_CAP_SECONDS if not settings.allow_exceed_max else HARD_CAP_SECONDS,
+        )
+        max_span_pre = max_allowed_span_for_core(
+            c, core_dur, effective_max, pre_virality=True,
+        )
 
-        # Store original AI core
-        c["original_start"] = core_start
-        c["original_end"] = core_end
+        ctx_b, ctx_a = scaled_context_padding(
+            core_dur, settings.context_before, settings.context_after,
+        )
 
-        # Expand by context
-        exp_start = max(0.0, core_start - settings.context_before)
-        exp_end = min(media_duration, core_end + settings.context_after) if media_duration > 0 else core_end + settings.context_after
+        exp_start = max(0.0, core_start - ctx_b)
+        exp_end = (
+            min(media_duration, core_end + ctx_a)
+            if media_duration > 0
+            else core_end + ctx_a
+        )
 
-        # Try to snap start to a nearby pause boundary (cleaner cut point)
         snapped_start = find_nearest_pause_boundary(
-            exp_start, pauses, direction="before", tolerance=settings.pause_snap_tolerance
+            exp_start, pauses, direction="before", tolerance=settings.pause_snap_tolerance,
         )
         if snapped_start is not None and snapped_start < core_start:
-            exp_start = snapped_start
-            c.setdefault("expansion_note", "")
-            c["expansion_note"] = (c.get("expansion_note") or "") + f" Start snapped to pause at {snapped_start:.1f}s."
+            if core_start - snapped_start <= ctx_b + 1.0:
+                exp_start = snapped_start
+                c.setdefault("expansion_note", "")
+                c["expansion_note"] = (c.get("expansion_note") or "") + (
+                    f" Start snapped to pause at {snapped_start:.1f}s."
+                )
 
         snapped_end = find_nearest_pause_boundary(
-            exp_end, pauses, direction="after", tolerance=settings.pause_snap_tolerance
+            exp_end, pauses, direction="after", tolerance=settings.pause_snap_tolerance,
         )
         if snapped_end is not None and snapped_end > core_end:
-            exp_end = snapped_end
-            c["expansion_note"] = (c.get("expansion_note") or "") + f" End snapped to pause at {snapped_end:.1f}s."
+            if snapped_end - core_end <= ctx_a + 1.0:
+                exp_end = snapped_end
+                c["expansion_note"] = (c.get("expansion_note") or "") + (
+                    f" End snapped to pause at {snapped_end:.1f}s."
+                )
 
-        # Enforce max length (hard cap always wins unless allow_exceed_max)
         duration = exp_end - exp_start
-        effective_max = settings.max_clip_seconds
-        if settings.hard_max_seconds is not None:
-            effective_max = min(effective_max, settings.hard_max_seconds)
-        if duration > effective_max and not settings.allow_exceed_max:
-            exp_end = exp_start + effective_max
-            c["expansion_note"] = (c.get("expansion_note") or "") + " Trimmed to max length."
-        elif settings.hard_max_seconds is not None and duration > settings.hard_max_seconds:
-            exp_end = exp_start + settings.hard_max_seconds
-            c["expansion_note"] = (c.get("expansion_note") or "") + " Hard-capped to style max."
+        span_cap = min(effective_max, max_span_pre)
+        if duration > span_cap and not settings.allow_exceed_max:
+            exp_end = exp_start + span_cap
+            c["expansion_note"] = (c.get("expansion_note") or "") + (
+                f" Trimmed to {span_cap:.0f}s (cap/growth {MAX_GROWTH_PERCENT:.0f}%)."
+            )
 
-        # Enforce min length
         duration = exp_end - exp_start
         if duration < settings.min_clip_seconds:
-            # Extend end
             needed = settings.min_clip_seconds - duration
             exp_end = min(media_duration or exp_end + needed, exp_end + needed)
-            c["expansion_note"] = (c.get("expansion_note") or "") + " Extended to meet min length."
+            if exp_end - exp_start > span_cap and not settings.allow_exceed_max:
+                exp_end = exp_start + span_cap
+            c["expansion_note"] = (c.get("expansion_note") or "") + " Extended toward min length."
 
         c["start_seconds"] = round(exp_start, 3)
         c["end_seconds"] = round(exp_end, 3)
-        c["duration"] = round(exp_end - exp_start, 3)
+        c["expansion_reason"] = "context_expand"
+        c, _ = clamp_clip_to_duration_policy(c, media_duration, pre_virality=True)
+        c = refresh_expansion_diagnostics(c)
 
         logger.debug(
-            "Clip expanded: core=%.1f-%.1f -> export=%.1f-%.1f (%.1fs)",
-            core_start, core_end, exp_start, exp_end, c["duration"],
+            "Clip expanded: core=%.1f-%.1f -> export=%.1f-%.1f (%.1fs, growth=%.1fs)",
+            core_start,
+            core_end,
+            c["expanded_start"],
+            c["expanded_end"],
+            c["duration"],
+            c.get("growth_seconds", 0),
         )
         finalized.append(c)
 

@@ -114,7 +114,7 @@ _PROFILES: dict[str, AIProfile] = {
 
         json_fallback_model="gpt-4o-mini",
 
-        max_tokens=60_000,
+        max_tokens=90_000,
 
         token_saver=True,
 
@@ -128,7 +128,7 @@ _PROFILES: dict[str, AIProfile] = {
 
         max_gpt_regions=5,
 
-        max_clip_length=90.0,
+        max_clip_length=120.0,
 
         context_before=4.0,
 

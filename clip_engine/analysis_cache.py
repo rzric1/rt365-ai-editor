@@ -19,7 +19,7 @@ from config import PROJECT_ROOT
 
 logger = logging.getLogger("clip_engine.analysis_cache")
 
-CACHE_VERSION = "2"
+CACHE_VERSION = "3"
 ANALYSIS_CACHE_DIR = PROJECT_ROOT / "outputs" / "cache" / "analysis"
 
 
@@ -38,6 +38,11 @@ class AnalysisCacheKey:
     model_quality: str = ""
     context_before: float = 8.0
     context_after: float = 12.0
+    discovery_mode: bool = False
+    ai_profile_name: str = "SAFE"
+    clip_strategy: str = "Balanced"
+    platform_target: str = "TikTok/Reels/Shorts"
+    title_style: str = "Curiosity"
     cache_version: str = CACHE_VERSION
 
     def digest(self) -> str:
@@ -101,6 +106,11 @@ def build_cache_key(
     model_quality: str,
     context_before: float,
     context_after: float,
+    discovery_mode: bool = False,
+    ai_profile_name: str = "SAFE",
+    clip_strategy: str = "Balanced",
+    platform_target: str = "TikTok/Reels/Shorts",
+    title_style: str = "Curiosity",
 ) -> AnalysisCacheKey:
     return AnalysisCacheKey(
         video_filename=video_filename,
@@ -116,22 +126,28 @@ def build_cache_key(
         model_quality=model_quality,
         context_before=context_before,
         context_after=context_after,
+        discovery_mode=discovery_mode,
+        ai_profile_name=ai_profile_name,
+        clip_strategy=clip_strategy,
+        platform_target=platform_target,
+        title_style=title_style,
     )
 
 
 def load_cached_analysis(cache_key: str) -> dict[str, Any] | None:
     path = _cache_dir(cache_key) / "result.json"
     if not path.is_file():
+        logger.info("[CACHE] miss: no file for %s", cache_key)
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("cache_version") != CACHE_VERSION:
-            logger.info("Cache miss: version mismatch for %s", cache_key)
+            logger.info("[CACHE] miss: version mismatch for %s", cache_key)
             return None
-        logger.info("Cache hit: %s", cache_key)
+        logger.info("[CACHE] hit: %s", cache_key)
         return data
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Cache read failed %s: %s", cache_key, exc)
+        logger.warning("[CACHE] read failed %s: %s", cache_key, exc)
         return None
 
 
@@ -142,6 +158,7 @@ def save_cached_analysis(
     stats: dict,
     token_usage: dict,
     raw_candidates: list[dict] | None = None,
+    analysis_fingerprint: str = "",
 ) -> Path:
     d = _cache_dir(cache_key)
     d.mkdir(parents=True, exist_ok=True)
@@ -149,6 +166,7 @@ def save_cached_analysis(
         "cache_version": CACHE_VERSION,
         "cached_at": datetime.now(timezone.utc).isoformat(),
         "cache_key": cache_key,
+        "analysis_fingerprint": analysis_fingerprint,
         "clips": clips,
         "stats": stats,
         "token_usage": token_usage,
@@ -158,7 +176,7 @@ def save_cached_analysis(
     result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     token_path = d / "token_usage.json"
     token_path.write_text(json.dumps(token_usage, indent=2), encoding="utf-8")
-    logger.info("Saved analysis cache: %s", result_path)
+    logger.info("[CACHE] saved analysis: %s", result_path)
     return result_path
 
 

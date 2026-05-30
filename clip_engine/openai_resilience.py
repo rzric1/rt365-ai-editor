@@ -730,11 +730,14 @@ def call_openai_chat_json(
 
         if not allow_repair or not text.strip():
             raise
+        preview = text[:240].replace("\n", "\\n")
         logger.warning(
-            "JSON parse failed stage=%s model=%s — attempting repair call: %s",
+            "JSON repair stage=%s source_model=%s fallback_used=%s reason=%s preview=%s",
             stage,
             effective_model,
+            attempted_fallback,
             parse_err,
+            preview,
         )
         from clip_engine.telemetry import record_json_repair
 

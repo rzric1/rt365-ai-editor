@@ -24,6 +24,10 @@ EMOTION_WORDS = {
     "trauma", "traumatic", "abuse", "violence", "death", "died", "suicide",
     "cancer", "addiction", "struggle", "survived", "resilience", "resilient",
     "loss", "grief", "mourning", "painful", "suffering", "broken", "healing",
+    "alcoholic", "drunk", "drinking", "sober", "rehab", "mom", "mother", "dad",
+    "father", "childhood", "orphan", "divorce", "miscarriage", "overdose",
+    "depression", "anxiety", "panic", "abusive", "molest", "assault", "rape",
+    "prison", "jail", "homeless", "widow", "funeral", "hospital", "coma",
 }
 
 DRAMATIC_TURNS = {
@@ -106,12 +110,12 @@ def analyze_emotion_spikes(transcript_segments: list[dict]) -> dict[str, Any]:
     dramatic_hits = sum(1 for phrase in DRAMATIC_TURNS if phrase in text)
     funny_hits = len(words & FUNNY_INDICATORS) + (1 if LAUGHTER_MARKERS.search(text) else 0)
 
-    score = _score_from_hits(emotion_hits + dramatic_hits * 2, 8, base=25)
+    score = _score_from_hits(emotion_hits + dramatic_hits * 2, 12, base=22)
     if funny_hits:
         score = min(100, score + funny_hits * 8)
 
     reasons: list[str] = []
-    if emotion_hits >= 2:
+    if emotion_hits >= 1:
         reasons.append(f"{emotion_hits} emotional keywords")
     if dramatic_hits:
         reasons.append("dramatic turn")
@@ -143,10 +147,12 @@ def analyze_pacing(transcript_segments: list[dict]) -> dict[str, Any]:
     ) / total
 
     score = 40.0
-    if short_ratio >= 0.5:
+    if short_ratio >= 0.45:
         score += 35
-    elif short_ratio >= 0.3:
-        score += 20
+    elif short_ratio >= 0.22:
+        score += 22
+    elif short_ratio >= 0.12:
+        score += 12
     if avg_dur <= 3.0:
         score += 15
     elif avg_dur <= 5.0:
@@ -155,7 +161,7 @@ def analyze_pacing(transcript_segments: list[dict]) -> dict[str, Any]:
     score = min(100.0, score)
     reason = (
         f"Fast pacing ({short_count}/{total} short segments)"
-        if short_ratio >= 0.3
+        if short_ratio >= 0.22
         else f"Moderate pacing (avg {avg_dur:.1f}s/segment)"
     )
     return {"pacing": int(round(score)), "reason": reason}
@@ -197,7 +203,7 @@ def analyze_curiosity_gap(text: str) -> dict[str, Any]:
     ellipsis = lower.count("...") + lower.count("…")
     cliffhanger = bool(re.search(r"\b(but|however|yet|until)\b.{0,40}$", lower.strip()))
 
-    score = 25.0 + hook_hits * 12 + min(question_marks, 3) * 8 + ellipsis * 5
+    score = 20.0 + hook_hits * 14 + min(question_marks, 4) * 9 + ellipsis * 6
     if cliffhanger:
         score += 15
     score = min(100.0, score)
@@ -287,6 +293,8 @@ def compute_signal_boosts(
         signal_boost = 10.0
     elif weighted_avg >= 45:
         signal_boost = 5.0
+    elif weighted_avg >= 35:
+        signal_boost = 3.0
     else:
         signal_boost = 0.0
 
