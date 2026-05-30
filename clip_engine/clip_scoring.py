@@ -43,6 +43,22 @@ TITLE_STYLES = (
     "Clean/professional",
 )
 
+EMOTION_WORDS = frozenset({
+    "love", "hate", "cry", "cried", "crying", "afraid", "scared", "trauma",
+    "abuse", "alcoholic", "alcoholism", "drunk", "drinking", "heartbreaking",
+    "devastating", "broken", "hurt", "pain", "grief", "mother", "father", "dad",
+    "mom", "brother", "sister", "childhood", "cancer", "death", "died", "suicide",
+    "divorce", "abandoned", "betrayed", "shattered", "traumatic", "addiction",
+    "emotional", "feelings", "tears", "weeping", "depressed", "depression",
+    "overwhelmed", "vulnerable", "courage", "strength", "survived", "survivor",
+})
+
+VETERAN_STORYTELLING_WORDS = frozenset({
+    "army", "military", "deployed", "deployment", "combat", "veteran", "service",
+    "soldier", "troops", "war", "battlefield", "mission", "tour", "duty",
+    "marine", "navy", "airforce", "infantry", "ptsd", "overseas", "enlisted",
+})
+
 _STRATEGY_WEIGHTS: dict[str, dict[str, float]] = {
     "Viral Moments": {"hook_strength": 1.2, "curiosity": 1.15, "pacing": 1.1},
     "Educational Nuggets": {"clarity": 1.2, "complete_thought": 1.15, "hook_strength": 0.95},
@@ -277,6 +293,19 @@ def compute_virality_score(
         complete_thought += 2
     else:
         complete_thought -= 4
+
+    # Content-type bonuses — only applied AFTER boundary and title repair so broken clips
+    # cannot use these to bypass quality checks.
+    if not boundary_still_broken and not title_still_broken:
+        # Podcast/storytelling emotion bonus: 3+ distinct emotion signals in transcript.
+        emotion_hits = sum(1 for w in EMOTION_WORDS if w in text)
+        if emotion_hits >= 3:
+            boosts += 15
+            emotion = min(15, emotion + 5)
+        # Veteran/military storytelling signal.
+        if any(w in text for w in VETERAN_STORYTELLING_WORDS):
+            boosts += 10
+            standalone = min(12, standalone + 3)
 
     if len(text.split()) < 40:
         standalone -= 4

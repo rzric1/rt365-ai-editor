@@ -93,6 +93,26 @@ EMOTION_KEYWORDS = frozenset({
 
 TOKEN_RE = re.compile(r"[A-Za-z']+")
 
+# Patterns for hook titles that are raw transcript fragments
+FRAGMENT_TITLE_START_RE = re.compile(
+    r"^\s*(?:uh+|um+|yeah|so i'?m gonna|to make the|and then|you know|i mean|"
+    r"like i|so basically|honestly)\b",
+    re.IGNORECASE,
+)
+
+# Trailing words that signal an incomplete title
+_FRAGMENT_TRAIL_PHRASES = frozenset({
+    "the", "and it's", "for the", "it's uh", "it's um", "and", "or", "but",
+    "a", "an", "of", "with", "that", "which", "when", "while", "if", "as",
+})
+
+HOST_QUESTION_TITLE_RE = re.compile(
+    r"^\s*(?:do you|did you|can you|could you|would you|will you|have you|"
+    r"are you|were you|what |how |why |when |where |who |tell me|"
+    r"what's|what is|how's|how is)\b.*\?",
+    re.IGNORECASE,
+)
+
 # Production rejection / warning thresholds (finalizer-only)
 FINALIZER_HARD_HOOK_THRESHOLD = 55
 FINALIZER_SOFT_HOOK_THRESHOLD = 70
@@ -101,7 +121,7 @@ FINALIZER_SOFT_SHORT_MAX_DURATION = 25.0
 FINALIZER_HARD_BROKEN_MAX_DURATION = 10.0
 GUEST_ANSWER_WINDOW_SECONDS = 15.0
 # Bump when rejection/warning rules change so cached clips re-finalize.
-FINALIZER_LOGIC_VERSION = 2
+FINALIZER_LOGIC_VERSION = 3
 
 
 @dataclass
@@ -154,6 +174,27 @@ class FinalizerReport:
 # ---------------------------------------------------------------------------
 # Detection helpers
 # ---------------------------------------------------------------------------
+
+
+def _hook_title_is_filler_fragment(title: str) -> bool:
+    """True when a hook title is a raw transcript fragment or host question, not a real title."""
+    t = (title or "").strip()
+    if not t:
+        return True
+    if FRAGMENT_TITLE_START_RE.match(t):
+        return True
+    if HOST_QUESTION_TITLE_RE.match(t):
+        return True
+    # Ends with any of the trailing incomplete phrases
+    t_lower = t.lower().rstrip(".!?,;:")
+    for phrase in _FRAGMENT_TRAIL_PHRASES:
+        if t_lower == phrase or t_lower.endswith(" " + phrase):
+            return True
+    # Mid-sentence filler: contains "uh" or "um" surrounded by words
+    words = TOKEN_RE.findall(t.lower())
+    if len(words) >= 3 and any(w in {"uh", "um", "uhh", "umm"} for w in words[1:-1]):
+        return True
+    return False
 
 
 def _clip_times(clip: dict) -> tuple[float, float]:
@@ -301,6 +342,8 @@ def _always_hard_reject_reasons(clip: dict, segments: list[dict] | None) -> list
         reasons.append("duration under 10 seconds")
     if _clip_has_empty_transcript(clip, segments):
         reasons.append("empty transcript window")
+    if clip.get("hook_fragment_unrepairable"):
+        reasons.append("fragment hook title could not be repaired above quality threshold 55")
     return reasons
 
 
@@ -669,6 +712,7 @@ def expand_clip_to_sentence_or_thought_boundary(
         c["end_seconds"] = round(new_t1, 3)
         c["finalizer_action"] = "expanded"
         c["finalizer_reason"] = "expanded to sentence boundaries"
+        c["expansion_reason"] = "finalizer_sentence_expand"
     return c
 
 
@@ -836,11 +880,13 @@ def repair_final_hook_title(
     old = str(c.get("hook_title", "")).strip()
     window = transcript_text or _window_text(c, segments)
 
+    was_fragment = _hook_title_is_filler_fragment(old)
     needs_repair = (
         not old
         or hook_title_is_incomplete(old)
         or _title_copied_from_transcript(old, window)
         or old.lower() in GENERIC_TITLES
+        or was_fragment
     )
 
     if needs_repair:
@@ -853,13 +899,25 @@ def repair_final_hook_title(
         c["finalizer_reason"] = "hook title repaired for complete thought"
         new_score, _ = assess_hook_quality(new_title)
         c["hook_quality_score"] = new_score
-        log.info(
-            '[HOOK REPAIR] clip=%s old="%s" new="%s" score=%s',
-            c.get("_wid", c.get("clip_id", "?")),
-            old[:60],
-            new_title[:60],
-            new_score,
-        )
+        # Fragment titles that still can't reach quality threshold 55 after repair are flagged
+        # for hard rejection — they cannot be passed to the UI as watchable clips.
+        if was_fragment and new_score < FINALIZER_HARD_HOOK_THRESHOLD:
+            c["hook_fragment_unrepairable"] = True
+            log.info(
+                '[HOOK REPAIR] clip=%s fragment title unrepairable after repair old="%s" new="%s" score=%d',
+                c.get("_wid", c.get("clip_id", "?")),
+                old[:60],
+                new_title[:60],
+                new_score,
+            )
+        else:
+            log.info(
+                '[HOOK REPAIR] clip=%s old="%s" new="%s" score=%s',
+                c.get("_wid", c.get("clip_id", "?")),
+                old[:60],
+                new_title[:60],
+                new_score,
+            )
     else:
         score, _ = assess_hook_quality(old)
         c["hook_quality_score"] = score

@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 import logging
+import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -8,6 +10,32 @@ from clip_engine.captions import CaptionPreset, DEFAULT_PRESET, segments_to_ass,
 from clip_engine.smart_crop import ExportMode, OUTPUT_W, OUTPUT_H, build_vf_filter, validate_output_resolution
 
 logger = logging.getLogger("clip_engine.export_vertical")
+
+# Sequential export controls — prevents GPU/memory exhaustion from concurrent ffmpeg processes.
+_EXPORT_LOCK = threading.Lock()
+_EXPORT_INTER_DELAY = 2.0          # seconds between clip exports
+_GPU_MEMORY_HEADROOM_GB = 8.0      # pause if GPU VRAM used exceeds this
+_FFMPEG_TIMEOUT_SECONDS = 300      # per-clip ffmpeg hard timeout
+
+
+def _check_gpu_headroom() -> None:
+    """If GPU memory usage exceeds threshold, wait 5 seconds before proceeding."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            used_mb = int(result.stdout.strip().split("\n")[0].strip())
+            used_gb = used_mb / 1024
+            if used_gb > _GPU_MEMORY_HEADROOM_GB:
+                logger.warning(
+                    "GPU memory %.1fGB exceeds %.1fGB threshold — waiting 5s before export",
+                    used_gb, _GPU_MEMORY_HEADROOM_GB,
+                )
+                time.sleep(5.0)
+    except Exception:
+        pass
 
 EXPORT_MODE_LABELS: dict[str, ExportMode] = {
     "Full frame fit with blurred background": "full_fit",
@@ -21,6 +49,30 @@ PREVIEW_MAX_DURATION = 15.0  # seconds max for preview
 
 
 def export_vertical_clip_with_captions(
+    video_path: Path, output_path: Path, start: float, end: float, segments: list[dict], *,
+    prefer_gpu: bool = True, force_gpu_export: bool = False, allow_cpu_fallback: bool = True,
+    caption_preset: CaptionPreset = DEFAULT_PRESET, export_mode: ExportMode = "full_fit",
+    write_sidecars: bool = True, smart_crop: bool = True,
+    advanced_captions: bool = False, dynamic_smart_crop: bool = True,
+    preview_mode: bool = False,
+) -> dict:
+    with _EXPORT_LOCK:
+        _check_gpu_headroom()
+        try:
+            return _export_vertical_clip_impl(
+                video_path, output_path, start, end, segments,
+                prefer_gpu=prefer_gpu, force_gpu_export=force_gpu_export,
+                allow_cpu_fallback=allow_cpu_fallback, caption_preset=caption_preset,
+                export_mode=export_mode, write_sidecars=write_sidecars,
+                smart_crop=smart_crop, advanced_captions=advanced_captions,
+                dynamic_smart_crop=dynamic_smart_crop, preview_mode=preview_mode,
+            )
+        finally:
+            if not preview_mode:
+                time.sleep(_EXPORT_INTER_DELAY)
+
+
+def _export_vertical_clip_impl(
     video_path: Path, output_path: Path, start: float, end: float, segments: list[dict], *,
     prefer_gpu: bool = True, force_gpu_export: bool = False, allow_cpu_fallback: bool = True,
     caption_preset: CaptionPreset = DEFAULT_PRESET, export_mode: ExportMode = "full_fit",
@@ -189,7 +241,7 @@ def export_filename_stem(clip: dict, sequence_index: int, title_slug: str) -> st
 
 
 def _run_with_fallback(cmd, video_path, output_path, start, duration, vf, uses_complex, encoder, allow_cpu_fallback, *, preview_mode=False):
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT_SECONDS)
     if result.returncode == 0:
         return encoder
     if encoder == "h264_nvenc" and allow_cpu_fallback:
@@ -198,8 +250,51 @@ def _run_with_fallback(cmd, video_path, output_path, start, duration, vf, uses_c
             video_path, output_path, start, duration, vf, uses_complex,
             False, False, preview_mode=preview_mode,
         )
-        result2 = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=600)
+        result2 = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT_SECONDS)
         if result2.returncode == 0:
             return "libx264"
         raise RuntimeError(f"CPU fallback failed: {result2.stderr[-1000:]}")
     raise RuntimeError(f"FFmpeg failed: {result.stderr[-1000:]}")
+
+
+def export_clips_sequential_safe(
+    clips: list[dict],
+    video_path: Path,
+    output_dir: Path,
+    segments: list[dict],
+    *,
+    prefer_gpu: bool = True,
+    allow_cpu_fallback: bool = True,
+    caption_preset: CaptionPreset = DEFAULT_PRESET,
+    export_mode: ExportMode = "full_fit",
+    advanced_captions: bool = False,
+    dynamic_smart_crop: bool = True,
+) -> list[dict]:
+    """Export clips one at a time. Failed clips are logged and marked, not re-raised."""
+    results: list[dict] = []
+    for i, clip in enumerate(clips):
+        title = str(clip.get("hook_title") or clip.get("export_title") or f"clip_{i+1}")
+        slug = re.sub(r"[^\w\s-]", "", title)[:40].strip().replace(" ", "_")
+        output_path = output_dir / f"{i+1:02d}_{slug}_9x16.mp4"
+        start = float(clip.get("start_seconds", clip.get("start", 0)))
+        end = float(clip.get("end_seconds", clip.get("end", 0)))
+        try:
+            result = export_vertical_clip_with_captions(
+                video_path, output_path, start, end, segments,
+                prefer_gpu=prefer_gpu, allow_cpu_fallback=allow_cpu_fallback,
+                caption_preset=caption_preset, export_mode=export_mode,
+                advanced_captions=advanced_captions, dynamic_smart_crop=dynamic_smart_crop,
+            )
+            result["clip_index"] = i
+            result["failed"] = False
+            results.append(result)
+            logger.info("Export %d/%d complete: %s", i + 1, len(clips), output_path.name)
+        except Exception as exc:
+            logger.error("Export %d/%d failed (%s): %s", i + 1, len(clips), output_path.name, exc)
+            results.append({
+                "clip_index": i,
+                "failed": True,
+                "error": str(exc),
+                "output_path": output_path,
+            })
+    return results
