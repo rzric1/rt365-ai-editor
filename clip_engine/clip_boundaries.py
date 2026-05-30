@@ -252,10 +252,10 @@ def snap_clip_to_sentence_boundaries(
         for _, end, text in reversed(spans):
             if end <= new_t0 + min_duration:
                 continue
-            if end > new_t0 + max_duration:
+            if end > new_t0 + expand_ceiling:
                 continue
             if SENTENCE_END_RE.search(text.strip()) and not ends_with_dangling_word(text):
-                candidate_end = min(end, new_t0 + max_duration)
+                candidate_end = min(end, new_t0 + expand_ceiling)
                 if candidate_end - new_t0 >= min_duration:
                     new_t1 = candidate_end
                     repaired = True
@@ -278,6 +278,7 @@ def snap_clip_to_sentence_boundaries(
         c["start_seconds"] = round(new_t0, 3)
         c["end_seconds"] = round(new_t1, 3)
         c["boundary_repaired"] = True
+        c["expansion_reason"] = "boundary_sentence_snap"
         logger.info(
             "Boundary repair %.1f-%.1f -> %.1f-%.1f",
             t0, t1, new_t0, new_t1,

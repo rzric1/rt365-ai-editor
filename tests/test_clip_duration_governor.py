@@ -4,12 +4,14 @@ import unittest
 
 from clip_engine.clip_duration_governor import (
     HARD_CAP_SECONDS,
+    MAX_GROWTH_PERCENT,
     SOFT_CAP_SECONDS,
     apply_duration_policy_batch,
     clamp_clip_to_duration_policy,
     compute_timeline_occupancy,
     effective_max_duration,
     merge_allowed_max_duration,
+    pin_ai_core_window,
     refresh_expansion_diagnostics,
     scaled_context_padding,
 )
@@ -25,17 +27,32 @@ class TestDurationGovernor(unittest.TestCase):
         self.assertEqual(effective_max_duration(clip), HARD_CAP_SECONDS)
 
     def test_clamp_soft_when_not_viral(self) -> None:
-        clip = {
-            "original_start": 100.0,
-            "original_end": 150.0,
+        clip = pin_ai_core_window({
+            "ai_core_start": 100.0,
+            "ai_core_end": 150.0,
             "start_seconds": 90.0,
             "end_seconds": 210.0,
             "virality_score": 60,
-        }
+        })
         fixed, actions = clamp_clip_to_duration_policy(clip, media_duration=600.0)
         self.assertLessEqual(fixed["end_seconds"] - fixed["start_seconds"], SOFT_CAP_SECONDS + 0.5)
-        self.assertTrue(any("soft_clamp" in a for a in actions))
-        self.assertEqual(fixed["growth_seconds"], 40.0)
+        self.assertTrue(actions)
+        self.assertLessEqual(float(fixed["growth_percent"]), MAX_GROWTH_PERCENT + 0.5)
+
+    def test_growth_100_percent_clamp(self) -> None:
+        """24s core expanded to 131s must shrink (production regression)."""
+        clip = pin_ai_core_window({
+            "ai_core_start": 100.0,
+            "ai_core_end": 124.0,
+            "start_seconds": 50.0,
+            "end_seconds": 181.0,
+            "virality_score": 55,
+        })
+        fixed, actions = clamp_clip_to_duration_policy(clip, media_duration=600.0)
+        dur = fixed["end_seconds"] - fixed["start_seconds"]
+        self.assertLessEqual(dur, 48.0 + 1.0)
+        self.assertTrue(any("growth_clamp" in a for a in actions))
+        self.assertIn("expansion_reason", fixed)
 
     def test_high_virality_allows_up_to_hard(self) -> None:
         clip = {

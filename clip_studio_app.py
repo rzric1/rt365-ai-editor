@@ -1713,6 +1713,8 @@ def main() -> None:
                         f"Expanded: **{exp_dur:.1f}s** (+{growth_s:.1f}s, {growth_pct:.0f}%) | "
                         f"Merge sources: **{merge_n}** | Boundary: **{boundary_label}**"
                     )
+                    if c.get("expansion_reason"):
+                        st.caption(f"Expansion reason: {c['expansion_reason']}")
                     if c.get("expansion_justification"):
                         st.caption(f"Expansion: {c['expansion_justification']}")
 

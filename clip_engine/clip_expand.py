@@ -12,9 +12,11 @@ from dataclasses import dataclass
 
 from clip_engine.clip_duration_governor import (
     HARD_CAP_SECONDS,
+    MAX_GROWTH_PERCENT,
     SOFT_CAP_SECONDS,
     clamp_clip_to_duration_policy,
-    ensure_expansion_baseline,
+    max_allowed_span_for_core,
+    pin_ai_core_window,
     refresh_expansion_diagnostics,
     scaled_context_padding,
 )
@@ -62,10 +64,18 @@ def finalize_clips_after_ai(
 
     finalized: list[dict] = []
     for raw in clips:
-        c = ensure_expansion_baseline(dict(raw))
-        core_start = float(c["original_start"])
-        core_end = float(c["original_end"])
+        c = pin_ai_core_window(dict(raw))
+        core_start = float(c["ai_core_start"])
+        core_end = float(c["ai_core_end"])
         core_dur = max(0.01, core_end - core_start)
+        effective_max = min(
+            settings.max_clip_seconds,
+            settings.hard_max_seconds or HARD_CAP_SECONDS,
+            SOFT_CAP_SECONDS if not settings.allow_exceed_max else HARD_CAP_SECONDS,
+        )
+        max_span_pre = max_allowed_span_for_core(
+            c, core_dur, effective_max, pre_virality=True,
+        )
 
         ctx_b, ctx_a = scaled_context_padding(
             core_dur, settings.context_before, settings.context_after,
@@ -82,32 +92,42 @@ def finalize_clips_after_ai(
             exp_start, pauses, direction="before", tolerance=settings.pause_snap_tolerance,
         )
         if snapped_start is not None and snapped_start < core_start:
-            exp_start = snapped_start
-            c.setdefault("expansion_note", "")
-            c["expansion_note"] = (c.get("expansion_note") or "") + f" Start snapped to pause at {snapped_start:.1f}s."
+            if core_start - snapped_start <= ctx_b + 1.0:
+                exp_start = snapped_start
+                c.setdefault("expansion_note", "")
+                c["expansion_note"] = (c.get("expansion_note") or "") + (
+                    f" Start snapped to pause at {snapped_start:.1f}s."
+                )
 
         snapped_end = find_nearest_pause_boundary(
             exp_end, pauses, direction="after", tolerance=settings.pause_snap_tolerance,
         )
         if snapped_end is not None and snapped_end > core_end:
-            exp_end = snapped_end
-            c["expansion_note"] = (c.get("expansion_note") or "") + f" End snapped to pause at {snapped_end:.1f}s."
+            if snapped_end - core_end <= ctx_a + 1.0:
+                exp_end = snapped_end
+                c["expansion_note"] = (c.get("expansion_note") or "") + (
+                    f" End snapped to pause at {snapped_end:.1f}s."
+                )
 
         duration = exp_end - exp_start
-        if duration > effective_max and not settings.allow_exceed_max:
-            exp_end = exp_start + effective_max
-            c["expansion_note"] = (c.get("expansion_note") or "") + f" Trimmed to {effective_max:.0f}s max."
+        span_cap = min(effective_max, max_span_pre)
+        if duration > span_cap and not settings.allow_exceed_max:
+            exp_end = exp_start + span_cap
+            c["expansion_note"] = (c.get("expansion_note") or "") + (
+                f" Trimmed to {span_cap:.0f}s (cap/growth {MAX_GROWTH_PERCENT:.0f}%)."
+            )
 
         duration = exp_end - exp_start
         if duration < settings.min_clip_seconds:
             needed = settings.min_clip_seconds - duration
             exp_end = min(media_duration or exp_end + needed, exp_end + needed)
-            if exp_end - exp_start > effective_max and not settings.allow_exceed_max:
-                exp_end = exp_start + effective_max
+            if exp_end - exp_start > span_cap and not settings.allow_exceed_max:
+                exp_end = exp_start + span_cap
             c["expansion_note"] = (c.get("expansion_note") or "") + " Extended toward min length."
 
         c["start_seconds"] = round(exp_start, 3)
         c["end_seconds"] = round(exp_end, 3)
+        c["expansion_reason"] = "context_expand"
         c, _ = clamp_clip_to_duration_policy(c, media_duration, pre_virality=True)
         c = refresh_expansion_diagnostics(c)
 
