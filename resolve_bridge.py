@@ -38,7 +38,7 @@ def build_timeline(resolve, payload):
     fps           = float(payload.get("fps", 30.0))
     handle_secs   = float(payload.get("handle_seconds", 2.0))
     timeline_name = payload.get("timeline_name", "AI Clips")
-    project_fps   = payload.get("project_fps", "30")
+    project_fps   = payload.get("project_fps", "29.97 DF")
     color_tag     = payload.get("color_tag", "Blue")
     log = []
 
