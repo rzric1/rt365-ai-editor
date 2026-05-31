@@ -2077,7 +2077,7 @@ def main() -> None:
                     fps_choice = st.selectbox(
                         "Timeline FPS",
                         options=fps_options,
-                        index=2,
+                        index=1,
                         format_func=lambda x: fps_labels[fps_options.index(x)],
                         key="resolve_fps_choice",
                     )
@@ -2153,18 +2153,32 @@ def main() -> None:
 
                 with st.expander("ðŸ“„ Export EDL instead (DaVinci Resolve free version)"):
                     if st.button("Generate EDL file", key="resolve_edl_generate"):
+                        st.session_state["resolve_edl_ready"] = False
+                        st.session_state.pop("resolve_edl_text", None)
                         edl_clips = _clips_for_resolve_payload(st.session_state["final_clips"])
-                        edl_text = build_edl(
-                            edl_clips,
-                            st.session_state["source_video_path"],
-                            fps=fps_choice,
-                            handle_seconds=handle_secs,
-                            title=timeline_name,
-                        )
-                        st.session_state["resolve_edl_text"] = edl_text
-                        edl_stem = Path(st.session_state["source_video_path"]).stem
-                        st.session_state["resolve_edl_filename"] = f"{edl_stem}_resolve.edl"
-                    if st.session_state.get("resolve_edl_text"):
+                        st.write(f"Generating EDL for {len(edl_clips)} clips...")
+                        try:
+                            with ThreadPoolExecutor(max_workers=1) as executor:
+                                future = executor.submit(
+                                    build_edl,
+                                    edl_clips,
+                                    st.session_state["source_video_path"],
+                                    fps=fps_choice,
+                                    handle_seconds=handle_secs,
+                                    title=timeline_name,
+                                )
+                                edl_text = future.result(timeout=5.0)
+                        except FuturesTimeoutError:
+                            st.error("EDL generation timed out after 5 seconds.")
+                        except Exception as exc:
+                            st.error(f"EDL generation failed: {exc}")
+                        else:
+                            st.session_state["resolve_edl_text"] = edl_text
+                            edl_stem = Path(st.session_state["source_video_path"]).stem
+                            st.session_state["resolve_edl_filename"] = f"{edl_stem}_resolve.edl"
+                            st.session_state["resolve_edl_ready"] = True
+                            st.success("EDL ready to download.")
+                    if st.session_state.get("resolve_edl_ready") and st.session_state.get("resolve_edl_text"):
                         st.download_button(
                             label="Download EDL file",
                             data=st.session_state["resolve_edl_text"],
