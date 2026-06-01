@@ -42,6 +42,7 @@ from clip_engine.dependency_status import get_dependency_report, render_status_m
 from clip_engine.analysis_cache import clear_all_analysis_cache
 from ui_helpers import open_folder
 from config import CLIP_STUDIO_OUTPUT_DIR
+from clip_engine.license_check import get_license_status, TRIAL_EXPORT_LIMIT
 
 try:
     from clip_engine.gpu_pipeline import get_rtx_pipeline_status
@@ -94,6 +95,15 @@ def _get_ai_diagnostics(*, refresh: bool = False):
 def render_sidebar() -> None:
     """Render the full sidebar."""
     from clip_engine.export_vertical import EXPORT_MODE_LABELS
+
+    _lic = get_license_status()
+    if _lic["trial"] and _lic["enforcement_active"]:
+        st.sidebar.warning(
+            f"⚠️ **TRIAL MODE** — {TRIAL_EXPORT_LIMIT} exports per session.\n\n"
+            "[Purchase a license](https://rt365.ai/buy) to unlock full access."
+        )
+    elif _lic["licensed"]:
+        st.sidebar.success("✅ Licensed")
 
     _run_startup_diagnostics_once()
     ensure_ffmpeg_on_path(log=False)

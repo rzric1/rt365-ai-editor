@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 NVIDIA NVENC detection and ffmpeg H.264 encode arguments (Ada / RTX 40-series friendly).
 

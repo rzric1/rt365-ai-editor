@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/transcription_utils.py
 Improved transcript segmentation utilities:

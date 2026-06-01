@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/effective_config.py
 

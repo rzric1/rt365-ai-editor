@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Tests for clip duration governor (soft 90 / hard 120 / virality exception)."""
 
 import unittest

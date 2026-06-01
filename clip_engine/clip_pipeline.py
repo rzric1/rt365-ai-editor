@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_pipeline.py
 Orchestrates multi-pass candidate generation, diversity, expansion, split, and grounding.

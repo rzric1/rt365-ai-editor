@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_diversity.py
 Timeline diversity, overlap prevention, and semantic deduplication for clip selection.

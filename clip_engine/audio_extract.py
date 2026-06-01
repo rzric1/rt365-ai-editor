@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Extract mono WAV for Whisper using ffmpeg."""
 
 from __future__ import annotations

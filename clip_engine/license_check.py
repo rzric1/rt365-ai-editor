@@ -8,6 +8,7 @@ import re
 import uuid
 
 LICENSE_ENFORCEMENT_ENABLED: bool = False
+TRIAL_EXPORT_LIMIT: int = 3
 
 _KEY_PATTERN = re.compile(r"^RT365-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 
@@ -42,4 +43,5 @@ def get_license_status() -> dict:
         "hardware_fingerprint": get_hardware_fingerprint(),
         "key_present": bool(key),
         "enforcement_enabled": LICENSE_ENFORCEMENT_ENABLED,
+        "enforcement_active": LICENSE_ENFORCEMENT_ENABLED,
     }

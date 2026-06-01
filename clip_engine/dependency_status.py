@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/dependency_status.py
 Optional dependency checker for AI editing upgrades.

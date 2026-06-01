@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/smart_crop.py
 Three export modes for vertical (9:16) output:

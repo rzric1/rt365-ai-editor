@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_duration_governor.py
 Central duration policy: target 30–90s, soft cap 90s, hard cap 120s.

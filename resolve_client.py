@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 DaVinci Resolve Studio connection helpers (read-only + markers only).
 

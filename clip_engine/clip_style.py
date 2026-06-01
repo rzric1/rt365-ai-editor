@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_style.py
 Clip style profiles: Balanced, Micro clips, Long story clips.

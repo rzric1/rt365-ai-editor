@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_metadata.py
 Ground clip titles/reasons against the final export transcript window.
