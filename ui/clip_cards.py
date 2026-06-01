@@ -538,10 +538,9 @@ def render_clip_card(c: dict, i: int, clips: list[dict], series_export_wids: dic
 
 def render_clips_section() -> None:
     """Render upload, transcribe, diarize, analyze, and clip cards (sections 1-3)."""
-    from ui.session_state import apply_long_podcast_defaults, flush_pending_long_defaults
+    from ui.session_state import apply_long_podcast_defaults
     from clip_engine.effective_config import log_widget_rerun_noop
 
-    flush_pending_long_defaults()
     log_widget_rerun_noop(st.session_state)
 
     api_key = os.environ.get(ENV_OPENAI_API_KEY, "").strip()
