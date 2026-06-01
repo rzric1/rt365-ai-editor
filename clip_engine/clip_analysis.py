@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_analysis.py
 Improved clip intelligence:
@@ -114,12 +115,19 @@ def _chunk_transcript(transcript: str, n_chunks: int) -> list[tuple[str, str]]:
     return chunks
 
 
+CHUNK_OVERLAP_SECONDS = 90.0
+
+
 def _chunk_transcript_by_time(
     segments: list[dict],
     media_duration: float,
     n_chunks: int,
 ) -> list[tuple[str, str]]:
-    """Split transcript into equal TIME regions using segment timestamps."""
+    """Split transcript into equal TIME regions with 90-second boundary overlap.
+
+    Stories that span chunk boundaries are included in both adjacent chunks so
+    GPT sees complete narratives rather than cut fragments.
+    """
     from clip_engine.transcription_utils import segments_to_prompt_transcript
 
     if not segments or media_duration <= 0:
@@ -130,8 +138,14 @@ def _chunk_transcript_by_time(
     chunks: list[tuple[str, str]] = []
 
     for i in range(n_chunks):
-        t_start = i * chunk_dur
-        t_end = (i + 1) * chunk_dur if i < n_chunks - 1 else media_duration + 0.001
+        # Extend start backwards (overlap into previous chunk) except for first chunk.
+        t_start = max(0.0, i * chunk_dur - (CHUNK_OVERLAP_SECONDS if i > 0 else 0.0))
+        # Extend end forwards (overlap into next chunk) except for last chunk.
+        t_end = (
+            min(media_duration, (i + 1) * chunk_dur + CHUNK_OVERLAP_SECONDS)
+            if i < n_chunks - 1
+            else media_duration + 0.001
+        )
         region = region_names[i] if i < len(region_names) else f"region_{i+1}"
         region_segs = [
             s for s in segments

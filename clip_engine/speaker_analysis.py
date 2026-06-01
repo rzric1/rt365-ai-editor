@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/speaker_analysis.py
 Speaker turn detection using faster-whisper word-level timestamps.

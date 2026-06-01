@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 CUDA / cuBLAS / CTranslate2 diagnostics for faster-whisper and sidebar UI.
 
@@ -37,6 +38,8 @@ CUDA_STACK_REFERENCE = (
 )
 
 _RUNTIME_PROBE_CACHE: tuple[bool, str] | None = None
+_STARTUP_DIAGNOSTICS_LOGGED: bool = False
+_CACHED_DIAGNOSTICS: "AiAccelerationDiagnostics | None" = None
 
 
 def invalidate_cuda_runtime_probe_cache() -> None:
@@ -287,10 +290,15 @@ class AiAccelerationDiagnostics:
 
 def collect_ai_acceleration_diagnostics(*, refresh_cuda_probe: bool = False) -> AiAccelerationDiagnostics:
     """Gather NVENC + CUDA + cuBLAS + ctranslate2 + optional torch. Import ffmpeg_gpu lazily."""
+    global _CACHED_DIAGNOSTICS
     from clip_engine.ffmpeg_gpu import (  # noqa: PLC0415
         ffmpeg_lists_h264_nvenc,
         nvenc_runtime_available,
     )
+
+    if not refresh_cuda_probe and _CACHED_DIAGNOSTICS is not None:
+        logger.debug("skipping duplicate diagnostics — using cached AI acceleration snapshot")
+        return _CACHED_DIAGNOSTICS
 
     if refresh_cuda_probe:
         invalidate_cuda_runtime_probe_cache()
@@ -331,7 +339,7 @@ def collect_ai_acceleration_diagnostics(*, refresh_cuda_probe: bool = False) -> 
     else:
         hint = "Local: **faster-whisper on CUDA** should work when GPU acceleration is on."
 
-    return AiAccelerationDiagnostics(
+    _CACHED_DIAGNOSTICS = AiAccelerationDiagnostics(
         nvenc_listed=listed,
         nvenc_probe_ok=probe_nvenc,
         nvidia_smi_ok=nvidia_ok,
@@ -348,10 +356,17 @@ def collect_ai_acceleration_diagnostics(*, refresh_cuda_probe: bool = False) -> 
         torch_summary=torch_line,
         transcribe_hint=hint,
     )
+    return _CACHED_DIAGNOSTICS
 
 
 def log_ai_acceleration_startup() -> None:
     """INFO lines once at process start (Streamlit / CLI)."""
+    global _STARTUP_DIAGNOSTICS_LOGGED
+    if _STARTUP_DIAGNOSTICS_LOGGED:
+        logger.debug("skipping duplicate diagnostics — startup AI acceleration already logged")
+        return
+    _STARTUP_DIAGNOSTICS_LOGGED = True
+    logger.info("diagnostics initialized — logging AI acceleration startup snapshot")
     d = collect_ai_acceleration_diagnostics(refresh_cuda_probe=True)
     logger.info("[ai-accel] NVENC listed=%s probe=%s", d.nvenc_listed, d.nvenc_probe_ok)
     logger.info("[ai-accel] nvidia-smi ok=%s cuda=%s gpu=%s", d.nvidia_smi_ok, d.driver_reported_cuda, d.nvidia_gpu_line[:120])

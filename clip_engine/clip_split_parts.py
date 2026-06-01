@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_split_parts.py
 Split long narrative clips into Part 1 / Part 2 for export.

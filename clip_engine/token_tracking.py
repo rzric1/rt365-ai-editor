@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/token_tracking.py
 Per-run token usage tracking by pipeline stage and per-clip metadata calls.

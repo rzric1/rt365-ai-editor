@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Call OpenAI (Responses API) to propose timeline markers from transcript text.
 

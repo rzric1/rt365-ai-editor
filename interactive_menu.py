@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Interactive CLI menu for RT365 AI Editor (Windows-friendly).
 

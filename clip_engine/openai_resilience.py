@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/openai_resilience.py
 OpenAI rate-limit retry/backoff, token estimation, and request guards.
@@ -15,6 +16,51 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from clip_engine.token_tracking import TokenTracker, get_tracker
+
+import os as _os
+
+# ── API key masking ──────────────────────────────────────────────
+def _mask_key(key: str) -> str:
+    """Return a safely masked API key for log output."""
+    if not key or len(key) < 8:
+        return "***"
+    return key[:7] + "..." + key[-4:]
+
+
+# ── Session token cap ────────────────────────────────────────────
+DEFAULT_SESSION_TOKEN_CAP = 80_000
+SESSION_TOKEN_CAP = int(_os.environ.get("RT365_SESSION_TOKEN_CAP", DEFAULT_SESSION_TOKEN_CAP))
+
+
+class TokenBudgetExceededError(RuntimeError):
+    """Raised when the session OpenAI token budget is exhausted."""
+
+    def __init__(self, used: int, cap: int) -> None:
+        self.used = used
+        self.cap = cap
+        super().__init__(
+            f"Session token budget exceeded: used {used:,} of {cap:,} tokens. "
+            f"Set RT365_SESSION_TOKEN_CAP in your .env to raise the limit, "
+            f"or switch to the SAFE profile to reduce usage."
+        )
+
+
+def check_token_budget() -> None:
+    """Raise TokenBudgetExceededError if the session cap has been reached."""
+    if SESSION_TOKEN_CAP <= 0:
+        return
+    try:
+        from clip_engine.token_tracking import get_tracker
+
+        tracker = get_tracker()
+        used = getattr(tracker, "total_tokens", 0) or 0
+        if used > SESSION_TOKEN_CAP:
+            raise TokenBudgetExceededError(used, SESSION_TOKEN_CAP)
+    except TokenBudgetExceededError:
+        raise
+    except Exception:
+        pass
+
 
 logger = logging.getLogger("clip_engine.openai_resilience")
 
@@ -590,6 +636,7 @@ def call_openai_chat(
     Build model-compatible params, call with rate-limit backoff, and retry on
     unsupported max_tokens / max_completion_tokens / temperature / response_format errors.
     """
+    check_token_budget()
     msg_list = append_json_rules_to_messages(messages) if (
         enforce_json_prompt or response_format is not None
     ) else list(messages)
@@ -730,11 +777,14 @@ def call_openai_chat_json(
 
         if not allow_repair or not text.strip():
             raise
+        preview = text[:240].replace("\n", "\\n")
         logger.warning(
-            "JSON parse failed stage=%s model=%s — attempting repair call: %s",
+            "JSON repair stage=%s source_model=%s fallback_used=%s reason=%s preview=%s",
             stage,
             effective_model,
+            attempted_fallback,
             parse_err,
+            preview,
         )
         from clip_engine.telemetry import record_json_repair
 
@@ -791,6 +841,7 @@ def call_openai_with_backoff(
     Call client.chat.completions.create with exponential backoff on 429.
     Records usage on success; tracks retry attempts on tracker.
     """
+    check_token_budget()
     cfg = config or RateLimitConfig()
     ctx = get_call_context()
     tracker = tracker or ctx.tracker or get_tracker()

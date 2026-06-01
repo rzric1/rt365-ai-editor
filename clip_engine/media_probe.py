@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Media duration via ffprobe (same bin dir as ffmpeg)."""
 
 from __future__ import annotations

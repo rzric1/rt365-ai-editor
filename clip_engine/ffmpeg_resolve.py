@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Resolve ffmpeg.exe on Windows (Streamlit / IDE often lack WinGet PATH).
 
@@ -19,6 +20,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _CACHED_EXE: str | None = None
+_FFMPEG_STARTUP_LOGGED: bool = False
 _CACHED_VERSION_LINE: str | None = None
 _VERSION_LINE_EXE: str | None = None  # exe path _CACHED_VERSION_LINE belongs to
 
@@ -139,13 +141,17 @@ def ensure_ffmpeg_on_path(*, log: bool = False) -> str | None:
         _CACHED_VERSION_LINE = None
         _VERSION_LINE_EXE = None
 
+    global _FFMPEG_STARTUP_LOGGED
     if _CACHED_EXE and Path(_CACHED_EXE).is_file():
         _ensure_path_has_ffmpeg_bin(str(Path(_CACHED_EXE).parent))
         from config import ENV_FFMPEG_BINARY  # noqa: PLC0415
 
         os.environ[ENV_FFMPEG_BINARY] = _CACHED_EXE
-        if log:
+        if log and not _FFMPEG_STARTUP_LOGGED:
+            _FFMPEG_STARTUP_LOGGED = True
             logger.info("[ffmpeg] using cached: %s", _CACHED_EXE)
+        elif log:
+            logger.debug("skipping duplicate diagnostics — ffmpeg startup already logged")
             vl = _ffmpeg_version_line(_CACHED_EXE)
             if vl:
                 logger.info("[ffmpeg] %s", vl)
@@ -178,16 +184,23 @@ def ensure_ffmpeg_on_path(*, log: bool = False) -> str | None:
         pass
 
     if log:
-        logger.info("[ffmpeg] resolved: %s", exe)
-        vl = _ffmpeg_version_line(exe)
-        if vl:
-            logger.info("[ffmpeg] %s", vl)
-        logger.info(
-            "[ffmpeg] subprocess.run(-version): %s",
-            "ok" if vl else "failed",
-        )
-        head = os.environ.get("PATH", "")[:240]
-        logger.info("[ffmpeg] PATH visibility (first 240 chars): %s", head + ("…" if len(os.environ.get("PATH", "")) > 240 else ""))
+        if not _FFMPEG_STARTUP_LOGGED:
+            _FFMPEG_STARTUP_LOGGED = True
+            logger.info("[ffmpeg] resolved: %s", exe)
+            vl = _ffmpeg_version_line(exe)
+            if vl:
+                logger.info("[ffmpeg] %s", vl)
+            logger.info(
+                "[ffmpeg] subprocess.run(-version): %s",
+                "ok" if vl else "failed",
+            )
+            head = os.environ.get("PATH", "")[:240]
+            logger.info(
+                "[ffmpeg] PATH visibility (first 240 chars): %s",
+                head + ("…" if len(os.environ.get("PATH", "")) > 240 else ""),
+            )
+        else:
+            logger.debug("skipping duplicate diagnostics — ffmpeg startup already logged")
 
     return exe
 

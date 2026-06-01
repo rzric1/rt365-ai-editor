@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/captions.py
 Modern burned-in caption styles + SRT/ASS sidecar file generation.

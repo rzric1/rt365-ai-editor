@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Load podcast / reaction transcripts for AI analysis.
 

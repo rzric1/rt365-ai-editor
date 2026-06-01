@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """AI clip studio: transcribe, analyze, export vertical clips."""
 
 from clip_engine.clip_analysis import suggest_clips_from_transcript

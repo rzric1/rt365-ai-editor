@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_diversity.py
 Timeline diversity, overlap prevention, and semantic deduplication for clip selection.
@@ -19,7 +20,7 @@ from typing import NamedTuple
 
 logger = logging.getLogger("clip_engine.clip_diversity")
 
-MIN_HOOK_SCORE = 35
+MIN_HOOK_SCORE = 25
 MIN_CLIPS_FLOOR = 5
 NEARBY_CONTENT_START_GAP = 60.0
 

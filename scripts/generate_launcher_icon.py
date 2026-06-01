@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Generate assets/ai_clip_studio.ico for Windows shortcuts (requires Pillow)."""
 
 from __future__ import annotations

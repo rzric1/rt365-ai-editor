@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/semantic_ranking.py
 GPU-accelerated semantic embeddings for transcript ranking and dedupe.
@@ -5,6 +6,7 @@ GPU-accelerated semantic embeddings for transcript ranking and dedupe.
 
 from __future__ import annotations
 
+import os
 import logging
 from typing import Any
 
@@ -18,7 +20,13 @@ _MODEL_NAME = "all-MiniLM-L6-v2"
 _EMBEDDING_DIM = 384
 
 
+def force_cpu_embeddings() -> bool:
+    return os.environ.get("FORCE_CPU_EMBEDDINGS", "").strip().lower() in ("1", "true", "yes")
+
+
 def cuda_available() -> bool:
+    if force_cpu_embeddings():
+        return False
     try:
         import torch
 
@@ -28,6 +36,8 @@ def cuda_available() -> bool:
 
 
 def get_embedding_device() -> str:
+    if force_cpu_embeddings():
+        return "cpu"
     return "cuda" if cuda_available() else "cpu"
 
 
@@ -43,7 +53,11 @@ def get_gpu_device_name() -> str:
 
 
 def embeddings_available() -> bool:
+    if force_cpu_embeddings():
+        logger.info("[GPU PREFILTER] FORCE_CPU_EMBEDDINGS=1; GPU embeddings disabled")
+        return False
     try:
+        # Broad guard to catch transitive import failures (torchcodec/FFmpeg/etc).
         import sentence_transformers  # noqa: F401
 
         return True
@@ -55,18 +69,28 @@ def embeddings_available() -> bool:
 
 def _load_model():
     global _MODEL, _MODEL_DEVICE
+    if force_cpu_embeddings():
+        raise RuntimeError("FORCE_CPU_EMBEDDINGS=1 disables SentenceTransformer GPU model load")
     if _MODEL is not None:
         return _MODEL
     try:
+        # Keep this import local and fully guarded; some systems can trigger
+        # transitive native import problems when sentence_transformers initializes.
         from sentence_transformers import SentenceTransformer
-    except ImportError as exc:
+    except Exception as exc:
         raise RuntimeError(
-            "sentence-transformers not installed. "
-            "Install: pip install -r requirements-ai-upgrades.txt"
+            "sentence-transformers unavailable or failed during import. "
+            "Install/repair: pip install -r requirements-ai-upgrades.txt"
         ) from exc
 
-    _MODEL_DEVICE = get_embedding_device()
-    _MODEL = SentenceTransformer(_MODEL_NAME, device=_MODEL_DEVICE)
+    try:
+        _MODEL_DEVICE = get_embedding_device()
+        _MODEL = SentenceTransformer(_MODEL_NAME, device=_MODEL_DEVICE)
+    except Exception as exc:
+        raise RuntimeError(
+            f"SentenceTransformer model init failed (device={_MODEL_DEVICE}): {exc}"
+        ) from exc
+
     logger.info(
         "[GPU] Sentence-transformers using CUDA: %s | Device: %s | Model: %s",
         _MODEL_DEVICE == "cuda",
@@ -80,16 +104,19 @@ def generate_embeddings(texts: list[str], *, batch_size: int = 64) -> np.ndarray
     """Encode texts to normalized embedding matrix (n, dim)."""
     if not texts:
         return np.zeros((0, _EMBEDDING_DIM), dtype=np.float32)
-    model = _load_model()
-    clean = [t.strip() or "(empty)" for t in texts]
-    emb = model.encode(
-        clean,
-        batch_size=batch_size,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-    return np.asarray(emb, dtype=np.float32)
+    try:
+        model = _load_model()
+        clean = [t.strip() or "(empty)" for t in texts]
+        emb = model.encode(
+            clean,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return np.asarray(emb, dtype=np.float32)
+    except Exception as exc:
+        raise RuntimeError(f"Embedding encode failed: {exc}") from exc
 
 
 def semantic_similarity(a: np.ndarray, b: np.ndarray) -> float:

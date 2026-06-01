@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_metadata.py
 Ground clip titles/reasons against the final export transcript window.
@@ -19,6 +20,7 @@ from clip_engine.openai_resilience import (
     get_call_context,
     truncate_text_safe,
 )
+from clip_engine.clip_scoring import assess_hook_quality, repair_hook_title_local
 from clip_engine.effective_config import ResolvedModels, resolve_models_from_call_context
 
 logger = logging.getLogger("clip_engine.clip_metadata")
@@ -203,7 +205,15 @@ def ground_clip_metadata_against_window(
         )
         if regen:
             if regen.get("hook_title"):
-                c["hook_title"] = str(regen["hook_title"]).strip()
+                new_title = str(regen["hook_title"]).strip()
+                hq, hw = assess_hook_quality(new_title)
+                if hq < 55:
+                    new_title = repair_hook_title_local(new_title, window_text)
+                    c["hook_title_repaired"] = True
+                c["hook_title"] = new_title
+                c["hook_quality_score"] = assess_hook_quality(new_title)[0]
+                if hw:
+                    c["hook_warning"] = hw
             if regen.get("selection_reason"):
                 c["selection_reason"] = str(regen["selection_reason"]).strip()
             if regen.get("ai_context_reason"):

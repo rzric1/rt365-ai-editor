@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Map AI marker types to Resolve marker colors and call Timeline.AddMarker only.
 

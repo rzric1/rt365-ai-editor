@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 patch_token_warning.py
 Run from C:\\dev\\rt365-ai-editor with:
