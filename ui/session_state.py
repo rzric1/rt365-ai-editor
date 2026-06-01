@@ -90,25 +90,45 @@ def init_session_state() -> None:
 
 
 def flush_pending_long_defaults() -> None:
-    """Apply long-podcast widget defaults once, before sidebar widgets render."""
-    if not st.session_state.pop("cs_pending_long_defaults", False):
+    """Apply long-video defaults to session state — must be called BEFORE widgets are rendered."""
+    if not st.session_state.get("cs_pending_long_defaults"):
         return
     if st.session_state.get("cs_long_defaults_applied"):
+        st.session_state["cs_pending_long_defaults"] = False
         return
+
     dur = float(st.session_state.get("cs_media_duration") or 0)
     if dur < 30 * 60:
+        st.session_state["cs_pending_long_defaults"] = False
         return
-    st.session_state.cs_discovery_mode = True
-    st.session_state.cs_min_clip_seconds = 15
-    st.session_state.cs_max_clip_seconds = 120
-    st.session_state.cs_min_gap_seconds = 35
-    st.session_state.cs_similarity_threshold = 85
+
+    long_video_defaults = {
+        "cs_discovery_mode": True,
+        "cs_min_clip_seconds": 15,
+        "cs_max_clip_seconds": 120,
+        "cs_context_before": 4,
+        "cs_context_after": 5,
+        "cs_min_gap_seconds": 35,
+        "cs_similarity_threshold": 85,
+    }
+
+    for key, value in long_video_defaults.items():
+        try:
+            st.session_state[key] = value
+        except Exception:
+            pass  # Widget already bound — skip silently
+
     apply_profile_non_widget_keys(
         st.session_state, profile_from_ui_label("SAFE (Recommended)")
     )
     if str(st.session_state.get("cs_clip_style", "")) == "Balanced":
-        st.session_state.cs_clip_style = "Micro clips"
+        try:
+            st.session_state.cs_clip_style = "Micro clips"
+        except Exception:
+            pass
+
     st.session_state.cs_long_defaults_applied = True
+    st.session_state["cs_pending_long_defaults"] = False
 
 
 def apply_long_podcast_defaults() -> None:

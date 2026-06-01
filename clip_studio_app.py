@@ -16,7 +16,7 @@ import streamlit as st
 from config import LOGS_DIR
 from clip_engine.telemetry import configure_rotating_logs, classify_exception, get_session_telemetry
 
-from ui.session_state import init_session_state
+from ui.session_state import init_session_state, flush_pending_long_defaults
 from ui.sidebar import render_sidebar
 from ui.clip_cards import render_clips_section
 from ui.export_panel import render_export_panel
@@ -36,6 +36,7 @@ def main() -> None:
         logging.basicConfig(level=logging.INFO)
         configure_rotating_logs(LOGS_DIR)
         init_session_state()
+        flush_pending_long_defaults()
         render_sidebar()
         render_clips_section()
         render_export_panel()

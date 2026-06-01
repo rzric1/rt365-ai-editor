@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-﻿from __future__ import annotations
+from __future__ import annotations
 import logging
 import re
 import subprocess
