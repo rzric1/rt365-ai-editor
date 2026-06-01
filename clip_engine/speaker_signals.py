@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/speaker_signals.py
 Speaker energy, interruption, and debate detection.

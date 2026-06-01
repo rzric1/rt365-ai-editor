@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_boundaries.py
 Complete-thought boundary detection and repair for clip windows.

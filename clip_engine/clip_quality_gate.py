@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_quality_gate.py
 Validate and repair clips before they reach the UI; never crash the pipeline.

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Shared helpers for the RT365 AI Edit Companion (Streamlit) and other UIs.
 

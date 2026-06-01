@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/local_candidate_discovery.py
 Fast local pre-candidate extraction (no OpenAI).

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_discovery.py
 Discovery mode: relaxed validation, candidate rescue, and local transcript-window fallbacks.

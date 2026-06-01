@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 RT365 AI Editor — safe AI-assisted markers for DaVinci Resolve Studio (v1).
 

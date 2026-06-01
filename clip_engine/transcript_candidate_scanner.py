@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/transcript_candidate_scanner.py
 

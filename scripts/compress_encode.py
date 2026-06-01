@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 CLI: compress a video for AI clip analysis (1280 wide, H.264 + AAC).
 Uses NVENC when available, else libx264. Invoked from compress_video.bat.

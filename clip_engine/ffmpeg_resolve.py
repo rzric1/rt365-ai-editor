@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Resolve ffmpeg.exe on Windows (Streamlit / IDE often lack WinGet PATH).
 

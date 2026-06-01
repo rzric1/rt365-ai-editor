@@ -1,17 +1,65 @@
-﻿from __future__ import annotations
-import json, os, sys, re
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import json
+import os
+import platform
+import re
+import sys
 
-def setup_resolve_env():
-    programdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-    api = os.path.join(programdata, "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting")
-    os.environ.setdefault("RESOLVE_SCRIPT_API", api)
-    os.environ.setdefault(
-        "RESOLVE_SCRIPT_LIB",
-        r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll",
-    )
-    modules = r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules"
-    if modules not in sys.path:
-        sys.path.insert(0, modules)
+
+def _get_resolve_paths() -> dict:
+    """Return platform-appropriate DaVinci Resolve scripting paths."""
+    system = platform.system()
+    if system == "Windows":
+        programdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        base = os.path.join(
+            programdata,
+            "Blackmagic Design",
+            "DaVinci Resolve",
+            "Support",
+            "Developer",
+            "Scripting",
+        )
+        return {
+            "api": base,
+            "lib": os.path.join(
+                program_files,
+                "Blackmagic Design",
+                "DaVinci Resolve",
+                "fusionscript.dll",
+            ),
+            "modules": os.path.join(base, "Modules"),
+        }
+    elif system == "Darwin":
+        base = (
+            "/Library/Application Support/Blackmagic Design"
+            "/DaVinci Resolve/Developer/Scripting"
+        )
+        return {
+            "api": base,
+            "lib": (
+                "/Applications/DaVinci Resolve/DaVinci Resolve.app"
+                "/Contents/Libraries/Fusion/fusionscript.so"
+            ),
+            "modules": os.path.join(base, "Modules"),
+        }
+    else:
+        base = "/opt/resolve/Developer/Scripting"
+        return {
+            "api": base,
+            "lib": "/opt/resolve/libs/Fusion/fusionscript.so",
+            "modules": os.path.join(base, "Modules"),
+        }
+
+
+def setup_resolve_env() -> None:
+    """Configure environment variables for DaVinci Resolve scripting."""
+    paths = _get_resolve_paths()
+    os.environ.setdefault("RESOLVE_SCRIPT_API", paths["api"])
+    os.environ.setdefault("RESOLVE_SCRIPT_LIB", paths["lib"])
+    if paths["modules"] not in sys.path:
+        sys.path.insert(0, paths["modules"])
 
 def seconds_to_frames(seconds, fps):
     return int(round(seconds * fps))
@@ -38,7 +86,7 @@ def build_timeline(resolve, payload):
     fps           = float(payload.get("fps", 30.0))
     handle_secs   = float(payload.get("handle_seconds", 2.0))
     timeline_name = payload.get("timeline_name", "AI Clips")
-    project_fps   = payload.get("project_fps", "30")
+    project_fps   = payload.get("project_fps", "29.97 DF")
     color_tag     = payload.get("color_tag", "Blue")
     log = []
 

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 RT365 AI Edit Companion — local Streamlit UI for the RT365 AI Editor workflow.
 

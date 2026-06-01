@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Transcription: prefer faster-whisper on CUDA when enabled; else OpenAI Whisper API."""
 
 from __future__ import annotations

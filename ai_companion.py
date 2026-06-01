@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 RT365 AI Edit Companion — intent routing and OpenAI structured responses.
 

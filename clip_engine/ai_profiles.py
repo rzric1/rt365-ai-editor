@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 
 clip_engine/ai_profiles.py
@@ -148,7 +149,7 @@ _PROFILES: dict[str, AIProfile] = {
 
         fast_model="gpt-4o-mini",
 
-        quality_model="gpt-5-mini",
+        quality_model="gpt-4o",
 
         json_fallback_model="gpt-4o-mini",
 
@@ -184,9 +185,9 @@ _PROFILES: dict[str, AIProfile] = {
 
         name=PROFILE_MAX_QUALITY,
 
-        fast_model="gpt-5-mini",
+        fast_model="gpt-4o",
 
-        quality_model="gpt-5-mini",
+        quality_model="gpt-4o",
 
         json_fallback_model="gpt-4o-mini",
 
@@ -291,5 +292,30 @@ def get_profile_help_text() -> str:
         "**MAX QUALITY** = highest reasoning quality but may retry more often."
 
     )
+
+
+VALID_OPENAI_MODELS = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-4",
+    "gpt-3.5-turbo",
+    "o1",
+    "o1-mini",
+    "o3-mini",
+}
+
+
+def validate_profile_models(profile) -> list:
+    """Return warning strings for any unrecognised model names in a profile."""
+    warnings = []
+    for attr in ("fast_model", "quality_model", "json_fallback_model"):
+        m = getattr(profile, attr, None)
+        if m and m not in VALID_OPENAI_MODELS:
+            warnings.append(
+                f"Profile '{getattr(profile, 'name', attr)}': "
+                f"unrecognised model '{m}' in field '{attr}'"
+            )
+    return warnings
 
 

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_split.py
 Split overly long clips into sharper micro-clips using transcript analysis.

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 CUDA / cuBLAS / CTranslate2 diagnostics for faster-whisper and sidebar UI.
 

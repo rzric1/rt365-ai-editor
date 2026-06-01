@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/semantic_ranking.py
 GPU-accelerated semantic embeddings for transcript ranking and dedupe.

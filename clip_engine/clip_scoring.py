@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_scoring.py
 Transparent virality scoring and hook title quality assessment.

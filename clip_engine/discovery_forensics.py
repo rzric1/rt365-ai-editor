@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/discovery_forensics.py
 Stage-by-stage discovery pipeline forensics (input/output/rejections).

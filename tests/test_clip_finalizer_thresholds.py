@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Targeted tests for clip finalizer rejection thresholds."""
 
 from __future__ import annotations

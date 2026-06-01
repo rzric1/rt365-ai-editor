@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_signals.py
 Local heuristic signal scoring for clip ranking boosts.

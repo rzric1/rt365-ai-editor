@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/analysis_cache.py
 Analysis result cache and partial-progress resume for clip pipeline.

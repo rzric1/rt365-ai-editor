@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/upload_manifest.py
 Deduplicate browser uploads via content fingerprint + manifest.

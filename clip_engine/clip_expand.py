@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 clip_engine/clip_expand.py
 Clip expansion/finalization with pause-aware boundary adjustment.
