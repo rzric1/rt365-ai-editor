@@ -13,6 +13,10 @@ load_dotenv(_ROOT / ".env")
 import logging
 import streamlit as st
 
+from clip_engine.startup_trace import register_shutdown_trace, trace
+
+trace("app imported")
+
 from config import LOGS_DIR
 from clip_engine.telemetry import configure_rotating_logs, get_session_telemetry
 from clip_engine.stability import (
@@ -33,6 +37,16 @@ from ui.resolve_panel import render_resolve_panel
 logger = logging.getLogger("clip_studio")
 _STARTUP_DONE = False
 _ENV_GATE_DONE = False
+_SHUTDOWN_REGISTERED = False
+_FIRST_RENDER_LOGGED = False
+
+
+def _register_shutdown_once() -> None:
+    global _SHUTDOWN_REGISTERED
+    if _SHUTDOWN_REGISTERED:
+        return
+    _SHUTDOWN_REGISTERED = True
+    register_shutdown_trace()
 
 
 def _ensure_environment_gate() -> None:
@@ -40,6 +54,7 @@ def _ensure_environment_gate() -> None:
     global _ENV_GATE_DONE
     if _ENV_GATE_DONE:
         return
+    trace("environment check started")
     from clip_engine.environment_check import (
         format_streamlit_error,
         validate_startup_environment,
@@ -50,7 +65,9 @@ def _ensure_environment_gate() -> None:
     write_environment_check_log(status)
     _ENV_GATE_DONE = True
     if status.ok:
+        trace("environment check passed")
         return
+    trace("environment check FAILED")
     st.error(format_streamlit_error(status))
     with st.expander("Environment details", expanded=True):
         for c in status.checks:
@@ -64,8 +81,10 @@ def _ensure_app_lock() -> None:
 
     ok, msg = acquire_app_lock()
     if not ok:
+        trace(f"lock acquire FAILED: {msg[:120]}")
         st.error(msg)
         st.stop()
+    trace("lock acquired")
 
 
 def _ensure_startup() -> None:
@@ -94,7 +113,16 @@ def _ensure_startup() -> None:
         logger.warning("Startup diagnostics failed: %s", exc)
 
 
+def _log_first_render() -> None:
+    global _FIRST_RENDER_LOGGED
+    if _FIRST_RENDER_LOGGED:
+        return
+    _FIRST_RENDER_LOGGED = True
+    trace("app rendered first frame")
+
+
 def main() -> None:
+    _register_shutdown_once()
     st.set_page_config(
         page_title="RT365 AI Clip Studio",
         page_icon="🎬",
@@ -105,14 +133,15 @@ def main() -> None:
         logging.basicConfig(level=logging.INFO)
         configure_rotating_logs(LOGS_DIR)
         _ensure_environment_gate()
-        _ensure_app_lock()
         _ensure_startup()
+        _ensure_app_lock()
         init_session_state()
         flush_pending_long_defaults()
         render_sidebar()
         render_clips_section()
         render_export_panel()
         render_resolve_panel()
+        _log_first_render()
     except Exception as e:
         logger.exception("Clip Studio UI failed")
         try:

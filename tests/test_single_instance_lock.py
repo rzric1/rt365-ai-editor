@@ -37,14 +37,29 @@ def test_acquire_and_release(tmp_path, monkeypatch):
 def test_preflight_message_when_lock_held(tmp_path, monkeypatch):
     from clip_engine import app_lock
 
+    other_pid = os.getpid() + 99999
     monkeypatch.setattr(app_lock, "LOGS_DIR", tmp_path)
     monkeypatch.setattr(app_lock, "LOCK_PATH", tmp_path / "rt365_app.lock")
     (tmp_path / "rt365_app.lock").write_text(
-        json.dumps({"pid": os.getpid()}),
+        json.dumps({"pid": other_pid}),
         encoding="utf-8",
     )
     monkeypatch.setattr(app_lock, "_is_clip_studio_process", lambda _pid: True)
-    monkeypatch.setattr(app_lock, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(app_lock, "_pid_alive", lambda pid: pid == other_pid)
+    monkeypatch.setattr(app_lock, "_another_instance_listening", lambda _port=8501: (False, ""))
     ok, msg = app_lock.preflight_single_instance()
     assert not ok
     assert "already running" in msg.lower()
+
+
+def test_acquire_succeeds_when_port_is_self_listener(tmp_path, monkeypatch):
+    """Streamlit process: port listen must not block acquire."""
+    from clip_engine import app_lock
+
+    monkeypatch.setattr(app_lock, "LOGS_DIR", tmp_path)
+    monkeypatch.setattr(app_lock, "LOCK_PATH", tmp_path / "rt365_app.lock")
+    monkeypatch.setattr(app_lock, "_another_instance_listening", lambda _port=8501: (False, ""))
+    app_lock._lock_held = False
+    ok, msg = app_lock.acquire_app_lock()
+    assert ok, msg
+    app_lock.release_app_lock()

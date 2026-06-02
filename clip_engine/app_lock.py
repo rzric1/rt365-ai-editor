@@ -43,7 +43,9 @@ def _pid_alive(pid: int) -> bool:
             import ctypes
 
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
             if handle:
                 ctypes.windll.kernel32.CloseHandle(handle)
                 return True
@@ -64,26 +66,71 @@ def _is_clip_studio_process(pid: int) -> bool:
         p = psutil.Process(pid)
         cmd = " ".join(p.cmdline()).lower()
         return "clip_studio_app" in cmd or (
-            "streamlit" in cmd and "8501" in cmd
+            "streamlit" in cmd and ("8501" in cmd or "clip_studio" in cmd)
         )
     except Exception:
         return False
 
 
-def _port_in_use(port: int = DEFAULT_PORT) -> bool:
+def _port_listener_pid(port: int = DEFAULT_PORT) -> int | None:
+    """
+    Return PID of process LISTENING on 127.0.0.1:port, or None if not listening.
+    Ignores TIME_WAIT / CLOSE_WAIT (not LISTEN).
+    """
+    try:
+        import psutil
+
+        for conn in psutil.net_connections(kind="inet"):
+            if not conn.laddr:
+                continue
+            if getattr(conn.laddr, "port", None) != port:
+                continue
+            if conn.status != psutil.CONN_LISTEN:
+                continue
+            if conn.pid:
+                return int(conn.pid)
+        return None
+    except (ImportError, AttributeError, PermissionError):
+        pass
+
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+        return None
+    except OSError:
+        return -1
+
+
+def _another_instance_listening(port: int = DEFAULT_PORT) -> tuple[bool, str]:
+    """True if a different live process is listening on port (launcher preflight only)."""
+    listener = _port_listener_pid(port)
+    if listener is None:
+        return False, ""
+    if listener == os.getpid():
+        return False, ""
+    if listener > 0 and _pid_alive(listener) and _is_clip_studio_process(listener):
+        return (
+            True,
+            f"RT365 AI Clip Studio is already running (port {port} held by PID {listener}).",
+        )
+    if listener == -1:
+        return (
+            True,
+            f"Port {port} is in use. Close the other Streamlit instance and retry.",
+        )
+    return False, ""
 
 
 def remove_stale_lock() -> bool:
-    """Remove lock file if PID is dead. Returns True if removed or no lock."""
+    """Remove lock file if PID is dead or not Clip Studio. Returns True if removed or no lock."""
     data = _read_lock()
     if data is None:
         return True
     pid = int(data.get("pid", 0))
+    if pid == os.getpid():
+        return True
     if _pid_alive(pid) and _is_clip_studio_process(pid):
         return False
     try:
@@ -97,13 +144,15 @@ def remove_stale_lock() -> bool:
 def preflight_single_instance(*, port: int = DEFAULT_PORT) -> tuple[bool, str]:
     """
     Launcher check before starting Streamlit. Does not acquire the lock.
-    Returns (ok, message).
+    Uses LISTEN-only port detection (TIME_WAIT does not block).
     """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    remove_stale_lock()
+
     data = _read_lock()
     if data:
         pid = int(data.get("pid", 0))
-        if _pid_alive(pid) and _is_clip_studio_process(pid):
+        if pid != os.getpid() and _pid_alive(pid) and _is_clip_studio_process(pid):
             return (
                 False,
                 "RT365 AI Clip Studio is already running. "
@@ -111,24 +160,31 @@ def preflight_single_instance(*, port: int = DEFAULT_PORT) -> tuple[bool, str]:
             )
         remove_stale_lock()
 
-    if _port_in_use(port):
-        return (
-            False,
-            f"RT365 AI Clip Studio is already running (port {port} in use). "
-            "Close the existing instance first.",
-        )
+    blocked, msg = _another_instance_listening(port)
+    if blocked:
+        return False, msg
     return True, ""
 
 
 def acquire_app_lock(*, port: int = DEFAULT_PORT) -> tuple[bool, str]:
-    """Acquire lock for current process (call once from Streamlit startup)."""
+    """
+    Acquire lock for the Streamlit server process.
+    Does NOT check port 8501 — the server already owns that port when this runs.
+    """
     global _lock_held
     if _lock_held:
         return True, ""
 
-    ok, msg = preflight_single_instance(port=port)
-    if not ok:
-        return False, msg
+    remove_stale_lock()
+    data = _read_lock()
+    if data:
+        pid = int(data.get("pid", 0))
+        if pid != os.getpid() and _pid_alive(pid) and _is_clip_studio_process(pid):
+            return (
+                False,
+                "RT365 AI Clip Studio is already running. "
+                f"(lock held by PID {pid}).",
+            )
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {

@@ -2,9 +2,6 @@
 <#
 .SYNOPSIS
   AI Clip Studio — Streamlit launcher (Python 3.11 .venv311 only).
-
-  Double-click or run:
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\dev\rt365-ai-editor\launch_ai_clip_studio.ps1"
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -20,24 +17,41 @@ Set-Location -LiteralPath $ProjectRoot
 $LogsDir = Join-Path $ProjectRoot 'logs'
 New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
 
+$venvPath = Join-Path $ProjectRoot '.venv311'
+$venvPython = Join-Path $venvPath 'Scripts\python.exe'
+$venvStreamlit = Join-Path $venvPath 'Scripts\streamlit.exe'
+$traceScript = Join-Path $ProjectRoot 'scripts\launcher_trace_event.py'
+
+function Invoke-LauncherTrace {
+    param([string]$Message)
+    if ((Test-Path -LiteralPath $venvPython) -and (Test-Path -LiteralPath $traceScript)) {
+        try {
+            & $venvPython $traceScript $Message 2>$null | Out-Null
+        }
+        catch {
+            # Trace must never block launch
+        }
+    }
+}
+
 function Write-EnvLog {
     param([string]$Line)
     Add-Content -LiteralPath (Join-Path $LogsDir 'environment_check.txt') -Value $Line -Encoding UTF8
 }
+
+Invoke-LauncherTrace 'launcher started'
 
 Write-Host ''
 Write-Host '=== RT365 AI Clip Studio ===' -ForegroundColor Cyan
 Write-Host "Directory: $ProjectRoot"
 Write-Host ''
 
-# Block Python 3.14 as default launcher target (Reliability Monitor crash correlation)
 $py314Out = & py -3.14 --version 2>$null
 if ($LASTEXITCODE -eq 0) {
     Write-Host "WARNING: Python 3.14 is installed ($py314Out). Clip Studio will NOT use it." -ForegroundColor Yellow
     Write-EnvLog 'WARN: Python 3.14 detected on system - blocked for Clip Studio'
 }
 
-# Require Python 3.11 for venv creation
 try {
     $py311 = & py -3.11 --version 2>&1
     if ($LASTEXITCODE -ne 0) { throw 'py -3.11 failed' }
@@ -45,32 +59,21 @@ try {
     Write-EnvLog "OK: $py311"
 }
 catch {
-    Write-Host 'ERROR: Python 3.11 required. Install from https://www.python.org/downloads/release/python-3119/' -ForegroundColor Red
-    Write-EnvLog 'FAIL: Python 3.11 not found'
+    Write-Host 'ERROR: Python 3.11 required.' -ForegroundColor Red
     Read-Host 'Press Enter to exit'
     exit 1
 }
 
-$venvPath = Join-Path $ProjectRoot '.venv311'
-$venvPython = Join-Path $venvPath 'Scripts\python.exe'
-$venvStreamlit = Join-Path $venvPath 'Scripts\streamlit.exe'
-
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Host 'Creating .venv311 ...' -ForegroundColor Cyan
     & py -3.11 -m venv $venvPath
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host 'ERROR: venv creation failed' -ForegroundColor Red
-        exit 1
-    }
     & $venvPython -m pip install --upgrade pip
     & $venvPython -m pip install -r (Join-Path $ProjectRoot 'requirements.txt')
     $aiUp = Join-Path $ProjectRoot 'requirements-ai-upgrades.txt'
     if (Test-Path -LiteralPath $aiUp) {
         & $venvPython -m pip install -r $aiUp
     }
-    Write-Host 'Installing CUDA PyTorch (cu121) ...' -ForegroundColor Cyan
     & $venvPython -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    Write-EnvLog 'OK: created .venv311 and installed packages'
 }
 
 if (-not (Test-Path -LiteralPath $venvStreamlit)) {
@@ -79,13 +82,11 @@ if (-not (Test-Path -LiteralPath $venvStreamlit)) {
     exit 1
 }
 
-# CUDA / FFmpeg session PATH
 $env:CUDA_VISIBLE_DEVICES = '0'
 $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
 $Cuda129Bin = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin'
 if (Test-Path -LiteralPath $Cuda129Bin) {
     $env:PATH = "$Cuda129Bin;$env:PATH"
-    Write-Host 'PATH: prepended CUDA 12.9 bin' -ForegroundColor Green
 }
 
 $ffmpegBat = Join-Path $ProjectRoot 'scripts\set_ffmpeg_path_for_session.bat'
@@ -93,50 +94,50 @@ if (Test-Path -LiteralPath $ffmpegBat) {
     cmd.exe /c "`"$ffmpegBat`""
 }
 
-# Environment validation (Python via check_environment.py — no inline Python in this .ps1)
+Invoke-LauncherTrace 'environment check started'
 Write-Host 'Running environment check ...' -ForegroundColor DarkGray
-$envCheckScript = Join-Path $ProjectRoot 'check_environment.py'
-& $venvPython $envCheckScript
+& $venvPython (Join-Path $ProjectRoot 'check_environment.py')
 if ($LASTEXITCODE -ne 0) {
-    Write-Host 'ERROR: environment check failed. See logs/environment_check.txt' -ForegroundColor Red
+    Invoke-LauncherTrace 'environment check FAILED'
     Read-Host 'Press Enter to exit'
     exit 1
 }
+Invoke-LauncherTrace 'environment check passed'
 
-# Single-instance preflight (one-line Python -c — no here-strings)
 $preflightCode = 'from clip_engine.app_lock import preflight_single_instance; import sys; ok, msg = preflight_single_instance(); print(msg); sys.exit(0 if ok else 2)'
 $preflightOut = & $venvPython -c $preflightCode 2>&1
 if ($LASTEXITCODE -ne 0) {
+    Invoke-LauncherTrace 'preflight lock check FAILED'
     Write-Host $preflightOut -ForegroundColor Red
     Read-Host 'Press Enter to exit'
     exit 2
 }
+Invoke-LauncherTrace 'preflight lock check passed'
 
 $scScript = Join-Path $ProjectRoot 'scripts\create_desktop_shortcuts.ps1'
 if (Test-Path -LiteralPath $scScript) {
     & $scScript -ProjectRoot $ProjectRoot
 }
 
+Invoke-LauncherTrace 'streamlit command about to start'
 Write-Host ''
 Write-Host 'Opening http://localhost:8501/ ...' -ForegroundColor DarkGray
 Start-Process cmd.exe -ArgumentList '/c', 'timeout /t 2 /nobreak >nul && start http://localhost:8501/' -WindowStyle Hidden
 
 Write-Host ''
-Write-Host '--- Streamlit (.venv311 Python 3.11) Ctrl+C to stop ---' -ForegroundColor Cyan
+Write-Host '--- Streamlit (.venv311) — Ctrl+C to stop ---' -ForegroundColor Cyan
 Write-Host ''
+
 Set-Location -LiteralPath $ProjectRoot
-try {
-    & $venvStreamlit run clip_studio_app.py --server.headless true --server.port 8501
-}
-finally {
-    $releaseCode = 'from clip_engine.app_lock import release_app_lock; release_app_lock()'
-    & $venvPython -c $releaseCode 2>$null
-}
+
+# Run Streamlit in foreground; do NOT release lock until process exits (finally after streamlit only)
+& $venvStreamlit run clip_studio_app.py --server.headless true --server.port 8501
 $code = $LASTEXITCODE
-if ($code -eq 0) {
-    Write-Host "`nStreamlit exited with code $code" -ForegroundColor Green
-}
-else {
-    Write-Host "`nStreamlit exited with code $code" -ForegroundColor Red
-}
+
+Invoke-LauncherTrace "streamlit exited code=$code"
+Write-Host "`nStreamlit exited with code $code" -ForegroundColor $(if ($code -eq 0) { 'Green' } else { 'Red' })
+
+$releaseCode = 'from clip_engine.app_lock import release_app_lock; from clip_engine.startup_trace import trace; trace("lock released by launcher"); release_app_lock()'
+& $venvPython -c $releaseCode 2>$null
+
 Read-Host 'Press Enter to close this window'
