@@ -228,12 +228,11 @@ def transcribe_video(
         return segments, full_text
     finally:
         try:
-            from clip_engine.whisper_runtime import unload_whisper
+            from clip_engine.gpu_cleanup import cleanup_gpu_after_phase
 
-            unload_whisper()
+            cleanup_gpu_after_phase("transcription_complete", whisper=True)
         except Exception:
-            pass
-        release_gpu_memory("transcription_complete")
+            release_gpu_memory("transcription_complete")
 
 
 def _mb(n: int) -> str:

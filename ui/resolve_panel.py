@@ -67,7 +67,6 @@ def render_resolve_panel() -> None:
         )
 
     if st.button("🚀 Send to DaVinci Resolve", type="primary", key="resolve_send_btn"):
-        import subprocess
         resolve_clips = _clips_for_resolve_payload(st.session_state["final_clips"])
         payload = {
             "source_path": st.session_state["source_video_path"],
@@ -88,12 +87,15 @@ def render_resolve_panel() -> None:
         resolve_python = next((p for p in candidates if Path(p).exists()), sys.executable)
         st.session_state["resolve_python_path"] = resolve_python
         try:
-            result = subprocess.run(
-                [resolve_python, str(Path(__file__).parent.parent / "resolve_bridge.py")],
-                input=json.dumps(payload),
-                capture_output=True,
+            from clip_engine.subprocess_guard import run_subprocess_with_input
+
+            bridge = Path(__file__).parent.parent / "resolve_bridge.py"
+            result = run_subprocess_with_input(
+                [resolve_python, str(bridge)],
+                input_text=json.dumps(payload),
+                timeout=30.0,
+                label="resolve_bridge",
                 text=True,
-                timeout=30,
             )
             if result.returncode == 0:
                 try:

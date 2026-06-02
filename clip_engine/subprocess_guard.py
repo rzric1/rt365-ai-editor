@@ -146,6 +146,54 @@ def terminate_orphan_ffmpeg(*, parent_pid: int | None = None) -> int:
     return killed
 
 
+def run_subprocess_with_input(
+    cmd: list[str],
+    *,
+    input_text: str = "",
+    timeout: float | None = None,
+    label: str = "subprocess",
+    check: bool = False,
+    text: bool = True,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run tracked subprocess with stdin payload (e.g. Resolve bridge JSON)."""
+    from clip_engine.job_control import JobCancelledError, is_cancelled
+
+    if is_cancelled():
+        raise JobCancelledError("Cancelled before starting subprocess.")
+
+    cmd_line = " ".join(str(x) for x in cmd)
+    logger.info("[%s] start (stdin): %s", label, cmd_line[:500])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE if text else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if text else subprocess.DEVNULL,
+        text=text,
+        cwd=cwd,
+        **_subprocess_kw(),
+    )
+    _register(proc, label=label, cmd_line=cmd_line)
+    try:
+        try:
+            out, err = proc.communicate(input=input_text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            terminate_process(proc)
+            raise
+        result = subprocess.CompletedProcess(
+            cmd, proc.returncode if proc.returncode is not None else 0, stdout=out, stderr=err
+        )
+        if check and result.returncode != 0:
+            tail = (err or out or "").strip()
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, output=tail[-4000:] if tail else ""
+            )
+        return result
+    finally:
+        _unregister(proc)
+
+
 def run_subprocess(
     cmd: list[str],
     *,

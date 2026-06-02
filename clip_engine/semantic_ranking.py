@@ -67,6 +67,19 @@ def embeddings_available() -> bool:
         return False
 
 
+def release_embedding_model() -> None:
+    """Drop cached SentenceTransformer to free VRAM/RAM."""
+    global _MODEL, _MODEL_DEVICE
+    if _MODEL is None:
+        return
+    try:
+        del _MODEL
+    except Exception:
+        pass
+    _MODEL = None
+    logger.info("[semantic_ranking] released embedding model")
+
+
 def _load_model():
     global _MODEL, _MODEL_DEVICE
     if force_cpu_embeddings():

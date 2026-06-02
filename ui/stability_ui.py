@@ -36,6 +36,13 @@ def render_stability_controls() -> None:
     else:
         st.caption("No long-running job active.")
 
+    if st.button("Clear session memory (transcript/clips)", key="cs_clear_session_ram"):
+        from ui.session_memory import clear_session_heavy_data
+
+        cleared = clear_session_heavy_data(keep_video_path=True)
+        st.session_state.cs_status = f"Cleared {len(cleared)} in-memory session key(s)."
+        st.rerun()
+
     if st.button("Refresh resource snapshot", key="cs_resource_snap"):
         snap = log_resource_snapshot(label="manual")
         st.session_state.cs_resource_snap = snap

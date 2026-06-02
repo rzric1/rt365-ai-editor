@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -36,11 +35,10 @@ def get_media_duration_seconds(media_path: Path) -> float:
         "json",
         str(media_path.resolve()),
     ]
-    kw: dict = {}
-    if sys.platform == "win32":
-        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, **kw)
+        from clip_engine.subprocess_guard import run_subprocess
+
+        r = run_subprocess(cmd, timeout=120.0, label="ffprobe_duration", text=True)
         if r.returncode != 0:
             logger.warning("ffprobe failed: %s", (r.stderr or r.stdout)[:400])
             return 0.0

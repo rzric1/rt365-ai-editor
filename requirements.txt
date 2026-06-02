@@ -1,13 +1,18 @@
-# RT365 AI Editor + AI Clip Studio (Streamlit)
-# Install: py -m pip install -r requirements.txt
-#
-# Clip export also requires ffmpeg on your PATH:
-#   https://ffmpeg.org/download.html
+# RT365 AI Clip Studio — Python 3.11 virtual env (.venv311) ONLY
+# Do NOT install into Python 3.14 (Reliability Monitor python.exe crashes).
+# Setup: setup_windows.bat  |  Launch: launch_ai_clip_studio.ps1
 
 openai>=1.59.0
 python-dotenv>=1.0.0
 streamlit>=1.31.0
-# Local GPU Whisper (CUDA via CTranslate2). Install CUDA-enabled PyTorch/ctranslate2 per NVIDIA docs if needed.
-faster-whisper>=1.0.3
-# Resource snapshots and orphan ffmpeg detection (Clip Studio stability)
+numpy>=1.24.0
 psutil>=5.9.0
+
+# Local GPU Whisper (CUDA via CTranslate2)
+faster-whisper>=1.0.3
+ctranslate2>=4.4.0
+
+# Smart crop (optional but recommended on RTX 4090)
+opencv-python-headless>=4.8.0
+
+# FFmpeg must be on PATH or FFMPEG_BINARY in .env — https://ffmpeg.org/download.html

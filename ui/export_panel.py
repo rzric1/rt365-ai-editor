@@ -261,6 +261,14 @@ def render_export_panel() -> None:
                     if failed:
                         st.error(f"{failed} clip(s) failed - check warnings above.")
 
+                    try:
+                        from clip_engine.gpu_cleanup import cleanup_gpu_after_phase
+
+                        smart = bool(st.session_state.get("cs_smart_crop", True))
+                        cleanup_gpu_after_phase("export_batch", yolo=smart)
+                    except Exception:
+                        pass
+
         except JobCancelledError:
             st.warning("Export cancelled.")
         except Exception as e:

@@ -14,7 +14,7 @@ import logging
 import streamlit as st
 
 from config import LOGS_DIR
-from clip_engine.telemetry import configure_rotating_logs, classify_exception, get_session_telemetry
+from clip_engine.telemetry import configure_rotating_logs, get_session_telemetry
 from clip_engine.stability import (
     cleanup_temp_artifacts,
     install_exception_hooks,
@@ -32,6 +32,40 @@ from ui.resolve_panel import render_resolve_panel
 
 logger = logging.getLogger("clip_studio")
 _STARTUP_DONE = False
+_ENV_GATE_DONE = False
+
+
+def _ensure_environment_gate() -> None:
+    """Block UI if Python/venv/deps are unsafe (prevents crash-prone launches)."""
+    global _ENV_GATE_DONE
+    if _ENV_GATE_DONE:
+        return
+    from clip_engine.environment_check import (
+        format_streamlit_error,
+        validate_startup_environment,
+        write_environment_check_log,
+    )
+
+    status = validate_startup_environment()
+    write_environment_check_log(status)
+    _ENV_GATE_DONE = True
+    if status.ok:
+        return
+    st.error(format_streamlit_error(status))
+    with st.expander("Environment details", expanded=True):
+        for c in status.checks:
+            if not c.ok:
+                st.text(f"[{'CRITICAL' if c.critical else 'warn'}] {c.name}: {c.detail}")
+    st.stop()
+
+
+def _ensure_app_lock() -> None:
+    from clip_engine.app_lock import acquire_app_lock
+
+    ok, msg = acquire_app_lock()
+    if not ok:
+        st.error(msg)
+        st.stop()
 
 
 def _ensure_startup() -> None:
@@ -70,6 +104,8 @@ def main() -> None:
     try:
         logging.basicConfig(level=logging.INFO)
         configure_rotating_logs(LOGS_DIR)
+        _ensure_environment_gate()
+        _ensure_app_lock()
         _ensure_startup()
         init_session_state()
         flush_pending_long_defaults()

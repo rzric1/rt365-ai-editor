@@ -49,6 +49,8 @@ def _system_snapshot() -> dict[str, Any]:
     snap: dict[str, Any] = {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
+        "python_executable": sys.executable,
+        "venv_prefix": sys.prefix,
         "cwd": str(Path.cwd()),
     }
     try:
@@ -121,9 +123,14 @@ def write_crash_report(
         "=" * 72,
         f"CRASH REPORT {ts}",
         f"Context: {context or 'unknown'}",
+        f"Python executable: {snap.get('python_executable', sys.executable)}",
+        f"Python version: {snap.get('python', sys.version.split()[0])}",
+        f"Virtual env: {snap.get('venv_prefix', sys.prefix)}",
         f"Exception: {type(exc).__name__}: {exc}",
         f"Active job: {snap.get('active_job')}",
         f"Pipeline step: {snap.get('pipeline_step')}",
+        f"Process RSS MB: {snap.get('process_rss_mb', '?')}",
+        f"RAM available GB: {snap.get('ram_available_gb', '?')}",
         f"FFmpeg cmd: {ffmpeg_cmd[:800] if ffmpeg_cmd else '(none)'}",
         "System snapshot:",
     ]
@@ -279,6 +286,8 @@ def log_resource_snapshot(*, label: str = "snapshot") -> dict[str, Any]:
     snap = _system_snapshot()
     snap["label"] = label
     snap["ts"] = datetime.now(timezone.utc).isoformat()
+    snap["python_executable"] = sys.executable
+    snap["venv_prefix"] = sys.prefix
     try:
         import psutil
 

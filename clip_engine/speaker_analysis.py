@@ -179,9 +179,9 @@ def diarize_audio_file(audio_path: str) -> list[dict]:
         return []
     finally:
         try:
-            from clip_engine.stability import release_gpu_memory
+            from clip_engine.gpu_cleanup import cleanup_gpu_after_phase
 
-            release_gpu_memory()
+            cleanup_gpu_after_phase("diarize", whisper=True)
         except Exception:
             pass
 

@@ -57,8 +57,9 @@ from clip_engine.upload_manifest import clean_duplicate_uploads, save_upload_onc
 from clip_engine.export_vertical import EXPORT_MODE_LABELS, export_clip_preview
 from clip_engine.ffmpeg_resolve import ensure_ffmpeg_on_path
 from clip_engine.job_control import JobCancelledError
-from clip_engine.stability import release_gpu_memory
+from clip_engine.gpu_cleanup import cleanup_gpu_after_phase
 from ui.job_helpers import studio_job
+from ui.session_memory import upload_size_warning
 
 logger = logging.getLogger("clip_studio")
 
@@ -636,6 +637,9 @@ def render_clips_section() -> None:
                 )
             else:
                 st.success(f"Ready: **{up.name}** - {_format_size(sz)}. Click **Save** to continue.")
+                warn = upload_size_warning(sz)
+                if warn:
+                    st.warning(warn)
             if st.button("Save upload to project", type="primary", disabled=sz > CLIP_STUDIO_MAX_UPLOAD_BYTES):
                 bar = st.progress(0.0, text="Preparing to save...")
                 try:
@@ -764,7 +768,7 @@ def render_clips_section() -> None:
                     else:
                         st.error(f"**{category}:** {user_msg}")
                 finally:
-                    release_gpu_memory()
+                    cleanup_gpu_after_phase("transcribe", whisper=True)
 
     if st.session_state.get("cs_status"):
         st.caption(st.session_state.cs_status)
@@ -837,7 +841,7 @@ def render_clips_section() -> None:
                     logger.exception("Speaker diarization failed")
                     st.error(f"Diarization failed: {_diar_exc}")
                 finally:
-                    release_gpu_memory()
+                    cleanup_gpu_after_phase("diarize", whisper=True)
 
         if _diar_turns:
             _unique_speakers = sorted({t["speaker"] for t in _diar_turns})
@@ -996,7 +1000,7 @@ def render_clips_section() -> None:
                     _progress_bar.progress(1.0)
                     _status_placeholder.empty()
                     _progress_bar.empty()
-                    release_gpu_memory()
+                    cleanup_gpu_after_phase("analyze", embeddings=True)
             except JobCancelledError:
                 _progress_bar.progress(1.0)
                 _status_placeholder.empty()
@@ -1047,7 +1051,7 @@ def render_clips_section() -> None:
                     except Exception as e:
                         st.error(f"Re-score failed: {e}")
                     finally:
-                        release_gpu_memory()
+                        cleanup_gpu_after_phase("analyze_rescore", embeddings=True)
 
     with col_more:
         if st.session_state.cs_clips:

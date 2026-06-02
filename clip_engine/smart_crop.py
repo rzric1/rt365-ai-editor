@@ -10,7 +10,6 @@ Three export modes for vertical (9:16) output:
 from __future__ import annotations
 
 import logging
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -324,6 +323,19 @@ def _get_yolo_model():
     return _yolo_model
 
 
+def release_yolo_model() -> None:
+    """Drop cached YOLO weights to free VRAM."""
+    global _yolo_model
+    if _yolo_model is None:
+        return
+    try:
+        del _yolo_model
+    except Exception:
+        pass
+    _yolo_model = None
+    logger.info("[smart_crop] released YOLO model")
+
+
 def _yolo_detect_trajectory(
     video_path: Path,
     clip_start: float,
@@ -601,17 +613,33 @@ def _center_crop_filter(video_path: Path) -> str:
 
 def _probe_dimensions(video_path: Path) -> tuple[int, int]:
     try:
-        result = subprocess.run(
+        from clip_engine.ffmpeg_resolve import get_ffmpeg_executable
+        from clip_engine.subprocess_guard import run_subprocess
+
+        ffmpeg = Path(get_ffmpeg_executable())
+        ffprobe = ffmpeg.parent / (
+            "ffprobe.exe" if ffmpeg.suffix.lower() == ".exe" else "ffprobe"
+        )
+        if not ffprobe.is_file():
+            ffprobe = Path("ffprobe")
+        result = run_subprocess(
             [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=p=0",
+                str(ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
                 str(video_path),
             ],
-            capture_output=True, text=True, timeout=15,
+            timeout=15.0,
+            label="ffprobe_dimensions",
+            text=True,
         )
-        parts = result.stdout.strip().split(",")
+        parts = (result.stdout or "").strip().split(",")
         if len(parts) >= 2:
             return int(parts[0]), int(parts[1])
     except Exception as e:

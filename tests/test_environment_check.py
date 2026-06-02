@@ -1,12 +1,57 @@
 # -*- coding: utf-8 -*-
-import subprocess
+from __future__ import annotations
+
 import sys
 
-def test_check_environment_runs():
-    result = subprocess.run(
+
+def test_blocks_python_314_minor():
+    from unittest.mock import patch
+
+    from clip_engine.environment_check import _check_python_version
+
+    with patch("sys.version_info", (3, 14, 0, "final", 0)):
+        c = _check_python_version()
+        assert not c.ok
+        assert "3.14" in c.detail
+
+
+def test_detects_missing_faster_whisper(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "faster_whisper":
+            raise ImportError("no module")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    from clip_engine.environment_check import validate_startup_environment
+
+    status = validate_startup_environment(require_gpu_stack=True)
+    assert any("faster-whisper" in e for e in status.errors)
+
+
+def test_environment_check_log_writes(tmp_path, monkeypatch):
+    from clip_engine import environment_check
+
+    monkeypatch.setattr(environment_check, "LOGS_DIR", tmp_path)
+    path = environment_check.write_environment_check_log()
+    assert path.is_file()
+    assert "environment check" in path.read_text(encoding="utf-8").lower()
+
+
+def test_check_environment_cli_runs():
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    r = subprocess.run(
         [sys.executable, "check_environment.py"],
-        capture_output=True, text=True, cwd="C:/dev/rt365-ai-editor"
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        timeout=60,
     )
-    # Should exit 0 or 1 — never crash with a traceback
-    assert result.returncode in (0, 1)
-    assert "RT365 AI Clip Studio" in result.stdout
+    assert r.returncode in (0, 1)
+    assert "environment check" in (r.stdout + r.stderr).lower()
