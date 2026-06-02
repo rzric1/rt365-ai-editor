@@ -9,3 +9,5 @@ python-dotenv>=1.0.0
 streamlit>=1.31.0
 # Local GPU Whisper (CUDA via CTranslate2). Install CUDA-enabled PyTorch/ctranslate2 per NVIDIA docs if needed.
 faster-whisper>=1.0.3
+# Resource snapshots and orphan ffmpeg detection (Clip Studio stability)
+psutil>=5.9.0

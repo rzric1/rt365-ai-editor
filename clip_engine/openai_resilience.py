@@ -199,6 +199,21 @@ def parse_retry_after_seconds(exc: BaseException) -> float | None:
     return value
 
 
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep in short slices so cancel can stop rate-limit backoff."""
+    from clip_engine.job_control import check_cancelled
+
+    if seconds <= 0:
+        return
+    end = time.monotonic() + seconds
+    while True:
+        check_cancelled()
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.5, remaining))
+
+
 def _backoff_delay(attempt: int, config: RateLimitConfig, parsed_wait: float | None) -> float:
     if parsed_wait is not None and parsed_wait > 0:
         base = min(config.max_delay_seconds, parsed_wait)
@@ -223,7 +238,7 @@ def apply_call_delay() -> None:
     ctx = get_call_context()
     delay = ctx.call_delay_seconds if ctx.token_saver_mode or ctx.rate_limit_safe else 0.0
     if delay > 0:
-        time.sleep(delay)
+        _interruptible_sleep(delay)
 
 
 def truncate_text_safe(text: str, max_chars: int, *, label: str = "text") -> tuple[str, bool]:
@@ -920,7 +935,7 @@ def call_openai_with_backoff(
                 "Rate limit stage=%s model=%s attempt=%d/%d wait=%.2fs parsed=%s err=%s",
                 stage, model, attempt, cfg.max_retries, wait, parsed, exc,
             )
-            time.sleep(wait)
+            _interruptible_sleep(wait)
 
     raise OpenAIRateLimitError(
         f"OpenAI call failed at stage '{stage}': {last_exc}",

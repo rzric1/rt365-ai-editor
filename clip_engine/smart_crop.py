@@ -311,13 +311,26 @@ def _detect_people_trajectory(
     return [], "opencv", confidence
 
 
+_yolo_model: object | None = None
+
+
+def _get_yolo_model():
+    global _yolo_model
+    if _yolo_model is None:
+        from ultralytics import YOLO  # type: ignore
+
+        _yolo_model = YOLO("yolov8n.pt")
+        logger.info("[smart_crop] loaded YOLOv8n (cached for session)")
+    return _yolo_model
+
+
 def _yolo_detect_trajectory(
     video_path: Path,
     clip_start: float,
     clip_end: float | None,
 ) -> tuple[list[tuple[float, CropRegion]], float]:
-    from ultralytics import YOLO  # type: ignore
     import cv2  # type: ignore
+    from clip_engine.job_control import check_cancelled
 
     src_w, src_h = _probe_dimensions(video_path)
     if src_w == 0:
@@ -333,13 +346,14 @@ def _yolo_detect_trajectory(
     end_time = min(end_time, total_frames / fps)
     duration = max(1.0, end_time - clip_start)
 
-    model = YOLO("yolov8n.pt")
+    model = _get_yolo_model()
     step_sec = max(2.0, duration / 12)  # ~12 samples across clip
     trajectory: list[tuple[float, CropRegion]] = []
     confidences: list[float] = []
 
     t = clip_start
     while t < end_time:
+        check_cancelled()
         frame_idx = int(t * fps)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()

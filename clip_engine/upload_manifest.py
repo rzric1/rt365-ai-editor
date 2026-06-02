@@ -71,14 +71,37 @@ def _fingerprint_from_parts(
 def compute_upload_fingerprint(upload: Any) -> tuple[str, int, str]:
     """
     Stable fingerprint: original name, size, SHA256 of first/last 8 MB.
+    Streams chunks — does not load the entire upload into RAM.
     Returns (fingerprint, size_bytes, original_name).
     """
     _reset_upload_stream(upload)
     original_name = Path(upload.name).name
-    data = bytes(upload.getbuffer())
+    size_bytes = 0
+    first_buf = bytearray()
+    last_buf = bytearray()
+    read_chunk = 1024 * 1024
+
+    while True:
+        block = upload.read(read_chunk)
+        if not block:
+            break
+        size_bytes += len(block)
+        offset = 0
+        if len(first_buf) < CHUNK_HASH_SIZE:
+            need = CHUNK_HASH_SIZE - len(first_buf)
+            take = block[:need]
+            first_buf.extend(take)
+            offset = len(take)
+        remainder = block[offset:]
+        if remainder:
+            last_buf.extend(remainder)
+            if len(last_buf) > CHUNK_HASH_SIZE:
+                last_buf = last_buf[-CHUNK_HASH_SIZE:]
+
     _reset_upload_stream(upload)
-    size_bytes = len(data)
-    first_hash, last_hash = _partial_hashes_from_bytes(data)
+    first_hash = _hash_bytes(bytes(first_buf))
+    last_hash = _hash_bytes(bytes(last_buf)) if size_bytes > CHUNK_HASH_SIZE else ""
+
     fp = _fingerprint_from_parts(
         original_name=original_name,
         size_bytes=size_bytes,
@@ -192,29 +215,34 @@ def _upsert_manifest_entry(
 
 
 def write_upload_to_path(upload: Any, dest: Path, progress_bar: Any) -> None:
-    """Write uploaded bytes to dest with optional progress updates."""
+    """Write uploaded bytes to dest with optional progress updates (streamed, low RAM)."""
+    from clip_engine.job_control import check_cancelled
+
     _reset_upload_stream(upload)
-    buf = upload.getbuffer()
-    total = len(buf)
-    chunk = 32 * 1024 * 1024
+    chunk = 4 * 1024 * 1024
     written = 0
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as f:
-        offset = 0
-        while offset < total:
-            piece = buf[offset : offset + chunk]
+        while True:
+            check_cancelled()
+            piece = upload.read(chunk)
+            if not piece:
+                break
             f.write(piece)
-            offset += len(piece)
             written += len(piece)
-            if total > 0 and progress_bar is not None:
-                pct = min(1.0, written / total)
+            if progress_bar is not None:
                 try:
                     progress_bar.progress(
-                        pct,
-                        text=f"Saving: {_format_size(written)} / {_format_size(total)}",
+                        0.0,
+                        text=f"Saving: {_format_size(written)}…",
                     )
                 except TypeError:
-                    progress_bar.progress(pct)
+                    progress_bar.progress(0.0)
+    if progress_bar is not None:
+        try:
+            progress_bar.progress(1.0, text=f"Saved {_format_size(written)}.")
+        except TypeError:
+            progress_bar.progress(1.0)
     _reset_upload_stream(upload)
 
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 import logging
 import re
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -15,16 +14,24 @@ logger = logging.getLogger("clip_engine.export_vertical")
 # Sequential export controls — prevents GPU/memory exhaustion from concurrent ffmpeg processes.
 _EXPORT_LOCK = threading.Lock()
 _EXPORT_INTER_DELAY = 2.0          # seconds between clip exports
-_GPU_MEMORY_HEADROOM_GB = 8.0      # pause if GPU VRAM used exceeds this
+_GPU_MEMORY_HEADROOM_GB = 18.0     # RTX 4090: wait only when VRAM is genuinely tight
 _FFMPEG_TIMEOUT_SECONDS = 300      # per-clip ffmpeg hard timeout
 
 
 def _check_gpu_headroom() -> None:
     """If GPU memory usage exceeds threshold, wait 5 seconds before proceeding."""
     try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
+        from clip_engine.subprocess_guard import run_subprocess
+
+        result = run_subprocess(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5,
+            label="nvidia-smi",
         )
         if result.returncode == 0:
             used_mb = int(result.stdout.strip().split("\n")[0].strip())
@@ -242,7 +249,17 @@ def export_filename_stem(clip: dict, sequence_index: int, title_slug: str) -> st
 
 
 def _run_with_fallback(cmd, video_path, output_path, start, duration, vf, uses_complex, encoder, allow_cpu_fallback, *, preview_mode=False):
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT_SECONDS)
+    from clip_engine.job_control import set_pipeline_step
+    from clip_engine.subprocess_guard import run_subprocess
+
+    set_pipeline_step("ffmpeg_export")
+    cmd = _resolve_ffmpeg_binary(list(cmd))
+    result = run_subprocess(
+        cmd,
+        timeout=_FFMPEG_TIMEOUT_SECONDS,
+        label="ffmpeg_export",
+        text=True,
+    )
     if result.returncode == 0:
         return encoder
     if encoder == "h264_nvenc" and allow_cpu_fallback:
@@ -251,11 +268,26 @@ def _run_with_fallback(cmd, video_path, output_path, start, duration, vf, uses_c
             video_path, output_path, start, duration, vf, uses_complex,
             False, False, preview_mode=preview_mode,
         )
-        result2 = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT_SECONDS)
+        cpu_cmd = _resolve_ffmpeg_binary(list(cpu_cmd))
+        result2 = run_subprocess(
+            cpu_cmd,
+            timeout=_FFMPEG_TIMEOUT_SECONDS,
+            label="ffmpeg_export_cpu_fallback",
+            text=True,
+        )
         if result2.returncode == 0:
             return "libx264"
-        raise RuntimeError(f"CPU fallback failed: {result2.stderr[-1000:]}")
-    raise RuntimeError(f"FFmpeg failed: {result.stderr[-1000:]}")
+        raise RuntimeError(f"CPU fallback failed: {(result2.stderr or '')[-1000:]}")
+    raise RuntimeError(f"FFmpeg failed: {(result.stderr or '')[-1000:]}")
+
+
+def _resolve_ffmpeg_binary(cmd: list) -> list:
+    """Replace leading 'ffmpeg' with resolved executable path."""
+    if cmd and cmd[0] == "ffmpeg":
+        from clip_engine.ffmpeg_resolve import get_ffmpeg_executable
+
+        return [get_ffmpeg_executable(), *cmd[1:]]
+    return cmd
 
 
 def export_clips_sequential_safe(

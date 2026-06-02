@@ -118,6 +118,11 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.header("Settings")
 
+        from ui.stability_ui import render_stability_controls
+
+        render_stability_controls()
+        st.divider()
+
         st.checkbox("GPU acceleration (NVENC exports + local Whisper)", key="cs_gpu_acceleration")
         gpu_on = bool(st.session_state.get("cs_gpu_acceleration", True))
         force_gpu_export = bool(st.session_state.get("cs_force_gpu_export", False))

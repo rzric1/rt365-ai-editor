@@ -1,6 +1,8 @@
-# Windows Diagnostics — Correlating RT365 Crashes with System Evidence
+# Windows Diagnostics — RT365 AI Clip Studio Crash Correlation
 
-Use this guide after a freeze, crash, BSOD, or GPU reset while running **RT365 AI Clip Studio**.
+Use this guide after a freeze, crash, BSOD, or GPU reset while running **RT365 AI Clip Studio** on Windows 11 + RTX 4090.
+
+**Companion logs (RT365):** `logs/crash_report.txt`, `logs/app.log`, `logs/gpu.log`, `logs/exports.log`, `logs/resource_monitor.log`, `logs/startup_diagnostics.txt`, launcher `crash_log.txt`.
 
 ---
 
@@ -9,215 +11,134 @@ Use this guide after a freeze, crash, BSOD, or GPU reset while running **RT365 A
 1. Note exact action: Upload / Transcribe / Analyze / Export / Preview / Resolve send.
 2. Note video file size, duration, Whisper model size, export clip count, export mode (smart_crop vs full_fit).
 3. Save last 200 lines of launcher console or `crash_log.txt`.
-4. Copy `logs/app.log`, `logs/gpu.log`, `logs/exports.log` timestamps around the event.
+4. Copy RT365 logs with timestamps ±5 minutes around the event.
+5. Sidebar → **Refresh resource snapshot** if app still responsive.
 
 ---
 
-## 2. Event Viewer
-
-**Open:** `Win + R` → `eventvwr.msc`
-
-### 2.1 Application log
-
-Path: **Windows Logs → Application**
-
-Filter:
-
-- **Sources:** `Application Error`, `Windows Error Reporting`, `Python`, `.NET Runtime` (Streamlit may appear as python.exe)
-- **Time:** Custom range around incident
-
-Look for:
-
-- `Faulting application name: python.exe`
-- `Faulting module name: nvcuda.dll`, `nvenc.dll`, `ctranslate2.dll`, `c10.dll` (torch), `ffmpeg.exe`
-- Exit code `0xc0000005` (access violation), `0xc0000409` (stack buffer), `0xe0434352` (.NET — less common for Python)
-
-### 2.2 System log
-
-Path: **Windows Logs → System**
-
-Look for:
-
-- **nvlddmkm** — Display driver stopped responding and has recovered (TDR)
-- **WHEA-Logger** — hardware errors (RAM/PCIe)
-- **Disk** — disk errors during heavy write to `uploads/` or `outputs/`
-
-### 2.3 Correlation template
-
-| App log time | System log | Interpretation |
-|--------------|------------|----------------|
-| python.exe crash + nvcuda.dll | nvlddmkm TDR same minute | GPU timeout / driver reset |
-| python.exe OOM | No driver event | RAM exhaustion |
-| ffmpeg.exe hang | Disk 153 | I/O bottleneck |
-| No app crash, full freeze | High CPU python | Streamlit blocked on subprocess |
-
----
-
-## 3. Reliability Monitor
+## 2. Reliability Monitor
 
 **Open:** `Win + R` → `perfmon /rel`
 
-- Daily stability index — drop on crash day
-- Click red X entries → **View technical details**
-- Match **Source** (python.exe, ffmpeg.exe, Windows)
-- **Fault bucket** IDs useful for web search
+| Step | Action |
+|------|--------|
+| 1 | Find the crash day — stability index drop |
+| 2 | Click red **X** entries for `python.exe`, `ffmpeg.exe`, `Streamlit` |
+| 3 | **View technical details** — faulting module, bucket ID |
+| 4 | Export: right-click → **Save Events As** CSV |
 
-Export: Right-click column header → **Save Events As** CSV for records.
-
----
-
-## 4. Windows crash dumps
-
-### 4.1 User-mode dumps (python / ffmpeg)
-
-**Enable (optional):**
-
-```
-Win + R → sysdm.cpl → Advanced → Startup and Recovery → Settings
-→ Write debugging information: Small memory dump (256 KB) or Automatic
-```
-
-For **full** python dumps, use **Windows Error Reporting** local dumps:
-
-Registry (admin):  
-`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\python.exe`  
-- `DumpFolder` = `C:\CrashDumps`  
-- `DumpType` = `2` (full)
-
-### 4.2 BSOD kernel dumps
-
-Location (if enabled): `C:\Windows\MEMORY.DMP` or `C:\Windows\Minidump\*.dmp`
-
-Analyze with **WinDbg Preview**:
-
-```
-!analyze -v
-```
-
-Common bugchecks:
-
-| Code | Meaning | RT365 correlation |
-|------|---------|-------------------|
-| `0x00000116` | VIDEO_TDR_FAILURE | Long NVENC/CUDA |
-| `0x0000007E` | SYSTEM_THREAD_EXCEPTION | Driver |
-| `0x0000001A` | MEMORY_MANAGEMENT | RAM pressure |
-| `0x000000EF` | CRITICAL_PROCESS_DIED | System instability |
+**Correlate with RT365:** Match Reliability timestamp to `logs/crash_report.txt` UTC block.
 
 ---
 
-## 5. NVIDIA driver logs
+## 3. Event Viewer
 
-### 5.1 nvidia-smi (immediate)
+**Open:** `Win + R` → `eventvwr.msc`
 
-```powershell
-nvidia-smi
-nvidia-smi --query-gpu=timestamp,name,memory.used,memory.total,utilization.gpu,utilization.memory --format=csv -l 1
-```
+### 3.1 Application log
 
-Run during reproduce — watch **memory.used** during Transcribe + Export.
+**Path:** Windows Logs → Application
 
-### 5.2 NVIDIA logging
+**Filter:** Sources `Application Error`, `Windows Error Reporting`, time range around incident.
 
-- **NVIDIA Control Panel → Help → Debug Logging** (if available on driver version)
-- Driver logs folder (varies):  
-  `C:\ProgramData\NVIDIA Corporation\NvTelemetry`  
-  `C:\Windows\System32\LogFiles\`
+| Pattern | Meaning |
+|---------|---------|
+| Faulting `python.exe` + `nvcuda.dll` / `c10.dll` | GPU/CUDA in Python stack |
+| Faulting `python.exe` + `ctranslate2.dll` | faster-whisper native crash |
+| Faulting `ffmpeg.exe` + `nvenc.dll` | NVENC encode failure |
+| Exit `0xc0000005` | Access violation |
+| Exit `0xc0000409` | Stack buffer overrun |
+| Exit `0xe0434352` | .NET — rare for Clip Studio |
 
-### 5.3 CUDA toolkit alignment
+### 3.2 System log
 
-RT365 launcher adds:
+**Path:** Windows Logs → System
 
-`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin`
+| Source | Meaning |
+|--------|---------|
+| **nvlddmkm** | Display driver TDR — GPU reset; Whisper/NVENC may have hung |
+| **WHEA-Logger** | Hardware error (RAM, PCIe) — investigate RAM test if recurring |
+| **Kernel-Power** Event 41 | Unexpected shutdown — power loss or hard crash |
+| **Disk** | Storage errors during write to `uploads/` or `outputs/` |
 
-Verify `cublas64_12.dll` exists — matches `cuda_diagnostics.py` checks in app sidebar.
+### 3.3 LiveKernelEvent
 
----
+**Path:** Windows Logs → System → filter **LiveKernelEvent**
 
-## 6. Application-specific artifacts
+- Often accompanies **nvlddmkm** TDR on RTX cards.
+- Indicates kernel detected hung GPU command buffer.
 
-| Path | Content |
-|------|---------|
-| `C:\dev\rt365-ai-editor\logs\app.log` | General pipeline |
-| `C:\dev\rt365-ai-editor\logs\gpu.log` | GPU memory snapshots |
-| `C:\dev\rt365-ai-editor\logs\exports.log` | Per-export encoder |
-| `C:\dev\rt365-ai-editor\logs\openai.log` | API timing |
-| `C:\dev\rt365-ai-editor\crash_log.txt` | Launcher stderr capture |
-
-Search logs for last successful phase tag:
-
-- `[PIPELINE TIMING]`
-- `faster-whisper transcription done`
-- `[GPU MEMORY]`
-- `Delivery email` (N/A here)
-- `FFmpeg failed`
+**RT365 correlation:** If LiveKernelEvent timestamp = end of long NVENC export or CUDA transcribe, reduce concurrent GPU load and update driver.
 
 ---
 
-## 7. Process snapshot during hang
+## 4. WHEA (hardware errors)
 
-**Task Manager → Details:**
+**Path:** Event Viewer → Applications and Services Logs → Microsoft → Windows → WHEA-Logger → Operational
 
-| Process | Expected | Problem |
-|---------|----------|---------|
-| `python.exe` (streamlit) | 1 | 2+ = duplicate launch |
-| `ffmpeg.exe` | 0–1 during work | Many = orphan leak |
-| GPU engine | python or ffmpeg | Both high = overlap |
-
-**PowerShell:**
-
-```powershell
-Get-Process python, ffmpeg -ErrorAction SilentlyContinue | Format-Table Id, CPU, WS, PM -AutoSize
-```
-
-`WS` (working set) > 8 GB on python during upload = RAM spike confirmed.
+| Finding | Action |
+|---------|--------|
+| Corrected memory error | Run MemTest86; check XMP/EXPO |
+| PCIe error | Reseat GPU; check PSU rails |
+| Repeated WHEA + no driver events | Suspect hardware before blaming RT365 |
 
 ---
 
-## 8. Correlation decision tree
+## 5. nvlddmkm (NVIDIA display driver)
 
-```
-Incident during Upload?
-  YES → Check python WS > file size → RAM OOM in Event Viewer
-  NO ↓
-Incident during Transcribe?
-  YES → gpu.log + nvidia-smi VRAM → Whisper model size
-  NO ↓
-Incident during Analyze?
-  YES → openai.log rate limits; python CPU 100% (normal); RAM from session
-  NO ↓
-Incident during Export?
-  YES → exports.log encoder; ffmpeg.exe count; nvlddmkm TDR
-  NO ↓
-BSOD without app log?
-  → Minidump + WHEA + RAM test (mdsched.exe)
-```
+**Symptoms:** Black screen flash, "Display driver stopped responding", app freeze with GPU busy.
+
+**Event Viewer:** System log, Source `nvlddmkm`, Event ID 4101 (common).
+
+**Mitigations for Clip Studio workloads:**
+
+1. Update to latest NVIDIA Studio driver for content creation.
+2. Avoid parallel **Resolve playback + Whisper + NVENC export**.
+3. Lower Whisper model size for very long files.
+4. Disable unnecessary GPU acceleration toggles to isolate (export CPU fallback test).
+5. Increase TDR delay (advanced registry) only if Microsoft/docs recommend for your workflow.
 
 ---
 
-## 9. Evidence package for support
+## 6. Kernel-Power (Event 41)
 
-Zip these after an incident:
+**Meaning:** System rebooted without clean shutdown.
 
-1. `logs/*.log` (last 24 h)
-2. Event Viewer export (Application + System, 1 h window)
-3. Reliability Monitor screenshot
-4. `nvidia-smi -q` text output
-5. Streamlit console tail / `crash_log.txt`
-6. Note: GPU model, driver version, RAM, file size, settings profile (SAFE/AGGRESSIVE)
+**Distinguish:**
 
----
-
-## 10. RT365-specific timestamps to record
-
-| Field | Example |
-|-------|---------|
-| `cs_whisper_model` | base / small / large-v3 |
-| `cs_gpu_acceleration` | on/off |
-| `cs_export_mode_label` | smart_crop vs full_fit |
-| Clip count exported | 17 |
-| Input mode | Local path vs browser upload |
-| AI profile | SAFE |
+| Cause | Other evidence |
+|-------|----------------|
+| PSU overload / spike | Kernel-Power 41, no app log |
+| Driver hard reset | nvlddmkm + LiveKernelEvent same second |
+| User hard power | No RT365 logs |
 
 ---
 
-*Hardware BSODs require minidump analysis; software freezes often correlate with python RAM or ffmpeg orphans per STABILITY_REPORT.md.*
+## 7. Correlation worksheet
+
+| Time (local) | RT365 log | Windows source | Likely cause |
+|--------------|-----------|----------------|--------------|
+| | `pipeline_step=ffmpeg_export` | nvlddmkm | NVENC TDR |
+| | `whisper_cuda_float16` | python + ctranslate2 | CUDA DLL / model |
+| | `analyze` + high `process_rss_mb` | no GPU event | RAM pressure |
+| | orphan ffmpeg PIDs in resource log | ffmpeg.exe hung | Stuck encode; use Kill orphan |
+
+---
+
+## 8. Post-incident RT365 actions
+
+1. Restart Clip Studio (clears Streamlit session RAM).
+2. Sidebar → **Kill orphan ffmpeg** if PIDs listed.
+3. Review `logs/crash_report.txt` newest block.
+4. Attach `startup_diagnostics.txt` + Reliability export when opening support ticket.
+
+---
+
+## 9. When to escalate
+
+| Signal | Escalate to |
+|--------|-------------|
+| WHEA errors | Hardware / RAM vendor |
+| nvlddmkm only on GPU workloads | NVIDIA driver / thermal |
+| python OOM, no WHEA | RT365 — transcript size / session restart |
+| ffmpeg-only hang | Disk space / path / corrupt source file |

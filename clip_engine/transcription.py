@@ -14,6 +14,7 @@ from openai import OpenAI
 from clip_engine.audio_extract import extract_audio_wav, ffmpeg_available
 from clip_engine.cuda_diagnostics import cublas_missing_hint, ctranslate2_cuda_runtime_probe
 from clip_engine.ffmpeg_gpu import faster_whisper_cuda_available
+from clip_engine.stability import MAX_CLOUD_WHISPER_WAV_BYTES, release_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -46,43 +47,6 @@ def _segments_from_response(tr: Any) -> tuple[list[dict[str, Any]], str]:
     return segments, full_text
 
 
-def _faster_whisper_run(
-    wav_path: Path,
-    *,
-    language: str | None,
-    model_size: str,
-    device: str,
-    compute_type: str,
-) -> tuple[list[dict[str, Any]], str]:
-    from faster_whisper import WhisperModel
-
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    logger.info("faster-whisper: model=%s device=%s compute_type=%s", model_size, device, compute_type)
-    segs_iter, info = model.transcribe(
-        str(wav_path),
-        language=language,
-        beam_size=5,
-        vad_filter=True,
-    )
-    segments: list[dict[str, Any]] = []
-    text_parts: list[str] = []
-    for seg in segs_iter:
-        t = seg.text.strip()
-        if not t:
-            continue
-        segments.append({"start": float(seg.start), "end": float(seg.end), "text": t})
-        text_parts.append(t)
-    full_text = " ".join(text_parts).strip()
-    if not segments and full_text:
-        segments = [{"start": 0.0, "end": 0.0, "text": full_text}]
-    logger.info(
-        "faster-whisper transcription done: %s segments, language=%s",
-        len(segments),
-        getattr(info, "language", "?"),
-    )
-    return segments, full_text
-
-
 def transcribe_with_faster_whisper_cuda(
     wav_path: Path,
     *,
@@ -95,6 +59,9 @@ def transcribe_with_faster_whisper_cuda(
 
     Returns (segments, text, device_tag) where device_tag is \"cuda\" or \"cpu\".
     """
+    from clip_engine.job_control import set_pipeline_step
+    from clip_engine.whisper_runtime import transcribe_wav
+
     try:
         import faster_whisper  # noqa: F401
     except ImportError:
@@ -116,7 +83,8 @@ def transcribe_with_faster_whisper_cuda(
         cuda_attempted = True
         for comp in ("float16", "int8_float16", "int8"):
             try:
-                segs, txt = _faster_whisper_run(
+                set_pipeline_step(f"whisper_cuda_{comp}")
+                segs, txt, _info = transcribe_wav(
                     wav_path,
                     language=language,
                     model_size=model_size,
@@ -147,7 +115,8 @@ def transcribe_with_faster_whisper_cuda(
     if use_cpu_fallback:
         for comp in ("int8", "float32"):
             try:
-                segs, txt = _faster_whisper_run(
+                set_pipeline_step(f"whisper_cpu_{comp}")
+                segs, txt, _info = transcribe_wav(
                     wav_path,
                     language=language,
                     model_size=model_size,
@@ -178,6 +147,8 @@ def transcribe_video(
     If prefer_gpu and CUDA+faster-whisper work, uses local GPU.
     Otherwise uses OpenAI whisper-1 (requires api_key).
     """
+    from clip_engine.job_control import check_cancelled, set_pipeline_step
+
     if not ffmpeg_available():
         from config import ENV_FFMPEG_BINARY  # noqa: PLC0415
 
@@ -189,63 +160,84 @@ def transcribe_video(
     from clip_engine.telemetry import pipeline_phase
 
     wav_path = work_dir / "_whisper_input.wav"
-    with pipeline_phase("audio_extract"):
-        extract_audio_wav(video_path, wav_path)
+    try:
+        with pipeline_phase("audio_extract"):
+            extract_audio_wav(video_path, wav_path)
 
-    if prefer_gpu and os.environ.get("FORCE_CPU_WHISPER", "").lower() not in ("1", "true", "yes"):
-        with pipeline_phase("transcription"):
-            local = transcribe_with_faster_whisper_cuda(
-                wav_path,
-                language=language,
-                model_size=faster_whisper_model,
+        check_cancelled()
+
+        if prefer_gpu and os.environ.get("FORCE_CPU_WHISPER", "").lower() not in ("1", "true", "yes"):
+            with pipeline_phase("transcription"):
+                local = transcribe_with_faster_whisper_cuda(
+                    wav_path,
+                    language=language,
+                    model_size=faster_whisper_model,
+                )
+            if local is not None:
+                segs, txt, dev_tag = local
+                label = "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU int8/float32 fallback)"
+                logger.info("Transcription backend: %s", label)
+                return segs, txt
+            logger.info("Transcription backend: falling back to OpenAI whisper-1 API.")
+
+        key = (api_key or "").strip()
+        if not key:
+            raise ValueError(
+                "OpenAI API key missing for cloud Whisper. Set OPENAI_API_KEY in .env, "
+                "or install faster-whisper + CUDA and enable GPU acceleration."
             )
-        if local is not None:
-            segs, txt, dev_tag = local
-            label = "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU int8/float32 fallback)"
-            logger.info("Transcription backend: %s", label)
-            return segs, txt
-        logger.info("Transcription backend: falling back to OpenAI whisper-1 API.")
 
-    key = (api_key or "").strip()
-    if not key:
-        raise ValueError(
-            "OpenAI API key missing for cloud Whisper. Set OPENAI_API_KEY in .env, "
-            "or install faster-whisper + CUDA and enable GPU acceleration."
-        )
+        wav_size = wav_path.stat().st_size
+        if wav_size > MAX_CLOUD_WHISPER_WAV_BYTES:
+            raise ValueError(
+                f"Extracted audio is {_mb(wav_size)} MB — too large for cloud Whisper in RAM. "
+                "Enable GPU acceleration (local faster-whisper) or use a shorter clip."
+            )
 
-    audio_bytes = wav_path.read_bytes()
-    client = OpenAI(api_key=key)
+        set_pipeline_step("openai_whisper_api")
+        client = OpenAI(api_key=key)
 
-    def _request() -> Any:
-        bio = BytesIO(audio_bytes)
-        bio.name = "audio.wav"
-        kwargs: dict[str, Any] = {
-            "model": "whisper-1",
-            "file": bio,
-            "response_format": "verbose_json",
-        }
-        if language:
-            kwargs["language"] = language
-        return client.audio.transcriptions.create(**kwargs)
+        def _request() -> Any:
+            with wav_path.open("rb") as audio_file:
+                kwargs: dict[str, Any] = {
+                    "model": "whisper-1",
+                    "file": audio_file,
+                    "response_format": "verbose_json",
+                }
+                if language:
+                    kwargs["language"] = language
+                return client.audio.transcriptions.create(**kwargs)
 
-    with pipeline_phase("transcription"):
+        with pipeline_phase("transcription"):
+            try:
+                tr = _request()
+            except TypeError:
+                language = None
+                tr = _request()
+
+        segments, full_text = _segments_from_response(tr)
+
+        if not segments and full_text:
+            segments = [{"start": 0.0, "end": 0.0, "text": full_text}]
+            logger.warning("Whisper returned no segments; using single blob.")
+
+        if not full_text and segments:
+            full_text = " ".join(s["text"] for s in segments)
+
+        logger.info("Transcription backend: OpenAI whisper-1 (API).")
+        return segments, full_text
+    finally:
         try:
-            tr = _request()
-        except TypeError:
-            language = None
-            tr = _request()
+            from clip_engine.whisper_runtime import unload_whisper
 
-    segments, full_text = _segments_from_response(tr)
+            unload_whisper()
+        except Exception:
+            pass
+        release_gpu_memory("transcription_complete")
 
-    if not segments and full_text:
-        segments = [{"start": 0.0, "end": 0.0, "text": full_text}]
-        logger.warning("Whisper returned no segments; using single blob.")
 
-    if not full_text and segments:
-        full_text = " ".join(s["text"] for s in segments)
-
-    logger.info("Transcription backend: OpenAI whisper-1 (API).")
-    return segments, full_text
+def _mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f}"
 
 
 def segments_to_prompt_transcript(segments: list[dict[str, Any]], max_chars: int = 100_000) -> str:

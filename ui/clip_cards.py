@@ -56,6 +56,9 @@ from clip_engine.transcription_utils import (
 from clip_engine.upload_manifest import clean_duplicate_uploads, save_upload_once
 from clip_engine.export_vertical import EXPORT_MODE_LABELS, export_clip_preview
 from clip_engine.ffmpeg_resolve import ensure_ffmpeg_on_path
+from clip_engine.job_control import JobCancelledError
+from clip_engine.stability import release_gpu_memory
+from ui.job_helpers import studio_job
 
 logger = logging.getLogger("clip_studio")
 
@@ -74,7 +77,24 @@ def _uploaded_file_size_bytes(upload) -> int:
     try:
         return int(upload.size)
     except Exception:
-        return len(upload.getbuffer())
+        pass
+    total = 0
+    if hasattr(upload, "seek"):
+        try:
+            upload.seek(0)
+        except Exception:
+            pass
+    while True:
+        block = upload.read(4 * 1024 * 1024)
+        if not block:
+            break
+        total += len(block)
+    if hasattr(upload, "seek"):
+        try:
+            upload.seek(0)
+        except Exception:
+            pass
+    return total
 
 
 def _format_size(n: int) -> str:
@@ -511,20 +531,23 @@ def render_clip_card(c: dict, i: int, clips: list[dict], series_export_wids: dic
                 preset = str(st.session_state.get(f"preset_{wid}", c.get("caption_preset", "Clean")))
                 try:
                     with st.spinner("Rendering preview..."):
-                        export_clip_preview(
-                            Path(st.session_state.cs_video_path),
-                            preview_path,
-                            t0_val, t1_val,
-                            st.session_state.get("cs_segments") or [],
-                            caption_preset=preset,
-                            export_mode=export_mode,
-                            advanced_captions=bool(st.session_state.get("cs_enable_advanced_captions", True)),
-                            dynamic_smart_crop=bool(st.session_state.get("cs_enable_dynamic_smart_crop", True)),
-                            prefer_gpu=bool(st.session_state.get("cs_gpu_acceleration", True)),
-                            allow_cpu_fallback=bool(st.session_state.get("cs_allow_cpu_fallback", True)),
-                        )
+                        with studio_job("preview"):
+                            export_clip_preview(
+                                Path(st.session_state.cs_video_path),
+                                preview_path,
+                                t0_val, t1_val,
+                                st.session_state.get("cs_segments") or [],
+                                caption_preset=preset,
+                                export_mode=export_mode,
+                                advanced_captions=bool(st.session_state.get("cs_enable_advanced_captions", True)),
+                                dynamic_smart_crop=bool(st.session_state.get("cs_enable_dynamic_smart_crop", True)),
+                                prefer_gpu=bool(st.session_state.get("cs_gpu_acceleration", True)),
+                                allow_cpu_fallback=bool(st.session_state.get("cs_allow_cpu_fallback", True)),
+                            )
                     st.session_state.cs_previews[wid] = str(preview_path)
                     st.success("Preview ready")
+                except JobCancelledError:
+                    pass
                 except Exception as e:
                     st.error(f"Preview failed: {e}")
             saved_preview = st.session_state.get("cs_previews", {}).get(wid)
@@ -616,7 +639,8 @@ def render_clips_section() -> None:
             if st.button("Save upload to project", type="primary", disabled=sz > CLIP_STUDIO_MAX_UPLOAD_BYTES):
                 bar = st.progress(0.0, text="Preparing to save...")
                 try:
-                    path, reused = save_upload_once(up, progress_bar=bar)
+                    with studio_job("upload"):
+                        path, reused = save_upload_once(up, progress_bar=bar)
                     st.session_state.cs_video_path = path
                     st.session_state["source_video_path"] = str(path)
                     st.session_state.cs_upload_reused = reused
@@ -646,6 +670,8 @@ def render_clips_section() -> None:
                     except TypeError:
                         bar.progress(1.0)
                     st.rerun()
+                except JobCancelledError:
+                    pass
                 except OSError as exc:
                     st.error(f"Could not write file (disk full or permissions?): {exc}")
                 finally:
@@ -697,14 +723,15 @@ def render_clips_section() -> None:
             prefer_gpu = bool(st.session_state.get("cs_gpu_acceleration", True))
             with st.spinner("Transcribing (may take a while for long videos)"):
                 try:
-                    segs, full = transcribe_video(
-                        st.session_state.cs_video_path,
-                        api_key,
-                        work_dir=work,
-                        language=lang,
-                        prefer_gpu=prefer_gpu,
-                        faster_whisper_model=model_sz,
-                    )
+                    with studio_job("transcribe"):
+                        segs, full = transcribe_video(
+                            st.session_state.cs_video_path,
+                            api_key,
+                            work_dir=work,
+                            language=lang,
+                            prefer_gpu=prefer_gpu,
+                            faster_whisper_model=model_sz,
+                        )
                     merged = merge_segments_into_sentences(segs)
                     st.session_state.cs_segments = merged if merged else segs
                     st.session_state.cs_formatted = segments_to_prompt_transcript(
@@ -725,6 +752,8 @@ def render_clips_section() -> None:
                         f"{len(st.session_state.cs_segments)} sentence groups."
                     )
                     st.session_state.cs_session_telemetry = get_session_telemetry().to_dict()
+                except JobCancelledError:
+                    pass
                 except Exception as e:
                     logger.exception("Transcribe failed")
                     category, user_msg = classify_exception(e)
@@ -734,6 +763,8 @@ def render_clips_section() -> None:
                         st.caption(f"Technical detail: {e}")
                     else:
                         st.error(f"**{category}:** {user_msg}")
+                finally:
+                    release_gpu_memory()
 
     if st.session_state.get("cs_status"):
         st.caption(st.session_state.cs_status)
@@ -788,7 +819,8 @@ def render_clips_section() -> None:
         ):
             with st.spinner("Detecting speaker turns via faster-whisper gap analysis..."):
                 try:
-                    _new_turns = diarize_audio_file(str(_work_wav))
+                    with studio_job("diarize"):
+                        _new_turns = diarize_audio_file(str(_work_wav))
                     st.session_state.cs_diarization_turns = _new_turns
                     _diar_turns = _new_turns
                     if _new_turns:
@@ -799,9 +831,13 @@ def render_clips_section() -> None:
                             "No speaker turns detected. "
                             "Ensure faster-whisper is installed (`pip install faster-whisper`)."
                         )
+                except JobCancelledError:
+                    pass
                 except Exception as _diar_exc:
                     logger.exception("Speaker diarization failed")
                     st.error(f"Diarization failed: {_diar_exc}")
+                finally:
+                    release_gpu_memory()
 
         if _diar_turns:
             _unique_speakers = sorted({t["speaker"] for t in _diar_turns})
@@ -913,59 +949,58 @@ def render_clips_section() -> None:
                         break
 
             try:
-                params = _get_analysis_params()
-                vid = params.get("video_filename") or str(st.session_state.get("cs_video_path", ""))
-                th = hash_transcript(params["formatted"], params["segments"])
-                inv = get_invalidation_reason(
-                    st.session_state,
-                    video_identity=vid,
-                    transcript_hash=th,
-                )
-                if inv is None and st.session_state.get("cs_clips") and not st.session_state.get(SESSION_FORCE_REANALYZE):
-                    from clip_engine.clip_finalizer import ensure_clips_finalized
+                with studio_job("analyze"):
+                    params = _get_analysis_params()
+                    vid = params.get("video_filename") or str(st.session_state.get("cs_video_path", ""))
+                    th = hash_transcript(params["formatted"], params["segments"])
+                    inv = get_invalidation_reason(
+                        st.session_state,
+                        video_identity=vid,
+                        transcript_hash=th,
+                    )
+                    if inv is None and st.session_state.get("cs_clips") and not st.session_state.get(SESSION_FORCE_REANALYZE):
+                        from clip_engine.clip_finalizer import ensure_clips_finalized
 
-                    segs = st.session_state.get("cs_segments") or []
-                    export_max = min(float(st.session_state.get("cs_max_clip_seconds", 120)), 120.0)
-                    finalized, _did_finalize = ensure_clips_finalized(
-                        list(st.session_state.cs_clips),
-                        segs,
-                        min_duration=float(st.session_state.get("cs_min_clip_seconds", 25)),
-                        max_duration=export_max,
-                    )
-                    if _did_finalize:
-                        st.session_state.cs_clips = finalized
-                        st.session_state["final_clips"] = finalized
-                    logger.info("[SESSION] no-op analysis rerun — clips still valid")
-                    st.session_state.cs_status = (
-                        f"Using existing {len(st.session_state.cs_clips)} clips "
-                        "(edit hooks/times freely — no new OpenAI calls)."
-                    )
+                        segs = st.session_state.get("cs_segments") or []
+                        export_max = min(float(st.session_state.get("cs_max_clip_seconds", 120)), 120.0)
+                        finalized, _did_finalize = ensure_clips_finalized(
+                            list(st.session_state.cs_clips),
+                            segs,
+                            min_duration=float(st.session_state.get("cs_min_clip_seconds", 25)),
+                            max_duration=export_max,
+                        )
+                        if _did_finalize:
+                            st.session_state.cs_clips = finalized
+                            st.session_state["final_clips"] = finalized
+                        logger.info("[SESSION] no-op analysis rerun — clips still valid")
+                        st.session_state.cs_status = (
+                            f"Using existing {len(st.session_state.cs_clips)} clips "
+                            "(edit hooks/times freely — no new OpenAI calls)."
+                        )
+                        st.session_state.cs_openai_status = ""
+                        _progress_bar.progress(1.0)
+                        _status_placeholder.empty()
+                        _progress_bar.empty()
+                        st.rerun()
+                    clips, pipe_stats = _run_clip_analysis(**params, status_callback=_on_pipeline_status)
+                    pipe_stats = pipe_stats or {}
+                    st.session_state.cs_clips = clips or []
+                    st.session_state["final_clips"] = clips or []
+                    st.session_state.cs_pipeline_stats = pipe_stats
+                    if pipe_stats.get("cache_hit"):
+                        st.session_state.cs_status = "Loaded cached analysis — no OpenAI tokens used."
+                    else:
+                        st.session_state.cs_status = f"Suggested {len(clips)} clips."
                     st.session_state.cs_openai_status = ""
+                    logger.info("[lifecycle] Clip analysis finished — %d clips; app remains active", len(clips or []))
                     _progress_bar.progress(1.0)
                     _status_placeholder.empty()
                     _progress_bar.empty()
-                    st.rerun()
-                clips, pipe_stats = _run_clip_analysis(**params, status_callback=_on_pipeline_status)
-                pipe_stats = pipe_stats or {}
-                st.session_state.cs_clips = clips or []
-                st.session_state["final_clips"] = clips or []
-                st.session_state.cs_pipeline_stats = pipe_stats
-                if pipe_stats.get("cache_hit"):
-                    st.session_state.cs_status = "Loaded cached analysis — no OpenAI tokens used."
-                else:
-                    st.session_state.cs_status = f"Suggested {len(clips)} clips."
-                st.session_state.cs_openai_status = ""
-                logger.info("[lifecycle] Clip analysis finished — %d clips; app remains active", len(clips or []))
+                    release_gpu_memory()
+            except JobCancelledError:
                 _progress_bar.progress(1.0)
                 _status_placeholder.empty()
                 _progress_bar.empty()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        logger.info("[cuda] empty_cache() called after clip analysis")
-                except Exception as exc:
-                    logger.debug("CUDA cache release skipped: %s", exc)
             except OpenAIRateLimitError as e:
                 logger.exception("Clip analysis rate limited")
                 _progress_bar.progress(1.0)
@@ -999,15 +1034,20 @@ def render_clips_section() -> None:
                 st.session_state[SESSION_FORCE_REANALYZE] = True
                 with st.spinner("Re-scoring..."):
                     try:
-                        clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
+                        with studio_job("analyze"):
+                            clips, pipe_stats = _run_clip_analysis(**_get_analysis_params())
                         pipe_stats = pipe_stats or {}
                         st.session_state.cs_clips = clips or []
                         st.session_state["final_clips"] = clips or []
                         st.session_state.cs_pipeline_stats = pipe_stats
                         st.session_state.cs_status = f"Re-scored: {len(clips)} clips."
                         st.rerun()
+                    except JobCancelledError:
+                        pass
                     except Exception as e:
                         st.error(f"Re-score failed: {e}")
+                    finally:
+                        release_gpu_memory()
 
     with col_more:
         if st.session_state.cs_clips:
@@ -1015,7 +1055,8 @@ def render_clips_section() -> None:
             if st.button("Find more clips", width="stretch", disabled=not can_analyze):
                 with st.spinner("Finding more..."):
                     try:
-                        extra, extra_stats = _run_clip_analysis(**_get_analysis_params())
+                        with studio_job("analyze"):
+                            extra, extra_stats = _run_clip_analysis(**_get_analysis_params())
                         extra_stats = extra_stats or {}
                         existing_ranges = {
                             (c.get("start_seconds"), c.get("end_seconds"))

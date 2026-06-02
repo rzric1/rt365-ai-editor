@@ -122,7 +122,7 @@ def diarize_audio_file(audio_path: str) -> list[dict]:
             logger.warning("Failed to read diarization cache: %s", exc)
 
     try:
-        from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel  # noqa: F401
     except ImportError:
         logger.warning(
             "faster-whisper not installed. "
@@ -131,11 +131,14 @@ def diarize_audio_file(audio_path: str) -> list[dict]:
         return []
 
     try:
+        from clip_engine.job_control import check_cancelled
+        from clip_engine.whisper_runtime import get_whisper_model
+
         device = "cuda" if cuda_available() else "cpu"
         compute = "float16" if device == "cuda" else "int8"
         logger.info("faster-whisper diarization: device=%s compute=%s", device, compute)
 
-        model = WhisperModel("base", device=device, compute_type=compute)
+        model = get_whisper_model(model_size="base", device=device, compute_type=compute)
         segments_iter, _info = model.transcribe(
             audio_path,
             word_timestamps=True,
@@ -144,6 +147,7 @@ def diarize_audio_file(audio_path: str) -> list[dict]:
 
         words: list[dict] = []
         for seg in segments_iter:
+            check_cancelled()
             if seg.words:
                 for w in seg.words:
                     words.append(
@@ -173,6 +177,13 @@ def diarize_audio_file(audio_path: str) -> list[dict]:
     except Exception as exc:
         logger.warning("faster-whisper diarization failed: %s", exc)
         return []
+    finally:
+        try:
+            from clip_engine.stability import release_gpu_memory
+
+            release_gpu_memory()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -1,137 +1,115 @@
 # RT365 AI Clip Studio — Stability Report
 
-Verification of lifecycle cleanup and shutdown behavior (static analysis + architectural review).
+**Audit date:** 2026-06-01  
+**Scope:** Job serialization, cancellation, subprocess/GPU/temp cleanup, exception handling
 
 ---
 
-## 1. FFmpeg process termination
+## 1. Verification checklist
 
-| Check | Result | Evidence |
-|-------|--------|----------|
-| Uses `subprocess.run` with timeout (export) | **Pass** | `export_vertical._FFMPEG_TIMEOUT_SECONDS = 300` |
-| Uses timeout (probe) | **Pass** | `media_probe` 120 s |
-| Uses timeout (compress utility) | **Pass** | `ffmpeg_gpu.run_ffmpeg_checked` 7200 s |
-| Audio extract timeout | **FAIL** | `audio_extract.extract_audio_wav` — no timeout |
-| Kill on Streamlit stop | **FAIL** | No signal handlers or `atexit` |
-| Kill on user Cancel | **FAIL** | No cancel API |
-| Zombie risk after crash | **FAIL** | Windows orphan `ffmpeg.exe` possible |
-
-**Verdict:** FFmpeg **usually** terminates when commands complete or hit timeout; **not guaranteed** on abnormal parent exit.
-
----
-
-## 2. Temporary file deletion
-
-| Artifact | Deleted? | Mechanism |
-|----------|----------|-----------|
-| `._tmp.ass` (captions) | **Yes** | `export_vertical` `finally: ass_file.unlink` |
-| `_whisper_input.wav` | **No** | Overwritten on next transcribe only |
-| Preview MP4s | **No** | `outputs/previews/` |
-| Session export dirs | **No** | Intentional user output |
-| Analysis cache | **Partial** | `analysis_cache` can clear by key; no auto TTL |
-| Diarization JSON cache | **No** | Beside WAV path |
-| Streamlit temp uploads | **Streamlit-managed** | OS temp |
-
-**Verdict:** Export subtitle temps are clean; **work directory accumulates** unless user deletes.
+| Control | Required | Status | Implementation |
+|---------|----------|--------|----------------|
+| One active transcription | Yes | **PASS** | `studio_job("transcribe")` + `try_acquire_job` |
+| One export at a time | Yes | **PASS** | `studio_job("export")` + `_EXPORT_LOCK` |
+| One AI scoring pass at a time | Yes | **PASS** | `studio_job("analyze")` — all analyze buttons share lock name |
+| Proper cancellation | Yes | **PASS** | `request_cancel()` → `check_cancelled()` + `terminate_all_tracked()` |
+| FFmpeg cleanup (tracked) | Yes | **PASS** | `subprocess_guard.run_subprocess` + `atexit` |
+| FFmpeg cleanup (orphan) | Yes | **PASS** (enhanced) | `terminate_orphan_ffmpeg()` startup + cancel + sidebar |
+| CUDA cleanup | Partial | **PASS with gaps** | `release_gpu_memory`, `unload_whisper` after transcribe; analyze clears torch cache |
+| Temp file cleanup | Yes | **PASS** | `cleanup_temp_artifacts()` — `._tmp.ass`, `.partial.mp4`, stale previews, work WAV |
+| Exception handling | Yes | **PASS** | `sys.excepthook` → `crash_report.txt`; per-job `write_crash_report` in `studio_job` |
 
 ---
 
-## 3. Worker shutdown
+## 2. Job control architecture
 
-| Worker type | Present | Clean shutdown |
-|-------------|---------|----------------|
-| Background threads | Export lock holder only | Dies with process |
-| ThreadPoolExecutor (EDL) | Short-lived `with` block | **Pass** |
-| Multiprocessing workers | None | N/A |
-| Scheduled tasks | None | N/A |
+```
+User action (Streamlit button)
+    → ui.job_helpers.studio_job("<name>")
+        → try_acquire_job(name)  # raises JobBusyError if another name active
+        → pipeline work + check_cancelled() at phase boundaries
+        → release_job(name) in finally
+```
 
-**Verdict:** No worker pool to drain; **Streamlit Ctrl+C** stops Python; children may survive.
+**Cancel path:**
 
----
+```
+Sidebar "Cancel current job"
+    → request_cancel()  # sets Event
+    → terminate_all_tracked()
+    → terminate_orphan_ffmpeg()
+    → release_job(active)
+    → st.rerun()
+```
 
-## 4. GPU memory release
+**Job names in use:** `upload`, `transcribe`, `diarize`, `analyze`, `preview`, `export`.
 
-| Action | Released? |
-|--------|-----------|
-| After Analyze | `torch.cuda.empty_cache()` if torch importable — **Whisper not explicitly freed** |
-| After Transcribe | **No** automatic release |
-| After Export (NVENC) | FFmpeg process exit releases NVENC context — **Pass** |
-| SentenceTransformer | Stays in `_MODEL` until process exit |
-| YOLO | Local variable; GC-dependent — **unreliable for CUDA** |
-
-**Verdict:** **Partial** — one explicit cache clear after analysis; Whisper/YOLO VRAM may linger until process end.
-
----
-
-## 5. Model unload
-
-| Model | Unload call | Verdict |
-|-------|-------------|---------|
-| faster-whisper | None | **Fail** |
-| sentence-transformers | None (singleton) | By design |
-| YOLO | None per call | **Fail** |
-| OpenAI client | Stateless HTTP | N/A |
+**Gap:** Resolve send (`resolve_panel.py`) does not use `studio_job` — can run during idle only; low risk (30 s subprocess).
 
 ---
 
-## 6. Browser / Streamlit session
+## 3. Subprocess & FFmpeg stability
 
-| Check | Result |
-|-------|--------|
-| Closing browser tab | Streamlit server **keeps running** |
-| Closing terminal / Ctrl+C | Server stops; ffmpeg may orphan |
-| Session state persistence | In-memory only — lost on restart |
-| `maxUploadSize` 4096 MB | Server accepts large POST |
+| Path | Tracked | Cancel-aware | Timeout |
+|------|---------|--------------|---------|
+| `audio_extract` | Yes | Yes | 7200 s |
+| `export_vertical` encode | Yes | Yes | 300 s |
+| `nvidia-smi` headroom | Yes | Yes | 5 s |
+| `media_probe` | No | No | 120 s |
+| `smart_crop` ffprobe | No | No | — |
+| `ffmpeg_gpu` probe | No | N/A | 25 s |
+| `resolve_bridge` | No | No | 30 s |
 
-**Verdict:** User must **stop launcher window** to end server; browser close is insufficient.
-
----
-
-## 7. DaVinci Resolve connections
-
-| Path | Termination |
-|------|-------------|
-| `resolve_bridge.py` subprocess | Exits after JSON response or 30 s timeout |
-| In-process `resolve_client` (companion) | Connection lifetime = script lifetime |
-| Timeline/markers API | No explicit disconnect in bridge |
-
-**Verdict:** **Pass** for subprocess bridge; Resolve app itself stays open (expected).
+**Fix applied:** `_check_gpu_headroom` removed invalid `capture_output=` kwarg that silently disabled VRAM checks.
 
 ---
 
-## 8. Logging under failure
+## 4. CUDA / model lifecycle
 
-| Feature | Status |
-|---------|--------|
-| Rotating logs | **Pass** — 10 MB × 5 files |
-| Exception in UI | Logged via `logger.exception` |
-| GPU snapshots | `log_gpu_memory` on export path |
-| Crash dump auto | **Not implemented** |
-| Windows Event Log integration | **None** |
+| Asset | Load | Release |
+|-------|------|---------|
+| faster-whisper | `whisper_runtime.get_whisper_model` | `unload_whisper()` after `transcribe_video` finally |
+| torch (optional) | analyze / embeddings | `release_gpu_memory()` |
+| NVENC | FFmpeg child | Process exit on encode complete |
 
----
-
-## 9. Stability scorecard (component)
-
-| Component | Score /10 | Notes |
-|-----------|-----------|-------|
-| Export pipeline | 7 | Lock + timeout + ass cleanup |
-| Transcription | 4 | No model reuse, no WAV cleanup |
-| Upload path | 3 | RAM spike |
-| Analyze pipeline | 6 | Cache + backoff; blocks UI |
-| Resolve integration | 8 | Short subprocess |
-| Overall process hygiene | 5 | Orphan ffmpeg risk |
+**Risk:** Diarization may load whisper words path separately — monitor VRAM if transcribe + diarize back-to-back without restart.
 
 ---
 
-## 10. Operational stability recommendations (no code)
+## 5. Temp & crash artifacts
 
-1. After any crash, run `taskkill /IM ffmpeg.exe /F` and restart Streamlit.
-2. Prefer **Local file path** over browser upload for files > 2 GB.
-3. Restart Clip Studio between **Transcribe → Analyze → Export** on machines with ≤16 GB RAM.
-4. Monitor `logs/gpu.log` and `logs/exports.log` after incidents.
-5. Keep one Streamlit instance (check port 8501).
+| Artifact | Cleanup |
+|----------|---------|
+| `outputs/_work/_whisper_input.wav` | Startup `cleanup_temp_artifacts` |
+| `._tmp.ass` | Export `finally` + startup sweep |
+| `*.partial.mp4` | Startup sweep |
+| Old previews (>7 days) | Startup sweep |
+| `logs/crash_report.txt` | Append-only forensic log |
+| `logs/startup_diagnostics.txt` | Overwritten each app start |
 
 ---
 
-*See FIX_PLAN.md for prioritized engineering fixes.*
+## 6. Streamlit-specific stability notes
+
+- **Full script rerun** on every widget change — no background worker queue.
+- Long operations block the rerun thread — expected.
+- **Session RAM** grows with transcript + clips — not a leak in Python GC sense; session lifetime issue.
+- Double-clicking actions before rerun completes can queue UX confusion; job lock prevents overlapping *different* job types.
+
+---
+
+## 7. Test coverage
+
+| Test file | Coverage |
+|-----------|----------|
+| `tests/test_stability_controls.py` | Job lock, cancel, crash report, startup diag, resource snapshot, orphan finder |
+
+Run in AI venv: `python -m pytest tests/test_stability_controls.py`
+
+---
+
+## 8. Stability verdict
+
+**Core controls are in place** for a single-user workstation deployment. Remaining instability is dominated by **GPU driver TDR**, **optional dependency gaps**, and **untracked short subprocesses** — not missing job locks.
+
+**Post-audit enhancements:** orphan ffmpeg termination, whisper unload after transcribe, resource snapshot logging, GPU headroom fix.

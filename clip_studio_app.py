@@ -15,6 +15,14 @@ import streamlit as st
 
 from config import LOGS_DIR
 from clip_engine.telemetry import configure_rotating_logs, classify_exception, get_session_telemetry
+from clip_engine.stability import (
+    cleanup_temp_artifacts,
+    install_exception_hooks,
+    log_resource_snapshot,
+    run_startup_diagnostics,
+    write_crash_report,
+)
+from clip_engine.subprocess_guard import terminate_orphan_ffmpeg
 
 from ui.session_state import init_session_state, flush_pending_long_defaults
 from ui.sidebar import render_sidebar
@@ -23,6 +31,33 @@ from ui.export_panel import render_export_panel
 from ui.resolve_panel import render_resolve_panel
 
 logger = logging.getLogger("clip_studio")
+_STARTUP_DONE = False
+
+
+def _ensure_startup() -> None:
+    global _STARTUP_DONE
+    if _STARTUP_DONE:
+        return
+    _STARTUP_DONE = True
+    install_exception_hooks()
+    try:
+        cleanup_temp_artifacts()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Temp cleanup at startup failed: %s", exc)
+    try:
+        n = terminate_orphan_ffmpeg()
+        if n:
+            logger.warning("Terminated %s orphan ffmpeg process(es) at startup", n)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Orphan ffmpeg cleanup at startup failed: %s", exc)
+    try:
+        log_resource_snapshot(label="startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Resource snapshot at startup failed: %s", exc)
+    try:
+        run_startup_diagnostics()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Startup diagnostics failed: %s", exc)
 
 
 def main() -> None:
@@ -35,6 +70,7 @@ def main() -> None:
     try:
         logging.basicConfig(level=logging.INFO)
         configure_rotating_logs(LOGS_DIR)
+        _ensure_startup()
         init_session_state()
         flush_pending_long_defaults()
         render_sidebar()
@@ -43,6 +79,10 @@ def main() -> None:
         render_resolve_panel()
     except Exception as e:
         logger.exception("Clip Studio UI failed")
+        try:
+            write_crash_report(e, context="clip_studio_main")
+        except Exception:
+            pass
         print(traceback.format_exc())
         st.error(f"**Clip Studio error:** {e}")
         with st.expander("Technical details", expanded=True):
