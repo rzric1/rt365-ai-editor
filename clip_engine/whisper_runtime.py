@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
+import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,20 @@ def get_whisper_model(*, model_size: str, device: str, compute_type: str) -> Any
             device,
             compute_type,
         )
+        try:
+            smi = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used,memory.free,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            logger.info("[whisper] post-load nvidia-smi: %s", smi.stdout.strip())
+        except Exception as exc:
+            logger.debug("[whisper] nvidia-smi query failed: %s", exc)
         return _model
 
 
@@ -68,12 +85,38 @@ def transcribe_wav(
         model_size=model_size, device=device, compute_type=compute_type
     )
     check_cancelled()
+    t_start = time.perf_counter()
     segs_iter, info = model.transcribe(
         str(wav_path),
         language=language,
         beam_size=5,
         vad_filter=True,
     )
+
+    first_seg = None
+    try:
+        first_seg = next(iter(segs_iter))
+        elapsed_to_first = time.perf_counter() - t_start
+        logger.info("[whisper] first_segment_latency_sec=%.2f", elapsed_to_first)
+        segs_iter = itertools.chain([first_seg], segs_iter)
+    except StopIteration:
+        logger.warning("[whisper] transcription produced zero segments")
+
+    try:
+        smi = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info("[whisper] mid-transcription nvidia-smi: %s", smi.stdout.strip())
+    except Exception:
+        pass
+
     segments: list[dict] = []
     text_parts: list[str] = []
     for seg in segs_iter:

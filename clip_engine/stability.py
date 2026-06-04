@@ -26,6 +26,7 @@ logger = logging.getLogger("clip_engine.stability")
 
 CRASH_REPORT_PATH = LOGS_DIR / "crash_report.txt"
 STARTUP_DIAG_PATH = LOGS_DIR / "startup_diagnostics.txt"
+GPU_TRANSCRIPTION_DIAG_PATH = LOGS_DIR / "gpu_transcription_diagnostics.txt"
 
 # Cloud Whisper: refuse to load entire WAV into RAM above this size.
 MAX_CLOUD_WHISPER_WAV_BYTES = 25 * 1024 * 1024
@@ -157,6 +158,65 @@ def release_gpu_memory(label: str = "") -> None:
         logger.debug("empty_cache skipped: %s", exc)
 
 
+def write_gpu_transcription_diagnostics(
+    output_path: str | Path | None = None,
+) -> None:
+    """Append GPU / CTranslate2 / PyTorch snapshot for transcription debugging."""
+    import subprocess
+
+    path = Path(output_path) if output_path is not None else GPU_TRANSCRIPTION_DIAG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"=== GPU Transcription Diagnostics @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
+    ]
+
+    try:
+        smi = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.free,memory.total,"
+                "utilization.gpu,driver_version",
+                "--format=csv",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        lines.append("\n--- nvidia-smi ---")
+        lines.append(smi.stdout.strip())
+    except Exception as e:
+        lines.append(f"nvidia-smi failed: {e}")
+
+    try:
+        import ctranslate2
+
+        lines.append("\n--- CTranslate2 ---")
+        lines.append(f"version: {ctranslate2.__version__}")
+        lines.append(f"cuda_device_count: {ctranslate2.get_cuda_device_count()}")
+        lines.append(
+            f"supported_compute_types(cuda): "
+            f"{ctranslate2.get_supported_compute_types('cuda')}"
+        )
+    except Exception as e:
+        lines.append(f"ctranslate2 error: {e}")
+
+    lines.append("\n--- PyTorch ---")
+    try:
+        import torch
+
+        lines.append(f"version: {torch.__version__}")
+        lines.append(f"cuda_available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            lines.append(f"device_name: {torch.cuda.get_device_name(0)}")
+            props = torch.cuda.get_device_properties(0)
+            lines.append(f"total_vram_gb: {props.total_memory / 1e9:.2f}")
+    except Exception as e:
+        lines.append(f"torch error: {e}")
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n\n")
+
+
 def run_startup_diagnostics() -> str:
     """Write logs/startup_diagnostics.txt and return summary text."""
     ensure_directories()
@@ -172,6 +232,10 @@ def run_startup_diagnostics() -> str:
         "=== RTX / NVIDIA (4090-class) ===",
     ]
     snap = _system_snapshot()
+    try:
+        write_gpu_transcription_diagnostics()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("GPU transcription diagnostics write failed: %s", exc)
     lines.append(f"nvidia-smi OK: {snap.get('nvidia_smi_ok')}")
     lines.append(f"Driver CUDA (banner): {snap.get('driver_cuda')}")
     lines.append(f"GPU: {snap.get('gpu_line')}")

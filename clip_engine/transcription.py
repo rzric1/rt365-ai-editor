@@ -113,6 +113,11 @@ def transcribe_with_faster_whisper_cuda(
 
     use_cpu_fallback = n_cuda > 0 and (not cuda_ok or cuda_attempted)
     if use_cpu_fallback:
+        logger.error(
+            "[whisper] ⚠️  CUDA unavailable or probe failed — falling back to CPU int8. "
+            "Transcription will be SLOW. Check cublas64_12.dll is on PATH. "
+            "Run: where.exe cublas64_12.dll  to verify."
+        )
         for comp in ("int8", "float32"):
             try:
                 set_pipeline_step(f"whisper_cpu_{comp}")
@@ -175,8 +180,11 @@ def transcribe_video(
                 )
             if local is not None:
                 segs, txt, dev_tag = local
-                label = "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU int8/float32 fallback)"
-                logger.info("Transcription backend: %s", label)
+                logger.info(
+                    "[transcribe] backend=%s device=%s",
+                    "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU FALLBACK)",
+                    dev_tag,
+                )
                 return segs, txt
             logger.info("Transcription backend: falling back to OpenAI whisper-1 API.")
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from pathlib import Path
 
 from clip_engine.ffmpeg_resolve import ensure_ffmpeg_on_path, get_ffmpeg_executable
@@ -42,9 +44,20 @@ def extract_audio_wav(video_path: Path, wav_out: Path, *, sample_rate: int = 160
     ]
     set_pipeline_step("audio_extract")
     logger.info("ffmpeg extract: %s", " ".join(cmd))
+    t_start = time.perf_counter()
     run_subprocess(
         cmd,
         timeout=FFMPEG_EXTRACT_TIMEOUT_SEC,
         label="ffmpeg_audio_extract",
         check=True,
     )
+    elapsed = time.perf_counter() - t_start
+    wav_size = os.path.getsize(wav_out) if wav_out.exists() else 0
+    logger.info(
+        "ffmpeg_audio_extract complete: duration_sec=%.1f wav_size_mb=%.1f path=%s",
+        elapsed,
+        wav_size / 1_048_576,
+        wav_out,
+    )
+    if wav_size == 0:
+        raise RuntimeError(f"FFmpeg produced a zero-byte WAV file: {wav_out}")

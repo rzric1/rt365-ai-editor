@@ -333,8 +333,11 @@ def collect_ai_acceleration_diagnostics(*, refresh_cuda_probe: bool = False) -> 
         )
     elif not cuda_ok:
         hint = (
-            "Local: CUDA device(s) reported but **runtime probe failed** (often missing **cublas64_12.dll**). "
-            "App will try **faster-whisper CPU (int8)** then **OpenAI API**."
+            "⚠️  CUDA runtime probe FAILED — transcription is running on CPU (slow). "
+            "Fix: run 'where.exe cublas64_12.dll' in PowerShell. If not found, install "
+            "NVIDIA CUDA Toolkit 12.x from https://developer.nvidia.com/cuda-downloads "
+            "and ensure C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.x\\bin "
+            "is on your system PATH, then restart the app."
         )
     else:
         hint = "Local: **faster-whisper on CUDA** should work when GPU acceleration is on."
