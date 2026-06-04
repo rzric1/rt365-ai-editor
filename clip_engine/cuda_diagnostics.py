@@ -488,7 +488,11 @@ def gpu_pid_check(*, context: str = "") -> tuple[bool, str]:
                 vram = parts[2] if len(parts) > 2 else "?"
                 python_rows.append(f"{row_pid}({proc_name},{vram})")
                 if row_pid == pid:
-                    msg = f"{prefix} INFO pid={pid} in compute-apps (python): {parts[1]} VRAM={vram}"
+                    msg = (
+                        f"{prefix} INFO pid={pid} in compute-apps (python): {parts[1]} "
+                        f"VRAM={vram}; sys.executable={sys.executable} "
+                        "(authoritative for .venv311 on Windows)"
+                    )
                     logger.info(msg)
                     return True, msg
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -527,3 +531,151 @@ def gpu_pid_check(*, context: str = "") -> tuple[bool, str]:
         )
     logger.warning(msg)
     return False, msg
+
+
+def query_nvidia_gpu_memory_and_util() -> tuple[int | None, int | None]:
+    """
+    Return (memory_used_mib, utilization_gpu_pct) for GPU 0 via nvidia-smi.
+    Used for faster-whisper / CTranslate2 GPU checks (not torch.cuda memory).
+    """
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None, None
+    try:
+        r = subprocess.run(
+            [
+                exe,
+                "--query-gpu=memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **_subprocess_kw(),
+        )
+        if r.returncode != 0:
+            return None, None
+        parts = [p.strip() for p in (r.stdout or "").strip().split(",")]
+        if len(parts) < 2:
+            return None, None
+        return int(float(parts[0])), int(float(parts[1].rstrip(" %")))
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        logger.debug("nvidia-smi memory/util query failed: %s", exc)
+        return None, None
+
+
+def get_startup_cuda_log_lines() -> list[str]:
+    """Lines written to logs/startup_diagnostics.txt for CUDA / DLL / venv checks."""
+    from clip_engine.whisper_runtime import (  # noqa: PLC0415
+        get_cuda_dll_fix_startup_lines,
+        get_env_startup_line,
+    )
+
+    lines = list(get_cuda_dll_fix_startup_lines())
+    lines.append(get_env_startup_line())
+    try:
+        d = collect_ai_acceleration_diagnostics(refresh_cuda_probe=True)
+        lines.append(
+            f"[ai-accel] cuBLAS paths={len(d.cublas_paths)} load_ok={d.cublas_load_ok} "
+            f"{d.cublas_load_detail[:200]}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[ai-accel] cuBLAS collect failed: {exc}")
+    lines.append(
+        "Windows venv note: nvidia-smi may list the base python.exe path while "
+        "sys.executable / logs/rt365_app.lock show .venv311\\Scripts\\python.exe."
+    )
+    return lines
+
+
+@dataclass
+class GpuTranscriptionCheck:
+    name: str
+    passed: bool
+    detail: str
+
+
+def evaluate_gpu_transcription_checks(
+    *,
+    segment_count: int,
+    requested_device: str,
+    actual_device: str,
+    sys_executable: str | None = None,
+    gpu_mem_before_mib: int | None = None,
+    gpu_mem_after_mib: int | None = None,
+    gpu_util_before_pct: int | None = None,
+    gpu_util_after_pct: int | None = None,
+) -> list[GpuTranscriptionCheck]:
+    """
+    Pass criteria for local GPU transcription (CTranslate2 / faster-whisper).
+    Does not use torch.cuda.memory_allocated() or WhisperModel.device.
+    """
+    exe = sys_executable or sys.executable
+    venv_ok = ".venv311" in exe.replace("\\", "/")
+    checks: list[GpuTranscriptionCheck] = []
+
+    checks.append(
+        GpuTranscriptionCheck(
+            "sys.executable uses .venv311",
+            venv_ok,
+            exe,
+        )
+    )
+    cuda_device = str(actual_device).lower() == "cuda" or (
+        str(requested_device).lower() == "cuda"
+        and "cuda" in str(actual_device).lower()
+    )
+    checks.append(
+        GpuTranscriptionCheck(
+            "whisper actual_device=cuda",
+            cuda_device,
+            f"requested={requested_device} actual={actual_device} "
+            "(expect log line: actual_device=cuda)",
+        )
+    )
+    checks.append(
+        GpuTranscriptionCheck(
+            "transcription segments > 0",
+            segment_count > 0,
+            str(segment_count),
+        )
+    )
+
+    util_rise = False
+    util_detail = f"before={gpu_util_before_pct}% after={gpu_util_after_pct}%"
+    if gpu_util_before_pct is not None and gpu_util_after_pct is not None:
+        util_rise = gpu_util_after_pct > max(gpu_util_before_pct, 10)
+        util_detail += f" (rise>{max(gpu_util_before_pct, 10)}%={util_rise})"
+    elif gpu_util_after_pct is not None:
+        util_rise = gpu_util_after_pct > 10
+        util_detail += f" (after-only >10%={util_rise})"
+    checks.append(
+        GpuTranscriptionCheck(
+            "nvidia-smi GPU utilization during/after transcribe",
+            util_rise,
+            util_detail,
+        )
+    )
+
+    vram_rise = False
+    vram_detail = f"before={gpu_mem_before_mib} MiB after={gpu_mem_after_mib} MiB"
+    if gpu_mem_before_mib is not None and gpu_mem_after_mib is not None:
+        vram_rise = gpu_mem_after_mib > gpu_mem_before_mib
+        vram_detail += f" delta={gpu_mem_after_mib - gpu_mem_before_mib} MiB"
+    checks.append(
+        GpuTranscriptionCheck(
+            "nvidia-smi VRAM increased during transcribe",
+            vram_rise,
+            vram_detail,
+        )
+    )
+
+    return checks
+
+
+def format_gpu_transcription_check_report(checks: list[GpuTranscriptionCheck]) -> str:
+    lines = ["--- GPU transcription pass criteria ---"]
+    for c in checks:
+        status = "PASS" if c.passed else "FAIL"
+        lines.append(f"[{status}] {c.name}: {c.detail}")
+    return "\n".join(lines)

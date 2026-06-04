@@ -30,7 +30,6 @@ def _torch_info() -> dict[str, Any]:
         "cuda_version": None,
         "cuda_available": False,
         "device_name": None,
-        "vram_gb": None,
     }
     try:
         import torch
@@ -41,10 +40,18 @@ def _torch_info() -> dict[str, Any]:
         out["cuda_available"] = bool(torch.cuda.is_available())
         if out["cuda_available"]:
             out["device_name"] = torch.cuda.get_device_name(0)
-            out["vram_gb"] = f"{torch.cuda.memory_allocated(0) / 1e9:.3f}"
     except Exception:
         pass
     return out
+
+
+def _nvidia_smi_gpu_line() -> str:
+    from clip_engine.cuda_diagnostics import query_nvidia_gpu_memory_and_util
+
+    mem, util = query_nvidia_gpu_memory_and_util()
+    if mem is None and util is None:
+        return "nvidia-smi unavailable"
+    return f"memory.used={mem} MiB, utilization.gpu={util}% (CTranslate2 / Whisper)"
 
 
 def _ctranslate2_version() -> str:
@@ -74,10 +81,13 @@ def render_runtime_debug_panel() -> None:
             st.markdown(f"**torch.cuda.is_available():** `{torch_i['cuda_available']}`")
             if torch_i["device_name"]:
                 st.markdown(f"**GPU name:** `{torch_i['device_name']}`")
-            if torch_i["vram_gb"] is not None:
-                st.markdown(f"**VRAM allocated:** `{torch_i['vram_gb']}` GB")
         else:
             st.markdown("**torch:** not installed")
+
+        st.markdown(f"**GPU (nvidia-smi):** `{_nvidia_smi_gpu_line()}`")
+        st.markdown(
+            "Whisper VRAM/util: see nvidia-smi above (not `torch.cuda.memory_allocated`)."
+        )
 
         st.markdown(f"**ctranslate2:** `{_ctranslate2_version()}`")
 

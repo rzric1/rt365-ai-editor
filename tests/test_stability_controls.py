@@ -56,11 +56,38 @@ def test_startup_diagnostics_writes(tmp_path, monkeypatch):
     from clip_engine import stability
 
     diag_file = tmp_path / "startup_diagnostics.txt"
+    gpu_diag = tmp_path / "gpu_transcription_diagnostics.txt"
     monkeypatch.setattr(stability, "STARTUP_DIAG_PATH", diag_file)
+    monkeypatch.setattr(stability, "GPU_TRANSCRIPTION_DIAG_PATH", gpu_diag)
     stability.run_startup_diagnostics()
     assert diag_file.is_file()
     body = diag_file.read_text(encoding="utf-8")
     assert "python" in body.lower() or "Python" in body
+    assert "[cuda-dll-fix] prepended torch lib to PATH" in body
+    assert "[cuda-dll-fix] os.add_dll_directory" in body
+    assert "[ai-accel] cuBLAS" in body
+    assert "[env] pid=" in body and "executable=" in body
+
+
+def test_gpu_transcription_pass_criteria():
+    from clip_engine.cuda_diagnostics import evaluate_gpu_transcription_checks
+
+    checks = evaluate_gpu_transcription_checks(
+        segment_count=10,
+        requested_device="cuda",
+        actual_device="cuda",
+        sys_executable=r"C:\dev\rt365-ai-editor\.venv311\Scripts\python.exe",
+        gpu_mem_before_mib=1700,
+        gpu_mem_after_mib=2400,
+        gpu_util_before_pct=5,
+        gpu_util_after_pct=45,
+    )
+    by_name = {c.name: c for c in checks}
+    assert by_name["sys.executable uses .venv311"].passed
+    assert by_name["whisper actual_device=cuda"].passed
+    assert by_name["transcription segments > 0"].passed
+    assert by_name["nvidia-smi GPU utilization during/after transcribe"].passed
+    assert by_name["nvidia-smi VRAM increased during transcribe"].passed
 
 
 def test_orphan_ffmpeg_finder_no_psutil_crash():

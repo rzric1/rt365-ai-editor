@@ -200,7 +200,15 @@ def write_gpu_transcription_diagnostics(
     except Exception as e:
         lines.append(f"ctranslate2 error: {e}")
 
-    lines.append("\n--- PyTorch ---")
+    lines.append("\n--- Environment (authoritative venv) ---")
+    lines.append(f"sys.executable: {sys.executable}")
+    lines.append(f"sys.prefix: {sys.prefix}")
+    lines.append(
+        "Note: faster-whisper uses CTranslate2 CUDA, not torch.cuda.memory_allocated(). "
+        "Use nvidia-smi memory.used / utilization.gpu and whisper logs (actual_device=cuda)."
+    )
+
+    lines.append("\n--- PyTorch (optional; not Whisper VRAM) ---")
     try:
         import torch
 
@@ -217,6 +225,42 @@ def write_gpu_transcription_diagnostics(
         f.write("\n".join(lines) + "\n\n")
 
 
+def append_gpu_transcription_session_result(
+    *,
+    segment_count: int,
+    requested_device: str,
+    actual_device: str,
+    gpu_mem_before_mib: int | None,
+    gpu_mem_after_mib: int | None,
+    gpu_util_before_pct: int | None,
+    gpu_util_after_pct: int | None,
+) -> None:
+    """Append post-transcription GPU pass/fail block (diagnostics only)."""
+    from clip_engine.cuda_diagnostics import (
+        evaluate_gpu_transcription_checks,
+        format_gpu_transcription_check_report,
+    )
+
+    checks = evaluate_gpu_transcription_checks(
+        segment_count=segment_count,
+        requested_device=requested_device,
+        actual_device=actual_device,
+        gpu_mem_before_mib=gpu_mem_before_mib,
+        gpu_mem_after_mib=gpu_mem_after_mib,
+        gpu_util_before_pct=gpu_util_before_pct,
+        gpu_util_after_pct=gpu_util_after_pct,
+    )
+    block = [
+        f"=== GPU Transcription Session @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
+        f"segments={segment_count} requested_device={requested_device} actual_device={actual_device}",
+        format_gpu_transcription_check_report(checks),
+        "",
+    ]
+    GPU_TRANSCRIPTION_DIAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with GPU_TRANSCRIPTION_DIAG_PATH.open("a", encoding="utf-8") as f:
+        f.write("\n".join(block))
+
+
 def run_startup_diagnostics() -> str:
     """Write logs/startup_diagnostics.txt and return summary text."""
     ensure_directories()
@@ -228,9 +272,19 @@ def run_startup_diagnostics() -> str:
         "=== System ===",
         f"Platform: {platform.platform()}",
         f"Python: {sys.version.split()[0]}",
+        f"Python executable: {sys.executable}",
+        f"Virtual env prefix: {sys.prefix}",
         "",
-        "=== RTX / NVIDIA (4090-class) ===",
+        "=== CUDA / AI acceleration (startup) ===",
     ]
+    try:
+        from clip_engine.cuda_diagnostics import get_startup_cuda_log_lines
+
+        lines.extend(get_startup_cuda_log_lines())
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"CUDA startup log lines failed: {exc}")
+    lines.append("")
+    lines.append("=== RTX / NVIDIA (4090-class) ===")
     snap = _system_snapshot()
     try:
         write_gpu_transcription_diagnostics()
@@ -246,8 +300,11 @@ def run_startup_diagnostics() -> str:
         lines.append(f"Torch device: {snap.get('torch_device')}")
     if snap.get("vram_total_gb"):
         lines.append(
-            f"VRAM total / allocated / reserved (GB): "
+            f"VRAM total / torch allocated / reserved (GB): "
             f"{snap.get('vram_total_gb')} / {snap.get('vram_allocated_gb')} / {snap.get('vram_reserved_gb')}"
+        )
+        lines.append(
+            "Whisper GPU VRAM: use nvidia-smi memory.used (CTranslate2), not torch.cuda.memory_allocated()."
         )
     lines.append("")
     lines.append("=== Resources ===")

@@ -21,6 +21,11 @@ def _torch_lib_dir() -> str | None:
     return None
 
 
+_dll_fix_torch_lib: str | None = None
+_dll_fix_prepended: bool = False
+_dll_fix_directory_added: bool = False
+
+
 def _prepend_venv_cuda_dlls() -> None:
     """
     On Windows, torch bundles its own CUDA DLLs under .venv/Lib/site-packages/torch/lib/.
@@ -28,14 +33,17 @@ def _prepend_venv_cuda_dlls() -> None:
     DLL search picks up the system cublas64_12.dll first, causing WinError 127 symbol
     mismatch. Prepending the torch lib path to PATH forces torch's bundled DLLs to win.
     """
+    global _dll_fix_torch_lib, _dll_fix_prepended
     if sys.platform != "win32":
         return
     try:
         torch_lib = _torch_lib_dir()
         if torch_lib:
+            _dll_fix_torch_lib = torch_lib
             current = os.environ.get("PATH", "")
             if torch_lib.lower() not in current.lower():
                 os.environ["PATH"] = torch_lib + os.pathsep + current
+                _dll_fix_prepended = True
                 import logging
 
                 logging.getLogger("clip_engine.whisper_runtime").info(
@@ -51,12 +59,15 @@ def _prepend_venv_cuda_dlls() -> None:
 
 
 def _add_torch_dll_directory() -> None:
+    global _dll_fix_torch_lib, _dll_fix_directory_added
     if sys.platform != "win32":
         return
     try:
         torch_lib = _torch_lib_dir()
         if torch_lib:
+            _dll_fix_torch_lib = torch_lib
             os.add_dll_directory(torch_lib)
+            _dll_fix_directory_added = True
             import logging
 
             logging.getLogger("clip_engine.whisper_runtime").info(
@@ -87,7 +98,24 @@ from typing import Any
 
 logger = logging.getLogger("clip_engine.whisper_runtime")
 
-logger.info(f"[env] pid={os.getpid()} executable={sys.executable} prefix={sys.prefix}")
+
+def get_cuda_dll_fix_startup_lines() -> list[str]:
+    """Lines for logs/startup_diagnostics.txt (mirrors import-time DLL setup)."""
+    lines: list[str] = []
+    torch_lib = _dll_fix_torch_lib or _torch_lib_dir()
+    if torch_lib:
+        suffix = "" if _dll_fix_prepended else " (already on PATH)"
+        lines.append(f"[cuda-dll-fix] prepended torch lib to PATH: {torch_lib}{suffix}")
+        if _dll_fix_directory_added:
+            lines.append(f"[cuda-dll-fix] os.add_dll_directory: {torch_lib}")
+    return lines
+
+
+def get_env_startup_line() -> str:
+    return f"[env] pid={os.getpid()} executable={sys.executable} prefix={sys.prefix}"
+
+
+logger.info(get_env_startup_line())
 
 _lock = threading.Lock()
 _model: Any = None
@@ -351,10 +379,17 @@ def transcribe_wav(
     )
     gpu_pid_check(context="transcription_start")
 
+    from clip_engine.cuda_diagnostics import query_nvidia_gpu_memory_and_util
+
+    mem_before, util_before = query_nvidia_gpu_memory_and_util()
+
     model = get_whisper_model(
         model_size=model_size, device=device, compute_type=compute_type
     )
     check_cancelled()
+
+    cache = get_whisper_cache_state()
+    actual_device = cache.get("device") or device
 
     try:
         smi = subprocess.run(
@@ -375,7 +410,23 @@ def transcribe_wav(
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_xcribe") as pool:
             future = pool.submit(_collect_transcription, model, wav_path, language=language)
             try:
-                return future.result(timeout=timeout)
+                segments, full_text, info = future.result(timeout=timeout)
+                mem_after, util_after = query_nvidia_gpu_memory_and_util()
+                try:
+                    from clip_engine.stability import append_gpu_transcription_session_result
+
+                    append_gpu_transcription_session_result(
+                        segment_count=len(segments),
+                        requested_device=device,
+                        actual_device=str(actual_device),
+                        gpu_mem_before_mib=mem_before,
+                        gpu_mem_after_mib=mem_after,
+                        gpu_util_before_pct=util_before,
+                        gpu_util_after_pct=util_after,
+                    )
+                except Exception as exc:
+                    logger.debug("GPU transcription session diagnostics skipped: %s", exc)
+                return segments, full_text, info
             except FuturesTimeoutError as exc:
                 logger.error(
                     "[whisper] transcribe TIMEOUT pid=%s after %.0fs wav=%s",
