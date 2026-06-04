@@ -19,6 +19,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+logger.info(f"[env] pid={os.getpid()} executable={sys.executable} prefix={sys.prefix}")
+
 # --- Reference (shown in UI / logs; keep in sync with pip extras for faster-whisper) ------------
 # RTX 4090 (Ada): needs a recent NVIDIA **driver** (not necessarily the full CUDA Toolkit).
 # faster-whisper → CTranslate2; prebuilt wheels are tagged cuda12 / cuda11 (check PyPI).
@@ -333,11 +335,11 @@ def collect_ai_acceleration_diagnostics(*, refresh_cuda_probe: bool = False) -> 
         )
     elif not cuda_ok:
         hint = (
-            "⚠️  CUDA runtime probe FAILED — transcription is running on CPU (slow). "
-            "Fix: run 'where.exe cublas64_12.dll' in PowerShell. If not found, install "
-            "NVIDIA CUDA Toolkit 12.x from https://developer.nvidia.com/cuda-downloads "
-            "and ensure C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.x\\bin "
-            "is on your system PATH, then restart the app."
+            "CUDA runtime probe FAILED — local faster-whisper CUDA is blocked unless "
+            "ALLOW_CPU_FALLBACK=1 (CPU int8, slow). Fix: run 'where.exe cublas64_12.dll'. "
+            "If not found, install NVIDIA CUDA Toolkit 12.x and add "
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.x\\bin to PATH, "
+            "then restart via launch_ai_clip_studio.ps1 (.venv311)."
         )
     else:
         hint = "Local: **faster-whisper on CUDA** should work when GPU acceleration is on."
@@ -393,3 +395,96 @@ def log_ai_acceleration_startup() -> None:
 def cublas_missing_hint(exc_message: str) -> bool:
     low = exc_message.lower()
     return "cublas" in low and ("not found" in low or "cannot be loaded" in low or "load" in low)
+
+
+def allow_cpu_fallback() -> bool:
+    """True only when ALLOW_CPU_FALLBACK=1|true|yes (default False)."""
+    return os.environ.get("ALLOW_CPU_FALLBACK", "").lower() in ("1", "true", "yes")
+
+
+def gpu_pid_check(*, context: str = "") -> tuple[bool, str]:
+    """
+    Verify the current process PID is using GPU compute (nvidia-smi).
+
+    On Windows WDDM, --query-compute-apps often lists graphics clients; we also scan
+    the default nvidia-smi process table for this PID with python in the process name.
+    Returns (on_gpu, detail_message).
+    """
+    pid = os.getpid()
+    prefix = f"[gpu_pid_check{(' ' + context) if context else ''}]"
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        msg = f"{prefix} WARN nvidia-smi not found — cannot verify GPU compute PID"
+        logger.warning(msg)
+        return False, msg
+
+    python_rows: list[str] = []
+    try:
+        r = subprocess.run(
+            [
+                exe,
+                "--query-compute-apps=pid,process_name,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **_subprocess_kw(),
+        )
+        if r.returncode == 0:
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                try:
+                    row_pid = int(parts[0])
+                except ValueError:
+                    continue
+                proc_name = parts[1].lower()
+                if "python" not in proc_name:
+                    continue
+                vram = parts[2] if len(parts) > 2 else "?"
+                python_rows.append(f"{row_pid}({proc_name},{vram})")
+                if row_pid == pid:
+                    msg = f"{prefix} INFO pid={pid} in compute-apps (python): {parts[1]} VRAM={vram}"
+                    logger.info(msg)
+                    return True, msg
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("%s compute-apps query error: %s", prefix, exc)
+
+    try:
+        r2 = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            **_subprocess_kw(),
+        )
+        if r2.returncode == 0:
+            for line in (r2.stdout or "").splitlines():
+                if str(pid) not in line:
+                    continue
+                low = line.lower()
+                if "python" in low:
+                    msg = f"{prefix} INFO pid={pid} found in nvidia-smi process table"
+                    logger.info(msg)
+                    return True, msg
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("%s full smi parse error: %s", prefix, exc)
+
+    if python_rows:
+        others = ", ".join(python_rows)
+        msg = (
+            f"{prefix} WARN pid={pid} NOT in nvidia-smi python compute list; "
+            f"other python GPU PIDs: {others}"
+        )
+    else:
+        msg = (
+            f"{prefix} WARN pid={pid} NOT using GPU compute (no python.exe in nvidia-smi). "
+            "Whisper may be on CPU, not loaded yet, or launched from wrong python.exe."
+        )
+    logger.warning(msg)
+    return False, msg

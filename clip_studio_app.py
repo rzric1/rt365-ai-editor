@@ -138,6 +138,9 @@ def main() -> None:
         init_session_state()
         flush_pending_long_defaults()
         render_sidebar()
+        from clip_engine.runtime_debug import render_runtime_debug_panel
+
+        render_runtime_debug_panel()
         render_clips_section()
         render_export_panel()
         render_resolve_panel()

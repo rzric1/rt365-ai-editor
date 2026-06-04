@@ -5,18 +5,25 @@ from __future__ import annotations
 
 import logging
 import os
-from io import BytesIO
+import sys
 from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
 
 from clip_engine.audio_extract import extract_audio_wav, ffmpeg_available
-from clip_engine.cuda_diagnostics import cublas_missing_hint, ctranslate2_cuda_runtime_probe
+from clip_engine.cuda_diagnostics import (
+    allow_cpu_fallback,
+    cublas_missing_hint,
+    ctranslate2_cuda_runtime_probe,
+    gpu_pid_check,
+)
 from clip_engine.ffmpeg_gpu import faster_whisper_cuda_available
 from clip_engine.stability import MAX_CLOUD_WHISPER_WAV_BYTES, release_gpu_memory
 
 logger = logging.getLogger(__name__)
+
+logger.info(f"[env] pid={os.getpid()} executable={sys.executable} prefix={sys.prefix}")
 
 
 def _segments_from_response(tr: Any) -> tuple[list[dict[str, Any]], str]:
@@ -54,9 +61,9 @@ def transcribe_with_faster_whisper_cuda(
     model_size: str = "base",
 ) -> tuple[list[dict[str, Any]], str, str] | None:
     """
-    Local faster-whisper: CUDA when runtime probe passes; if CUDA DLLs/model fail but a GPU
-    is present, fall back to CPU int8/float32 before returning None (caller may use OpenAI).
+    Local faster-whisper on CUDA (float16, RTX 4090 defaults).
 
+    CPU fallback runs only when ALLOW_CPU_FALLBACK=1|true|yes.
     Returns (segments, text, device_tag) where device_tag is \"cuda\" or \"cpu\".
     """
     from clip_engine.job_control import set_pipeline_step
@@ -76,48 +83,48 @@ def transcribe_with_faster_whisper_cuda(
         n_cuda = 0
 
     cuda_ok, cuda_msg = ctranslate2_cuda_runtime_probe()
-    cuda_attempted = False
-    last_cuda_exc: Exception | None = None
+    gpu_pid_check(context="transcribe_with_faster_whisper_cuda")
 
-    if n_cuda > 0 and cuda_ok and faster_whisper_cuda_available():
-        cuda_attempted = True
-        for comp in ("float16", "int8_float16", "int8"):
-            try:
-                set_pipeline_step(f"whisper_cuda_{comp}")
-                segs, txt, _info = transcribe_wav(
-                    wav_path,
-                    language=language,
-                    model_size=model_size,
-                    device="cuda",
-                    compute_type=comp,
-                )
-                return segs, txt, "cuda"
-            except Exception as exc:  # noqa: BLE001
-                last_cuda_exc = exc
-                logger.warning("faster-whisper CUDA compute_type=%s failed: %s", comp, exc)
-                if cublas_missing_hint(str(exc)):
-                    logger.warning(
-                        "cuBLAS/CUDA DLL load issue — add CUDA 12.x `bin` to PATH or set CUDA_PATH; "
-                        "trying CPU int8 fallback."
-                    )
-    elif n_cuda > 0 and not cuda_ok:
-        logger.warning(
-            "faster-whisper CUDA skipped (CTranslate2 runtime probe failed): %s",
-            cuda_msg,
+    if n_cuda <= 0 or not cuda_ok or not faster_whisper_cuda_available():
+        detail = (
+            f"CUDA devices={n_cuda}, probe_ok={cuda_ok}, probe_msg={cuda_msg}, "
+            f"executable={sys.executable}"
         )
-        if cublas_missing_hint(cuda_msg):
-            logger.warning(
-                "Likely missing cublas64_12.dll — install NVIDIA CUDA Toolkit 12.x or match "
-                "ctranslate2 wheel to your CUDA stack."
+        if allow_cpu_fallback():
+            logger.warning("[whisper] CUDA unavailable (%s) — ALLOW_CPU_FALLBACK enabled, trying CPU", detail)
+        else:
+            raise RuntimeError(
+                "GPU transcription requested but CUDA is not available for faster-whisper. "
+                f"{detail}. Launch via launch_ai_clip_studio.ps1 (.venv311), verify cublas64_12.dll "
+                "on PATH, or set ALLOW_CPU_FALLBACK=1 to permit CPU (slow)."
             )
 
-    use_cpu_fallback = n_cuda > 0 and (not cuda_ok or cuda_attempted)
-    if use_cpu_fallback:
-        logger.error(
-            "[whisper] ⚠️  CUDA unavailable or probe failed — falling back to CPU int8. "
-            "Transcription will be SLOW. Check cublas64_12.dll is on PATH. "
-            "Run: where.exe cublas64_12.dll  to verify."
-        )
+    if n_cuda > 0 and cuda_ok and faster_whisper_cuda_available():
+        set_pipeline_step("whisper_cuda_float16")
+        try:
+            segs, txt, _info = transcribe_wav(
+                wav_path,
+                language=language,
+                model_size=model_size,
+                device="cuda",
+                compute_type="float16",
+            )
+            gpu_pid_check(context="after_cuda_transcribe")
+            return segs, txt, "cuda"
+        except Exception as exc:
+            logger.error("[whisper] CUDA float16 transcription failed: %s", exc)
+            if cublas_missing_hint(str(exc)):
+                logger.error(
+                    "cuBLAS/CUDA DLL load issue — add CUDA 12.x `bin` to PATH or set CUDA_PATH."
+                )
+            if not allow_cpu_fallback():
+                raise RuntimeError(
+                    f"faster-whisper CUDA transcription failed: {exc}. "
+                    "Set ALLOW_CPU_FALLBACK=1 to try CPU int8 (slow)."
+                ) from exc
+            logger.warning("[whisper] ALLOW_CPU_FALLBACK — retrying on CPU after CUDA failure")
+
+    if allow_cpu_fallback():
         for comp in ("int8", "float32"):
             try:
                 set_pipeline_step(f"whisper_cpu_{comp}")
@@ -132,8 +139,6 @@ def transcribe_with_faster_whisper_cuda(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("faster-whisper CPU compute_type=%s failed: %s", comp, exc)
 
-    if last_cuda_exc and not use_cpu_fallback:
-        logger.error("faster-whisper CUDA failed: %s", last_cuda_exc)
     return None
 
 
@@ -173,17 +178,25 @@ def transcribe_video(
 
         if prefer_gpu and os.environ.get("FORCE_CPU_WHISPER", "").lower() not in ("1", "true", "yes"):
             with pipeline_phase("transcription"):
-                local = transcribe_with_faster_whisper_cuda(
-                    wav_path,
-                    language=language,
-                    model_size=faster_whisper_model,
-                )
+                try:
+                    local = transcribe_with_faster_whisper_cuda(
+                        wav_path,
+                        language=language,
+                        model_size=faster_whisper_model,
+                    )
+                except RuntimeError:
+                    raise
+                except Exception as exc:
+                    logger.exception("[transcribe] faster-whisper failed pid=%s", os.getpid())
+                    raise RuntimeError(f"Local Whisper transcription failed: {exc}") from exc
             if local is not None:
                 segs, txt, dev_tag = local
                 logger.info(
-                    "[transcribe] backend=%s device=%s",
+                    "[transcribe] backend=%s device=%s pid=%s executable=%s",
                     "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU FALLBACK)",
                     dev_tag,
+                    os.getpid(),
+                    sys.executable,
                 )
                 return segs, txt
             logger.info("Transcription backend: falling back to OpenAI whisper-1 API.")

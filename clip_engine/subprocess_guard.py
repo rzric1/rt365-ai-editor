@@ -146,6 +146,66 @@ def terminate_orphan_ffmpeg(*, parent_pid: int | None = None) -> int:
     return killed
 
 
+def find_orphan_job_process_pids(*, parent_pid: int | None = None) -> list[int]:
+    """
+    Return untracked ffmpeg.exe or python.exe child PIDs of parent_pid (default: current process).
+    Excludes the root process itself.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    root = parent_pid if parent_pid is not None else os.getpid()
+    try:
+        proc = psutil.Process(root)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+
+    orphans: list[int] = []
+    tracked = set(list_tracked_pids())
+    for child in proc.children(recursive=True):
+        try:
+            name = (child.name() or "").lower()
+            if "ffmpeg" not in name and "python" not in name:
+                continue
+            pid = child.pid
+            if pid == root or pid in tracked:
+                continue
+            if child.is_running():
+                orphans.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return orphans
+
+
+def terminate_orphan_job_processes(*, parent_pid: int | None = None) -> int:
+    """Terminate untracked ffmpeg/python children after job crash or timeout."""
+    if sys.platform != "win32":
+        return terminate_orphan_ffmpeg(parent_pid=parent_pid)
+    try:
+        import psutil
+    except ImportError:
+        return terminate_orphan_ffmpeg(parent_pid=parent_pid)
+
+    killed = 0
+    for pid in find_orphan_job_process_pids(parent_pid=parent_pid):
+        try:
+            p = psutil.Process(pid)
+            logger.warning("[subprocess] terminating orphan job child pid=%s name=%s", pid, p.name())
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                p.kill()
+            killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return killed
+
+
 def run_subprocess_with_input(
     cmd: list[str],
     *,
