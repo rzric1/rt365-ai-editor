@@ -28,7 +28,7 @@ def init_session_state() -> None:
         "cs_session_dir": None,
         "cs_status": "Upload a video to begin.",
         "cs_gpu_acceleration": True,
-        "cs_whisper_model": "base",
+        "cs_whisper_model": "large-v3",
         "cs_media_duration": 0.0,
         "cs_force_gpu_export": False,
         "cs_allow_cpu_fallback": True,

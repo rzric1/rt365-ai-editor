@@ -2,6 +2,14 @@
 """RT365 AI Clip Studio — main entry point."""
 from __future__ import annotations
 
+import os
+
+# CTranslate2 GPU throughput tuning for RTX 4090 — before torch/ctranslate2 import.
+if not os.environ.get("CT2_VERBOSE"):
+    os.environ.setdefault("CT2_USE_EXPERIMENTAL_PACKED_GEMM", "1")
+    os.environ.setdefault("CT2_CUDA_ALLOW_FP16", "1")
+    os.environ.setdefault("CT2_CUDA_CACHING_ALLOCATOR_CONFIG", "0,0,0,0")
+
 import traceback
 from pathlib import Path
 

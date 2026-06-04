@@ -11,6 +11,8 @@ from typing import Any
 
 from openai import OpenAI
 
+from config import DEFAULT_WHISPER_MODEL
+
 from clip_engine.audio_extract import extract_audio_wav, ffmpeg_available
 from clip_engine.cuda_diagnostics import (
     allow_cpu_fallback,
@@ -58,7 +60,7 @@ def transcribe_with_faster_whisper_cuda(
     wav_path: Path,
     *,
     language: str | None,
-    model_size: str = "base",
+    model_size: str = DEFAULT_WHISPER_MODEL,
 ) -> tuple[list[dict[str, Any]], str, str] | None:
     """
     Local faster-whisper on CUDA (float16, RTX 4090 defaults).
@@ -149,7 +151,7 @@ def transcribe_video(
     work_dir: Path,
     language: str | None = None,
     prefer_gpu: bool = False,
-    faster_whisper_model: str = "base",
+    faster_whisper_model: str = DEFAULT_WHISPER_MODEL,
 ) -> tuple[list[dict[str, Any]], str]:
     """
     Returns (segments, full_plain_text).

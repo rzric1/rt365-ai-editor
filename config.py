@@ -45,6 +45,9 @@ ENV_FFMPEG_BINARY: str = "FFMPEG_BINARY"
 DEFAULT_OPENAI_MODEL: str = "gpt-4o"
 DEFAULT_OPENAI_MODEL_JSON_FALLBACK: str = "gpt-4o-mini"
 
+# RTX 4090 has 24GB VRAM — large-v3 is appropriate default for local faster-whisper.
+DEFAULT_WHISPER_MODEL: str = "large-v3"
+
 # Frame rate for the last field (FF) in bracket transcripts: [HH:MM:SS:FF - ...]
 ENV_TRANSCRIPT_BRACKET_FPS: str = "TRANSCRIPT_BRACKET_FPS"
 DEFAULT_TRANSCRIPT_BRACKET_FPS: float = 24.0

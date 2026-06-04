@@ -7,6 +7,18 @@ import os
 import sys
 
 
+def _set_ct2_throughput_env() -> None:
+    """CTranslate2 GPU throughput tuning — must run before ctranslate2 is imported."""
+    if os.environ.get("CT2_VERBOSE"):
+        return
+    os.environ.setdefault("CT2_USE_EXPERIMENTAL_PACKED_GEMM", "1")
+    os.environ.setdefault("CT2_CUDA_ALLOW_FP16", "1")
+    os.environ.setdefault("CT2_CUDA_CACHING_ALLOCATOR_CONFIG", "0,0,0,0")
+
+
+_set_ct2_throughput_env()
+
+
 def _torch_lib_dir() -> str | None:
     try:
         import importlib.util
@@ -143,11 +155,18 @@ def get_whisper_cache_state() -> dict[str, Any]:
     with _lock:
         loaded = _model is not None
         key = _model_key
+        inner_device = None
+        if _model is not None:
+            inner = getattr(_model, "model", None)
+            dev = getattr(inner, "device", None) if inner is not None else None
+            if dev is not None:
+                inner_device = str(dev)
     return {
         "loaded": loaded,
         "model_size": key[0] if key else None,
         "device": key[1] if key else None,
         "compute_type": key[2] if key else None,
+        "inner_device": inner_device,
     }
 
 
@@ -200,7 +219,10 @@ def _release_model() -> None:
 
 
 def get_whisper_model(*, model_size: str, device: str, compute_type: str) -> Any:
-    """Return cached WhisperModel for (size, device, compute_type) or load once."""
+    """Return cached WhisperModel for (size, device, compute_type) or load once.
+
+    Default model_size should be config.DEFAULT_WHISPER_MODEL (large-v3 on RTX 4090).
+    """
     global _model, _model_key
     key = (model_size, device, compute_type)
 
@@ -254,7 +276,8 @@ def get_whisper_model(*, model_size: str, device: str, compute_type: str) -> Any
 
         _model_key = key
         elapsed = time.perf_counter() - load_start
-        actual_device = getattr(_model, "device", device)
+        inner = getattr(_model, "model", None)
+        actual_device = getattr(inner, "device", None) or getattr(_model, "device", device)
         logger.info(
             "[whisper] load END pid=%s elapsed_sec=%.2f model=%s requested_device=%s "
             "actual_device=%s compute_type=%s",

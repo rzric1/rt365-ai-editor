@@ -90,14 +90,23 @@ def render_runtime_debug_panel() -> None:
         )
 
         st.markdown(f"**ctranslate2:** `{_ctranslate2_version()}`")
+        st.markdown(
+            f"**CT2_USE_EXPERIMENTAL_PACKED_GEMM:** "
+            f"`{os.environ.get('CT2_USE_EXPERIMENTAL_PACKED_GEMM', '(unset)')}`"
+        )
+        st.markdown(
+            f"**CT2_CUDA_ALLOW_FP16:** `{os.environ.get('CT2_CUDA_ALLOW_FP16', '(unset)')}`"
+        )
 
         if cache["loaded"]:
+            inner_dev = cache.get("inner_device") or "unknown"
             st.markdown(
-                f"**Whisper model loaded:** Yes — `{cache['model_size']}` "
-                f"device=`{cache['device']}` compute_type=`{cache['compute_type']}`"
+                f"**Whisper model loaded:** Yes — size=`{cache['model_size']}` "
+                f"requested_device=`{cache['device']}` inner_device=`{inner_dev}` "
+                f"compute_type=`{cache['compute_type']}`"
             )
         else:
-            st.markdown("**Whisper model loaded:** No")
+            st.markdown("**Whisper model loaded:** No (default size from config: large-v3)")
 
         st.markdown(f"**Active job:** `{active or '(idle)'}`")
         if step:

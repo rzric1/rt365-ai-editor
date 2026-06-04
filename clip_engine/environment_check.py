@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config import ENV_OPENAI_API_KEY, LOGS_DIR, PROJECT_ROOT
+from config import ENV_OPENAI_API_KEY, ENV_OPENAI_MODEL, LOGS_DIR, PROJECT_ROOT
+
+VALID_OPENAI_MODELS = frozenset(
+    {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"}
+)
 
 ENV_CHECK_LOG = LOGS_DIR / "environment_check.txt"
 DOTENV_PATH = PROJECT_ROOT / ".env"
@@ -145,6 +149,26 @@ def _openai_api_key_present() -> bool:
     return bool((os.environ.get(ENV_OPENAI_API_KEY) or "").strip())
 
 
+def _check_openai_model() -> DependencyCheck:
+    _load_project_dotenv()
+    model = (os.environ.get(ENV_OPENAI_MODEL) or "").strip()
+    if not model:
+        return DependencyCheck(
+            ENV_OPENAI_MODEL,
+            True,
+            "unset (config default applies)",
+            critical=False,
+        )
+    if model in VALID_OPENAI_MODELS:
+        return DependencyCheck(ENV_OPENAI_MODEL, True, f"recognized: {model}", critical=False)
+    return DependencyCheck(
+        ENV_OPENAI_MODEL,
+        False,
+        f"'{model}' is not a recognized model name",
+        critical=False,
+    )
+
+
 def _check_openai_api_key() -> DependencyCheck:
     _load_project_dotenv()
     if _openai_api_key_present():
@@ -239,6 +263,7 @@ def validate_startup_environment(*, require_gpu_stack: bool = True) -> Environme
     checks.extend(_check_torch_cuda())
 
     checks.append(_check_openai_api_key())
+    checks.append(_check_openai_model())
 
     errors: list[str] = []
     warnings: list[str] = []

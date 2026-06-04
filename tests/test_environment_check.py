@@ -53,6 +53,19 @@ def test_openai_api_key_loaded_from_dotenv(tmp_path, monkeypatch):
     assert "[OK] OPENAI_API_KEY: present" in text
 
 
+def test_openai_model_unrecognized_warns(tmp_path, monkeypatch):
+    from clip_engine import environment_check
+
+    (tmp_path / ".env").write_text("OPENAI_MODEL=gpt-5-mini\n", encoding="utf-8")
+    monkeypatch.setattr(environment_check, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(environment_check, "DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    check = environment_check._check_openai_model()
+    assert not check.ok
+    assert "gpt-5-mini" in check.detail
+    assert "not a recognized model name" in check.detail
+
+
 def test_openai_api_key_missing_without_dotenv(tmp_path, monkeypatch):
     from clip_engine import environment_check
 

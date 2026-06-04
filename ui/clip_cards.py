@@ -14,6 +14,7 @@ from config import (
     CLIP_STUDIO_MAX_UPLOAD_BYTES,
     CLIP_STUDIO_MAX_UPLOAD_MB,
     CLIP_STUDIO_OUTPUT_DIR,
+    DEFAULT_WHISPER_MODEL,
     ENV_FFMPEG_BINARY,
     ENV_OPENAI_API_KEY,
     PROJECT_ROOT,
@@ -723,7 +724,7 @@ def render_clips_section() -> None:
             work = CLIP_STUDIO_OUTPUT_DIR / "_work"
             work.mkdir(parents=True, exist_ok=True)
             lang = whisper_lang.strip() or None
-            model_sz = str(st.session_state.get("cs_whisper_model", "base"))
+            model_sz = str(st.session_state.get("cs_whisper_model", DEFAULT_WHISPER_MODEL))
             prefer_gpu = bool(st.session_state.get("cs_gpu_acceleration", True))
             with st.spinner("Transcribing (may take a while for long videos)"):
                 try:
