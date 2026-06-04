@@ -1,0 +1,15 @@
+# Fix A: PyTorch CUDA 12.8 wheels (cu128) for RTX 4090 / CUDA 12.x toolkit alignment.
+# Replaces cu121 stack that mismatches CUDA Toolkit 12.9 cuBLAS DLLs (WinError 127).
+# Use only with .venv311 (Python 3.11). Install via fix_cuda.bat from project root.
+#
+# Manual:
+#   .venv311\Scripts\activate
+#   pip install -r requirements_cuda_fix.txt
+#
+# Verify:
+#   .venv311\Scripts\python.exe cuda_verify.py
+
+--index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
