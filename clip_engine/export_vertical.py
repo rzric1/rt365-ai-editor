@@ -216,24 +216,36 @@ def _apply_preview_scale(vf: str, uses_complex: bool) -> str:
     return f"{vf},{scale}"
 
 
-def _build_cmd(video_path, output_path, start, duration, vf, uses_complex, prefer_gpu, force_gpu_export, *, preview_mode=False):
-    from clip_engine.ffmpeg_gpu import should_attempt_nvenc_on_export
+def _build_cmd(
+    video_path,
+    output_path,
+    start,
+    duration,
+    vf,
+    uses_complex,
+    prefer_gpu,
+    force_gpu_export,
+    *,
+    preview_mode=False,
+    skip_hwaccel: bool = False,
+):
+    from clip_engine.ffmpeg_gpu import (
+        ffmpeg_hwaccel_cuda_input_args,
+        should_attempt_nvenc_on_export,
+        video_encode_args,
+    )
+
     use_nvenc = should_attempt_nvenc_on_export(prefer_gpu=prefer_gpu, force_gpu_mode=force_gpu_export)
-    encoder = "h264_nvenc" if use_nvenc else "libx264"
-    base = ["ffmpeg", "-y", "-ss", str(start), "-i", str(video_path), "-t", str(duration)]
+    encode_args, encoder = video_encode_args(use_nvenc=use_nvenc, preview_mode=preview_mode)
+    hwaccel: list[str] = []
+    if use_nvenc and not uses_complex and not skip_hwaccel:
+        hwaccel = ffmpeg_hwaccel_cuda_input_args()
+    base = ["ffmpeg", "-y", *hwaccel, "-ss", str(start), "-i", str(video_path), "-t", str(duration)]
     base += ["-filter_complex" if uses_complex else "-vf", vf]
     if uses_complex:
         base += ["-map", "[vout]", "-map", "0:a?"]
     base += ["-c:a", "aac", "-b:a", "128k" if preview_mode else "192k", "-ar", "44100"]
-    if encoder == "h264_nvenc":
-        cq = "28" if preview_mode else "23"
-        bv = "2M" if preview_mode else "4M"
-        base += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", cq,
-                 "-b:v", bv, "-maxrate", bv, "-bufsize", bv, "-pix_fmt", "yuv420p"]
-    else:
-        crf = "28" if preview_mode else "23"
-        preset = "veryfast" if preview_mode else "fast"
-        base += ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"]
+    base += [*encode_args, "-pix_fmt", "yuv420p"]
     return encoder, base + [str(output_path)]
 
 
@@ -263,6 +275,29 @@ def _run_with_fallback(cmd, video_path, output_path, start, duration, vf, uses_c
     if result.returncode == 0:
         return encoder
     if encoder == "h264_nvenc" and allow_cpu_fallback:
+        if "-hwaccel" in cmd:
+            logger.warning("NVENC/hwaccel failed — retrying export without CUDA hwaccel decode.")
+            _, nvenc_cmd = _build_cmd(
+                video_path,
+                output_path,
+                start,
+                duration,
+                vf,
+                uses_complex,
+                prefer_gpu,
+                force_gpu_export,
+                preview_mode=preview_mode,
+                skip_hwaccel=True,
+            )
+            nvenc_cmd = _resolve_ffmpeg_binary(list(nvenc_cmd))
+            result_hw = run_subprocess(
+                nvenc_cmd,
+                timeout=_FFMPEG_TIMEOUT_SECONDS,
+                label="ffmpeg_export_nvenc_no_hwaccel",
+                text=True,
+            )
+            if result_hw.returncode == 0:
+                return encoder
         logger.warning("NVENC failed, retrying with libx264.")
         _, cpu_cmd = _build_cmd(
             video_path, output_path, start, duration, vf, uses_complex,

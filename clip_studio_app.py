@@ -28,7 +28,7 @@ from clip_engine.startup_trace import register_shutdown_trace, trace
 
 trace("app imported")
 
-from config import LOGS_DIR
+from config import DEFAULT_WHISPER_MODEL, LOGS_DIR
 from clip_engine.telemetry import configure_rotating_logs, get_session_telemetry
 from clip_engine.stability import (
     cleanup_temp_artifacts,
@@ -50,6 +50,7 @@ _STARTUP_DONE = False
 _ENV_GATE_DONE = False
 _SHUTDOWN_REGISTERED = False
 _FIRST_RENDER_LOGGED = False
+_PREWARM_STARTED = False
 
 
 def _register_shutdown_once() -> None:
@@ -98,6 +99,31 @@ def _ensure_app_lock() -> None:
     trace("lock acquired")
 
 
+def _prewarm_whisper() -> None:
+    try:
+        from clip_engine.whisper_runtime import get_whisper_model
+
+        logger.info("[prewarm] loading %s into VRAM at startup", DEFAULT_WHISPER_MODEL)
+        get_whisper_model(
+            model_size=DEFAULT_WHISPER_MODEL,
+            device="cuda",
+            compute_type="float16",
+        )
+        logger.info("[prewarm] %s ready in VRAM", DEFAULT_WHISPER_MODEL)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[prewarm] failed: %s", exc)
+
+
+def _start_whisper_prewarm() -> None:
+    global _PREWARM_STARTED
+    if _PREWARM_STARTED:
+        return
+    _PREWARM_STARTED = True
+    import threading
+
+    threading.Thread(target=_prewarm_whisper, daemon=True, name="whisper_prewarm").start()
+
+
 def _ensure_startup() -> None:
     global _STARTUP_DONE
     if _STARTUP_DONE:
@@ -122,6 +148,7 @@ def _ensure_startup() -> None:
         run_startup_diagnostics()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Startup diagnostics failed: %s", exc)
+    _start_whisper_prewarm()
 
 
 def _log_first_render() -> None:

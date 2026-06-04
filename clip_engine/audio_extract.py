@@ -28,14 +28,24 @@ def extract_audio_wav(video_path: Path, wav_out: Path, *, sample_rate: int = 160
     ensure_ffmpeg_on_path()
     exe = get_ffmpeg_executable()
     wav_out.parent.mkdir(parents=True, exist_ok=True)
+    # Large MP4s: widen probe/analyze for demux; -threads 0 uses all CPU cores for decode.
+    # Audio-only (-vn): no GPU video decode; CUDA hwaccel does not apply here.
     cmd = [
         exe,
         "-y",
+        "-probesize",
+        "50M",
+        "-analyzeduration",
+        "50M",
         "-i",
         str(video_path.resolve()),
         "-vn",
+        "-threads",
+        "0",
         "-acodec",
         "pcm_s16le",
+        "-avoid_negative_ts",
+        "make_zero",
         "-ar",
         str(sample_rate),
         "-ac",

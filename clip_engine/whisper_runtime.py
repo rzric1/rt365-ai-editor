@@ -328,6 +328,7 @@ def _collect_transcription(
         language=language,
         beam_size=5,
         vad_filter=True,
+        vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 500},
     )
 
     first_seg = None

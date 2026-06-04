@@ -19,6 +19,8 @@ from clip_engine.ffmpeg_resolve import ensure_ffmpeg_on_path
 logger = logging.getLogger(__name__)
 
 _nvenc_runtime_cached: bool | None = None
+_nvenc_export_extras_cached: list[str] | None = None
+_hwaccel_cuda_cached: bool | None = None
 _last_nvenc_probe_log: str = ""
 _NVENC_PROBE_CMD_LOGGED: bool = False
 
@@ -40,8 +42,10 @@ def _run(cmd: list[str], *, timeout: float = 25.0) -> subprocess.CompletedProces
 
 
 def invalidate_nvenc_cache() -> None:
-    global _nvenc_runtime_cached
+    global _nvenc_runtime_cached, _nvenc_export_extras_cached, _hwaccel_cuda_cached
     _nvenc_runtime_cached = None
+    _nvenc_export_extras_cached = None
+    _hwaccel_cuda_cached = None
 
 
 def get_last_nvenc_probe_log() -> str:
@@ -268,7 +272,7 @@ def get_gpu_acceleration_status() -> GpuAccelerationStatus:
 
 
 # Ada Lovelace (e.g. RTX 4090): p4 + tune hq + VBR CQ + AQ + multipass fullres
-_NVENC_EXPORT = [
+_NVENC_EXPORT_BASE = [
     "-c:v",
     "h264_nvenc",
     "-gpu",
@@ -295,14 +299,141 @@ _NVENC_EXPORT = [
     "3",
 ]
 
+# Optional RTX tuning — applied only when probe_nvenc_export_extras() succeeds.
+_NVENC_EXPORT_OPTIONAL = [
+    "-maxrate",
+    "20M",
+    "-bufsize",
+    "40M",
+    "-rc-lookahead",
+    "32",
+]
+
 _CPU_X264 = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
 
 
-def video_encode_args(*, use_nvenc: bool) -> tuple[list[str], str]:
+def _export_nvenc_probe_cmd(exe: str, *, extra: tuple[str, ...] = ()) -> list[str]:
+    """Probe full export NVENC stack on a short synthetic encode."""
+    return [
+        exe,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=640x360:d=0.04",
+        *_NVENC_EXPORT_BASE,
+        *extra,
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "null",
+        "-",
+    ]
+
+
+def probe_nvenc_export_extras() -> list[str]:
+    """Return optional NVENC flags that pass a null-mux probe (cached)."""
+    global _nvenc_export_extras_cached
+    if _nvenc_export_extras_cached is not None:
+        return list(_nvenc_export_extras_cached)
+    exe = ensure_ffmpeg_on_path()
+    if not exe:
+        _nvenc_export_extras_cached = []
+        return []
+    ok_flags: list[str] = []
+    try:
+        r = subprocess.run(
+            _export_nvenc_probe_cmd(exe, extra=tuple(_NVENC_EXPORT_OPTIONAL)),
+            capture_output=True,
+            text=True,
+            timeout=60.0,
+            **_probe_subprocess_flags(),
+        )
+        if r.returncode == 0:
+            ok_flags = list(_NVENC_EXPORT_OPTIONAL)
+            logger.info("[nvenc] export extras probe OK: %s", " ".join(ok_flags))
+        else:
+            logger.warning(
+                "[nvenc] export extras probe failed; using base NVENC only. tail=%s",
+                (r.stderr or "")[-800:],
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[nvenc] export extras probe exception: %s", exc)
+    _nvenc_export_extras_cached = ok_flags
+    return list(ok_flags)
+
+
+def probe_hwaccel_cuda_decode() -> bool:
+    """True if ffmpeg can hwaccel-decode a short synthetic stream to null."""
+    global _hwaccel_cuda_cached
+    if _hwaccel_cuda_cached is not None:
+        return _hwaccel_cuda_cached
+    exe = ensure_ffmpeg_on_path()
+    if not exe:
+        _hwaccel_cuda_cached = False
+        return False
+    cmd = [
+        exe,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_output_format",
+        "cuda",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=640x360:d=0.04",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=45.0,
+            **_probe_subprocess_flags(),
+        )
+        _hwaccel_cuda_cached = r.returncode == 0
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[nvenc] hwaccel cuda probe exception: %s", exc)
+        _hwaccel_cuda_cached = False
+    if _hwaccel_cuda_cached:
+        logger.info("[nvenc] CUDA hwaccel decode probe OK")
+    else:
+        logger.info("[nvenc] CUDA hwaccel decode probe failed or unavailable")
+    return _hwaccel_cuda_cached
+
+
+def ffmpeg_hwaccel_cuda_input_args() -> list[str]:
+    """Input-side CUDA decode flags when probe passes (skip for -filter_complex paths)."""
+    if probe_hwaccel_cuda_decode():
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    return []
+
+
+def video_encode_args(*, use_nvenc: bool, preview_mode: bool = False) -> tuple[list[str], str]:
     """Return (ffmpeg args fragment, label for logging)."""
     if use_nvenc:
-        return list(_NVENC_EXPORT), "h264_nvenc"
-    return list(_CPU_X264), "libx264"
+        args = list(_NVENC_EXPORT_BASE)
+        if preview_mode:
+            if "-cq" in args:
+                cq_i = args.index("-cq")
+                args[cq_i + 1] = "28"
+            args.extend(["-maxrate", "8M", "-bufsize", "16M"])
+        else:
+            args.extend(probe_nvenc_export_extras())
+        return args, "h264_nvenc"
+    crf = "28" if preview_mode else "23"
+    preset = "veryfast" if preview_mode else "fast"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", crf], "libx264"
 
 
 _NVENC_COMPRESS = [
