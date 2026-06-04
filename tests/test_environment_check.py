@@ -32,6 +32,38 @@ def test_detects_missing_faster_whisper(monkeypatch):
     assert any("faster-whisper" in e for e in status.errors)
 
 
+def test_openai_api_key_loaded_from_dotenv(tmp_path, monkeypatch):
+    from clip_engine import environment_check
+
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=sk-test-do-not-log-this-value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(environment_check, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(environment_check, "DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    check = environment_check._check_openai_api_key()
+    assert check.ok
+    assert check.detail == "present"
+    log = environment_check.write_environment_check_log(
+        environment_check.EnvironmentStatus(ok=True, checks=[check])
+    )
+    text = log.read_text(encoding="utf-8")
+    assert "sk-test" not in text
+    assert "[OK] OPENAI_API_KEY: present" in text
+
+
+def test_openai_api_key_missing_without_dotenv(tmp_path, monkeypatch):
+    from clip_engine import environment_check
+
+    monkeypatch.setattr(environment_check, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(environment_check, "DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    check = environment_check._check_openai_api_key()
+    assert not check.ok
+    assert check.detail == "missing — cloud Whisper/analyze need .env"
+
+
 def test_environment_check_log_writes(tmp_path, monkeypatch):
     from clip_engine import environment_check
 

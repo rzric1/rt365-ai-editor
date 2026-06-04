@@ -10,9 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config import LOGS_DIR, PROJECT_ROOT
+from config import ENV_OPENAI_API_KEY, LOGS_DIR, PROJECT_ROOT
 
 ENV_CHECK_LOG = LOGS_DIR / "environment_check.txt"
+DOTENV_PATH = PROJECT_ROOT / ".env"
 
 REQUIRED_PYTHON_MAJOR = 3
 REQUIRED_PYTHON_MINOR = 11
@@ -58,7 +59,8 @@ def _in_expected_venv() -> bool:
 
 def _check_python_version() -> DependencyCheck:
     major, minor = sys.version_info[:2]
-    ver = f"{major}.{minor}.{sys.version_info.micro}"
+    micro = sys.version_info[2] if len(sys.version_info) > 2 else 0
+    ver = f"{major}.{minor}.{micro}"
     if major != REQUIRED_PYTHON_MAJOR:
         return DependencyCheck(
             "Python version",
@@ -127,6 +129,39 @@ def _check_torch_cuda() -> list[DependencyCheck]:
     return out
 
 
+def _load_project_dotenv() -> None:
+    """Load PROJECT_ROOT/.env into os.environ. Never logs secret values."""
+    if not DOTENV_PATH.is_file():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(DOTENV_PATH, override=False)
+    except ImportError:
+        pass
+
+
+def _openai_api_key_present() -> bool:
+    return bool((os.environ.get(ENV_OPENAI_API_KEY) or "").strip())
+
+
+def _check_openai_api_key() -> DependencyCheck:
+    _load_project_dotenv()
+    if _openai_api_key_present():
+        return DependencyCheck(
+            ENV_OPENAI_API_KEY,
+            True,
+            "present",
+            critical=False,
+        )
+    return DependencyCheck(
+        ENV_OPENAI_API_KEY,
+        False,
+        "missing — cloud Whisper/analyze need .env",
+        critical=False,
+    )
+
+
 def _check_ffmpeg() -> list[DependencyCheck]:
     out: list[DependencyCheck] = []
     which = shutil.which("ffmpeg")
@@ -159,6 +194,7 @@ def validate_startup_environment(*, require_gpu_stack: bool = True) -> Environme
     Run all startup checks. Critical failures set status.ok=False.
     GPU stack (faster-whisper, ctranslate2) is critical when require_gpu_stack=True.
     """
+    _load_project_dotenv()
     checks: list[DependencyCheck] = []
 
     checks.append(
@@ -202,15 +238,7 @@ def validate_startup_environment(*, require_gpu_stack: bool = True) -> Environme
     )
     checks.extend(_check_torch_cuda())
 
-    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    checks.append(
-        DependencyCheck(
-            "OPENAI_API_KEY",
-            bool(key),
-            "set" if key else "missing — cloud Whisper/analyze need .env",
-            critical=False,
-        )
-    )
+    checks.append(_check_openai_api_key())
 
     errors: list[str] = []
     warnings: list[str] = []
