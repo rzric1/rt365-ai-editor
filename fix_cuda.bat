@@ -24,8 +24,8 @@ if errorlevel 1 (
 echo [INFO] Python: 
 python --version
 echo.
-echo [INFO] Installing torch / torchvision / torchaudio from cu128 index...
-pip install -r requirements_cuda_fix.txt
+echo [INFO] Installing torch / torchvision / torchaudio from cu128 index (force reinstall)...
+pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 if errorlevel 1 (
     echo [ERROR] pip install failed.
     pause
