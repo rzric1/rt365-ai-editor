@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 _ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 load_dotenv(_ROOT / ".env")
 
+# Bundled torch CUDA DLLs must win over system CUDA Toolkit (WinError 127 on cublas64_12.dll).
+import clip_engine.whisper_runtime  # noqa: F401
+
 import logging
 import streamlit as st
 

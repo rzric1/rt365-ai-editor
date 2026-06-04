@@ -94,6 +94,21 @@ def _first_gpu_line(nvidia_smi_stdout: str | None) -> str | None:
     return None
 
 
+def _venv_torch_lib_dir() -> Path | None:
+    """Return site-packages/torch/lib without importing torch (avoids early DLL load)."""
+    try:
+        import importlib.util
+
+        torch_spec = importlib.util.find_spec("torch")
+        if torch_spec and torch_spec.submodule_search_locations:
+            torch_lib = Path(list(torch_spec.submodule_search_locations)[0]) / "lib"
+            if torch_lib.is_dir():
+                return torch_lib
+    except Exception:
+        pass
+    return None
+
+
 def _find_cublas_dlls() -> list[str]:
     """Best-effort search for cuBLAS DLLs (Windows + Linux-ish names)."""
     names = ("cublas64_12.dll", "cublas64_11.dll", "cublas.so.12", "cublas.so.11")
@@ -108,6 +123,12 @@ def _find_cublas_dlls() -> list[str]:
         if r not in seen and p.is_file():
             seen.add(r)
             out.append(r)
+
+    # Prefer venv-bundled torch CUDA DLLs (matches torch cu128 wheel, avoids system 12.9 mismatch).
+    torch_lib = _venv_torch_lib_dir()
+    if torch_lib is not None:
+        for n in names:
+            add(torch_lib / n)
 
     cuda_path = os.environ.get("CUDA_PATH", "").strip()
     if cuda_path:
@@ -139,23 +160,41 @@ def _try_load_cublas_windows(cublas_paths: list[str]) -> tuple[bool, str]:
         import ctypes
     except ImportError:
         return False, "ctypes unavailable"
-    # Prefer explicit path load so we report the exact failure.
+
+    venv_lib = _venv_torch_lib_dir()
+    venv_paths: list[str] = []
+    if venv_lib is not None:
+        for name in ("cublas64_12.dll", "cublas64_11.dll"):
+            candidate = venv_lib / name
+            if candidate.is_file():
+                venv_paths.append(str(candidate.resolve()))
+
+    for p in venv_paths:
+        try:
+            ctypes.WinDLL(p)
+            return True, f"loaded (venv torch/lib): {p}"
+        except OSError as exc:
+            logger.debug("venv cuBLAS load failed for %s: %s", p, exc)
+
     for p in cublas_paths:
         if not p.lower().endswith(".dll"):
             continue
+        if p in venv_paths:
+            continue
         try:
             ctypes.WinDLL(p)
-            return True, f"loaded: {p}"
+            source = "venv torch/lib" if venv_lib and str(venv_lib).lower() in p.lower() else "system CUDA"
+            return True, f"loaded ({source}): {p}"
         except OSError as exc:
             return False, f"failed to load {p}: {exc}"
-    # Try bare name (depends on PATH / add_dll_directory)
+
     for name in ("cublas64_12.dll", "cublas64_11.dll"):
         try:
             ctypes.WinDLL(name)
-            return True, f"loaded by name: {name}"
+            return True, f"loaded by name (PATH): {name}"
         except OSError:
             continue
-    return False, "cublas64_*.dll not found or not loadable (install CUDA Toolkit bin on PATH)"
+    return False, "cublas64_*.dll not found or not loadable (check venv torch/lib or CUDA Toolkit bin on PATH)"
 
 
 def ctranslate2_cuda_runtime_probe(*, use_cache: bool = True) -> tuple[bool, str]:

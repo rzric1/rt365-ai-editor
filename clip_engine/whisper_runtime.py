@@ -3,11 +3,80 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+
+def _torch_lib_dir() -> str | None:
+    try:
+        import importlib.util
+
+        torch_spec = importlib.util.find_spec("torch")
+        if torch_spec and torch_spec.submodule_search_locations:
+            torch_lib = os.path.join(list(torch_spec.submodule_search_locations)[0], "lib")
+            if os.path.isdir(torch_lib):
+                return torch_lib
+    except Exception:
+        pass
+    return None
+
+
+def _prepend_venv_cuda_dlls() -> None:
+    """
+    On Windows, torch bundles its own CUDA DLLs under .venv/Lib/site-packages/torch/lib/.
+    If a newer system CUDA Toolkit is installed (e.g. 12.9 vs torch's 12.8), Windows
+    DLL search picks up the system cublas64_12.dll first, causing WinError 127 symbol
+    mismatch. Prepending the torch lib path to PATH forces torch's bundled DLLs to win.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        torch_lib = _torch_lib_dir()
+        if torch_lib:
+            current = os.environ.get("PATH", "")
+            if torch_lib.lower() not in current.lower():
+                os.environ["PATH"] = torch_lib + os.pathsep + current
+                import logging
+
+                logging.getLogger("clip_engine.whisper_runtime").info(
+                    "[cuda-dll-fix] prepended torch lib to PATH: %s",
+                    torch_lib,
+                )
+    except Exception as exc:
+        import logging
+
+        logging.getLogger("clip_engine.whisper_runtime").warning(
+            "[cuda-dll-fix] failed: %s", exc
+        )
+
+
+def _add_torch_dll_directory() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        torch_lib = _torch_lib_dir()
+        if torch_lib:
+            os.add_dll_directory(torch_lib)
+            import logging
+
+            logging.getLogger("clip_engine.whisper_runtime").info(
+                "[cuda-dll-fix] os.add_dll_directory: %s",
+                torch_lib,
+            )
+    except Exception as exc:
+        import logging
+
+        logging.getLogger("clip_engine.whisper_runtime").warning(
+            "[cuda-dll-fix] add_dll_directory failed: %s", exc
+        )
+
+
+_prepend_venv_cuda_dlls()
+_add_torch_dll_directory()
+
 import itertools
 import logging
-import os
 import subprocess
-import sys
 import threading
 import time
 import traceback
