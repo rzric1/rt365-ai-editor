@@ -37,14 +37,50 @@ def ffmpeg_available() -> bool:
     return ensure_ffmpeg_on_path() is not None
 
 
-def extract_audio_wav(video_path: Path, wav_out: Path, *, sample_rate: int = 16000) -> None:
+_WORK_SUBDIR = "_work"
+_WHISPER_INPUT_WAV = "_whisper_input.wav"
+
+
+def whisper_input_wav_path(outputs_dir: Path | str | None = None) -> Path:
+    """Canonical Whisper demux WAV: {outputs_dir}/_work/_whisper_input.wav."""
+    if outputs_dir is None:
+        from config import CLIP_STUDIO_OUTPUT_DIR
+
+        outputs_dir = CLIP_STUDIO_OUTPUT_DIR
+    work_dir = os.path.join(os.fspath(outputs_dir), _WORK_SUBDIR)
+    return Path(os.path.join(work_dir, _WHISPER_INPUT_WAV))
+
+
+def _resolve_wav_out(
+    wav_out: Path | str | None,
+    *,
+    outputs_dir: Path | str | None = None,
+) -> Path:
+    canonical = whisper_input_wav_path(outputs_dir)
+    if wav_out is None:
+        return canonical
+    resolved = Path(os.fspath(wav_out))
+    # Guard against collapsed paths from accidental "\_" escapes in string literals.
+    if resolved.name == "clips_work_whisper_input.wav":
+        return canonical
+    return resolved
+
+
+def extract_audio_wav(
+    video_path: Path,
+    wav_out: Path | str | None = None,
+    *,
+    outputs_dir: Path | str | None = None,
+    sample_rate: int = 16000,
+) -> None:
     """16 kHz mono PCM WAV — good default for speech APIs."""
     from clip_engine.job_control import JobCancelledError, set_pipeline_step
     from clip_engine.subprocess_guard import run_subprocess
 
     ensure_ffmpeg_on_path()
     exe = get_ffmpeg_executable()
-    wav_out.parent.mkdir(parents=True, exist_ok=True)
+    wav_out = _resolve_wav_out(wav_out, outputs_dir=outputs_dir)
+    os.makedirs(os.fspath(wav_out.parent), exist_ok=True)
 
     if is_slow_drive(video_path):
         drive = os.path.splitdrive(str(video_path))[0].upper()
@@ -72,10 +108,11 @@ def extract_audio_wav(video_path: Path, wav_out: Path, *, sample_rate: int = 160
         str(sample_rate),
         "-ac",
         "1",
-        str(wav_out.resolve()),
+        os.fspath(wav_out.resolve()),
     ]
     set_pipeline_step("audio_extract")
-    logger.info("[audio_extract] ffmpeg extract: %s", " ".join(cmd))
+    logger.info("[audio_extract] ffmpeg extract -> %s", wav_out.resolve())
+    logger.debug("[audio_extract] ffmpeg cmd: %s", " ".join(cmd))
     t_start = time.perf_counter()
     timeout = _get_extract_timeout()
 
@@ -134,7 +171,9 @@ def extract_audio_wav(video_path: Path, wav_out: Path, *, sample_rate: int = 160
         stderr = (getattr(exc, "output", "") or "").strip()
         logger.error("[audio_extract] ERROR: ffmpeg non-zero exit:\n%s", stderr[-2000:])
         raise RuntimeError(
-            f"FFmpeg audio extraction failed (exit {exc.returncode}):\n{stderr[-2000:]}"
+            f"FFmpeg audio extraction failed (exit {exc.returncode})\n"
+            f"Output path used: {wav_out.resolve()}\n"
+            f"{stderr[-2000:]}"
         ) from exc
     finally:
         _stall_stop.set()
