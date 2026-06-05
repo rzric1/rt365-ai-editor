@@ -181,6 +181,30 @@ def find_orphan_job_process_pids(*, parent_pid: int | None = None) -> list[int]:
     return orphans
 
 
+def terminate_ffmpeg_by_pid(pid: int, *, grace_sec: float = 2.0) -> bool:
+    """Terminate a specific ffmpeg process by PID. Returns True if process was found and killed."""
+    with _registry_lock:
+        tracked = _tracked.get(pid)
+    if tracked is not None:
+        terminate_process(tracked.proc, grace_sec=grace_sec)
+        _unregister(tracked.proc)
+        return True
+    # Not in our registry — try via psutil if available.
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        if "ffmpeg" in (p.name() or "").lower():
+            p.terminate()
+            try:
+                p.wait(timeout=grace_sec)
+            except psutil.TimeoutExpired:
+                p.kill()
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def terminate_orphan_job_processes(*, parent_pid: int | None = None) -> int:
     """Terminate untracked ffmpeg/python children after job crash or timeout."""
     if sys.platform != "win32":

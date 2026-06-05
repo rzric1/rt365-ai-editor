@@ -29,6 +29,22 @@ def studio_job(name: str) -> Iterator[None]:
     except JobCancelledError:
         st.warning("Operation cancelled.")
         raise
+    except (TimeoutError, OSError) as exc:
+        # Surface ffmpeg stall / timeout errors with actionable guidance.
+        if name in ("transcribe", "audio_extract"):
+            st.error(
+                "**Audio extraction failed.** "
+                + str(exc)
+            )
+            st.info(
+                "If reading from a USB or network drive, copy the file to local storage (C:) "
+                "first and try again."
+            )
+        try:
+            write_crash_report(exc, context=name)
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         try:
             write_crash_report(exc, context=name)

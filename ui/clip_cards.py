@@ -721,12 +721,22 @@ def render_clips_section() -> None:
             placeholder="e.g. en - leave empty for auto",
         )
         if st.button("Transcribe", type="primary"):
+            from clip_engine.audio_extract import is_slow_drive
+            video_path_str = str(st.session_state.cs_video_path)
+            if is_slow_drive(video_path_str):
+                import os
+                drive = os.path.splitdrive(video_path_str)[0].upper()
+                st.warning(
+                    f"Tip: The source file is on drive **{drive}** (USB/network/HDD). "
+                    "Audio extraction may be slow. Copy the file to local storage (C:) for best speed."
+                )
             work = CLIP_STUDIO_OUTPUT_DIR / "_work"
             work.mkdir(parents=True, exist_ok=True)
             lang = whisper_lang.strip() or None
             model_sz = str(st.session_state.get("cs_whisper_model", DEFAULT_WHISPER_MODEL))
             prefer_gpu = bool(st.session_state.get("cs_gpu_acceleration", True))
-            with st.spinner("Transcribing (may take a while for long videos)"):
+            _phase_placeholder = st.empty()
+            with st.spinner("Transcribing..."):
                 try:
                     with studio_job("transcribe"):
                         segs, full = transcribe_video(
@@ -736,7 +746,9 @@ def render_clips_section() -> None:
                             language=lang,
                             prefer_gpu=prefer_gpu,
                             faster_whisper_model=model_sz,
+                            status_fn=_phase_placeholder.info,
                         )
+                    _phase_placeholder.empty()
                     merged = merge_segments_into_sentences(segs)
                     st.session_state.cs_segments = merged if merged else segs
                     st.session_state.cs_formatted = segments_to_prompt_transcript(
@@ -745,21 +757,34 @@ def render_clips_section() -> None:
                     st.session_state.cs_clips = []
                     st.session_state["final_clips"] = []
                     st.session_state[SESSION_FORCE_REANALYZE] = True
+                    dur = 0.0
                     try:
-                        st.session_state.cs_media_duration = get_media_duration_seconds(
-                            Path(st.session_state.cs_video_path)
-                        )
+                        dur = get_media_duration_seconds(Path(st.session_state.cs_video_path))
+                        st.session_state.cs_media_duration = dur
                     except Exception:
                         pass
                     apply_long_podcast_defaults()
+                    n_segs = len(st.session_state.cs_segments)
+                    dur_str = f" ({dur / 60:.1f} min)" if dur > 0 else ""
                     st.session_state.cs_status = (
-                        f"Transcribed {len(segs)} raw segments -> "
-                        f"{len(st.session_state.cs_segments)} sentence groups."
+                        f"Transcribed {len(segs)} raw segments -> {n_segs} sentence groups{dur_str}."
                     )
                     st.session_state.cs_session_telemetry = get_session_telemetry().to_dict()
                 except JobCancelledError:
-                    pass
+                    _phase_placeholder.empty()
+                except (TimeoutError, RuntimeError) as e:
+                    _phase_placeholder.empty()
+                    err_str = str(e)
+                    logger.exception("Transcribe failed (ffmpeg/audio)")
+                    st.error("**Audio extraction failed.** " + err_str)
+                    if "usb" in err_str.lower() or "network" in err_str.lower() or "stall" in err_str.lower() or is_slow_drive(video_path_str):
+                        st.info(
+                            "If reading from a USB or network drive, copy the file to local "
+                            "storage (C:) first and try again."
+                        )
+                    st.session_state.cs_session_telemetry = get_session_telemetry().to_dict()
                 except Exception as e:
+                    _phase_placeholder.empty()
                     logger.exception("Transcribe failed")
                     category, user_msg = classify_exception(e)
                     st.session_state.cs_session_telemetry = get_session_telemetry().to_dict()

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 import threading
 from typing import Callable
 
@@ -11,8 +13,19 @@ logger = logging.getLogger("clip_engine.job_control")
 
 _lock = threading.Lock()
 _active_job: str | None = None
+_job_acquired_at: float | None = None
 _cancel_requested = threading.Event()
 _last_pipeline_step: str = ""
+
+# Jobs held longer than this are auto-released on next acquire attempt.
+_DEFAULT_JOB_TIMEOUT_SEC = 1200.0
+
+
+def _get_job_timeout() -> float:
+    try:
+        return float(os.environ.get("JOB_LOCK_TIMEOUT", _DEFAULT_JOB_TIMEOUT_SEC))
+    except (TypeError, ValueError):
+        return _DEFAULT_JOB_TIMEOUT_SEC
 
 
 class JobBusyError(RuntimeError):
@@ -57,25 +70,42 @@ def request_cancel() -> None:
 
 
 def try_acquire_job(name: str) -> None:
-    """Raise JobBusyError if another job holds the lock."""
+    """Raise JobBusyError if another job holds the lock.
+
+    If the current lock holder has been held longer than JOB_LOCK_TIMEOUT, it is
+    automatically force-released so the next job can proceed.
+    """
     if is_cancelled():
         clear_cancel()
     with _lock:
-        global _active_job
+        global _active_job, _job_acquired_at
         if _active_job is not None and _active_job != name:
-            raise JobBusyError(
-                f"Cannot start '{name}' while '{_active_job}' is running. "
-                "Wait for it to finish or click Cancel current job."
-            )
+            elapsed = time.monotonic() - (_job_acquired_at or 0)
+            timeout = _get_job_timeout()
+            if elapsed >= timeout:
+                logger.warning(
+                    "[job] WARNING: job '%s' held for %.0fs, force-releasing stale lock",
+                    _active_job,
+                    elapsed,
+                )
+                _active_job = None
+                _job_acquired_at = None
+            else:
+                raise JobBusyError(
+                    f"Cannot start '{name}' while '{_active_job}' is running. "
+                    "Wait for it to finish or click Cancel current job."
+                )
         _active_job = name
+        _job_acquired_at = time.monotonic()
         logger.info("[job] acquired: %s", name)
 
 
 def release_job(name: str) -> None:
     with _lock:
-        global _active_job
+        global _active_job, _job_acquired_at
         if _active_job == name:
             _active_job = None
+            _job_acquired_at = None
             logger.info("[job] released: %s", name)
         clear_cancel()
 

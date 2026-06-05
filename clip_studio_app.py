@@ -118,6 +118,10 @@ def _start_whisper_prewarm() -> None:
     global _PREWARM_STARTED
     if _PREWARM_STARTED:
         return
+    # Session state gate prevents firing on every Streamlit rerun within the same browser session.
+    if st.session_state.get("_whisper_prewarmed"):
+        return
+    st.session_state["_whisper_prewarmed"] = True
     _PREWARM_STARTED = True
     import threading
 

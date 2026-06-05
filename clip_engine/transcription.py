@@ -152,6 +152,7 @@ def transcribe_video(
     language: str | None = None,
     prefer_gpu: bool = False,
     faster_whisper_model: str = DEFAULT_WHISPER_MODEL,
+    status_fn: Any = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """
     Returns (segments, full_plain_text).
@@ -171,14 +172,23 @@ def transcribe_video(
 
     from clip_engine.telemetry import pipeline_phase
 
+    def _status(msg: str) -> None:
+        if callable(status_fn):
+            try:
+                status_fn(msg)
+            except Exception:
+                pass
+
     wav_path = work_dir / "_whisper_input.wav"
     try:
+        _status("Extracting audio from video... (this may take 1-3 min for large files)")
         with pipeline_phase("audio_extract"):
             extract_audio_wav(video_path, wav_path)
 
         check_cancelled()
 
         if prefer_gpu and os.environ.get("FORCE_CPU_WHISPER", "").lower() not in ("1", "true", "yes"):
+            _status(f"Transcribing with Whisper {faster_whisper_model} on GPU...")
             with pipeline_phase("transcription"):
                 try:
                     local = transcribe_with_faster_whisper_cuda(
@@ -202,6 +212,7 @@ def transcribe_video(
                 )
                 return segs, txt
             logger.info("Transcription backend: falling back to OpenAI whisper-1 API.")
+        _status("Transcribing with Whisper (OpenAI API)...")
 
         key = (api_key or "").strip()
         if not key:
