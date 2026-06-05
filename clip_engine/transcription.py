@@ -13,7 +13,7 @@ from openai import OpenAI
 
 from config import DEFAULT_WHISPER_MODEL
 
-from clip_engine.audio_extract import extract_audio_wav, ffmpeg_available
+from clip_engine.audio_extract import extract_audio_wav, ffmpeg_available, whisper_input_wav_path
 from clip_engine.cuda_diagnostics import (
     allow_cpu_fallback,
     cublas_missing_hint,
@@ -148,7 +148,7 @@ def transcribe_video(
     video_path: Path,
     api_key: str,
     *,
-    work_dir: Path,
+    work_dir: Path | None = None,
     language: str | None = None,
     prefer_gpu: bool = False,
     faster_whisper_model: str = DEFAULT_WHISPER_MODEL,
@@ -179,16 +179,26 @@ def transcribe_video(
             except Exception:
                 pass
 
-    wav_path = work_dir / "_whisper_input.wav"
+    wav_path = whisper_input_wav_path()
     try:
-        _status("Extracting audio from video... (this may take 1-3 min for large files)")
+        _status("Extracting audio with FFmpeg (may take 1–3 min for large files)...")
+        logger.info("[transcribe] phase=audio_extract video=%s wav=%s", video_path, wav_path)
         with pipeline_phase("audio_extract"):
             extract_audio_wav(video_path, wav_path)
+        logger.info("[transcribe] phase=audio_extract complete wav=%s", wav_path)
 
         check_cancelled()
 
         if prefer_gpu and os.environ.get("FORCE_CPU_WHISPER", "").lower() not in ("1", "true", "yes"):
-            _status(f"Transcribing with Whisper {faster_whisper_model} on GPU...")
+            _status(
+                f"Transcribing with faster-whisper CUDA ({faster_whisper_model}, float16)..."
+            )
+            logger.info(
+                "[transcribe] phase=whisper_cuda model=%s prefer_gpu=%s executable=%s",
+                faster_whisper_model,
+                prefer_gpu,
+                sys.executable,
+            )
             with pipeline_phase("transcription"):
                 try:
                     local = transcribe_with_faster_whisper_cuda(
@@ -203,16 +213,24 @@ def transcribe_video(
                     raise RuntimeError(f"Local Whisper transcription failed: {exc}") from exc
             if local is not None:
                 segs, txt, dev_tag = local
+                backend = (
+                    "faster-whisper CUDA"
+                    if dev_tag == "cuda"
+                    else "faster-whisper CPU FALLBACK"
+                )
                 logger.info(
-                    "[transcribe] backend=%s device=%s pid=%s executable=%s",
-                    "faster-whisper (CUDA)" if dev_tag == "cuda" else "faster-whisper (CPU FALLBACK)",
+                    "[transcribe] phase=whisper complete backend=%s device=%s model=%s "
+                    "segments=%s pid=%s executable=%s",
+                    backend,
                     dev_tag,
+                    faster_whisper_model,
+                    len(segs),
                     os.getpid(),
                     sys.executable,
                 )
                 return segs, txt
             logger.info("Transcription backend: falling back to OpenAI whisper-1 API.")
-        _status("Transcribing with Whisper (OpenAI API)...")
+        _status("Transcribing with OpenAI Whisper API (cloud)...")
 
         key = (api_key or "").strip()
         if not key:
