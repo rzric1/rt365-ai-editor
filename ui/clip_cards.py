@@ -724,7 +724,6 @@ def render_clips_section() -> None:
             from clip_engine.audio_extract import is_slow_drive
             video_path_str = str(st.session_state.cs_video_path)
             if is_slow_drive(video_path_str):
-                import os
                 drive = os.path.splitdrive(video_path_str)[0].upper()
                 st.warning(
                     f"Tip: The source file is on drive **{drive}** (USB/network/HDD). "
