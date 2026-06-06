@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-import threading
 import time
 from pathlib import Path
 
@@ -14,11 +13,8 @@ from clip_engine.ffmpeg_resolve import ensure_ffmpeg_on_path, get_ffmpeg_executa
 
 logger = logging.getLogger(__name__)
 
-# Configurable via AUDIO_EXTRACT_TIMEOUT env var; default 900s (15 min).
-_DEFAULT_EXTRACT_TIMEOUT_SEC = 900.0
-_WAV_STALL_CHECK_INTERVAL_SEC = 30.0
-_WAV_STALL_WARMUP_SEC = 120.0  # large 4K MP4 may not flush WAV bytes immediately
-_WAV_STALL_KILL_AFTER_SEC = 180.0
+# Configurable via AUDIO_EXTRACT_TIMEOUT env var; default 7200s (June 1 long-podcast value).
+_DEFAULT_EXTRACT_TIMEOUT_SEC = 7200.0
 
 
 def _get_extract_timeout() -> float:
@@ -75,7 +71,7 @@ def extract_audio_wav(
     sample_rate: int = 16000,
 ) -> None:
     """16 kHz mono PCM WAV — good default for speech APIs."""
-    from clip_engine.job_control import JobCancelledError, set_pipeline_step
+    from clip_engine.job_control import set_pipeline_step
     from clip_engine.subprocess_guard import run_subprocess
 
     ensure_ffmpeg_on_path()
@@ -120,39 +116,6 @@ def extract_audio_wav(
     t_start = time.perf_counter()
     timeout = _get_extract_timeout()
 
-    # Stall monitor: kill ffmpeg if the output WAV stops growing for 60s.
-    _stall_stop = threading.Event()
-    _stall_reason: list[str] = []
-
-    def _stall_monitor() -> None:
-        started = time.monotonic()
-        last_size = -1
-        last_growth_time = time.monotonic()
-        while not _stall_stop.wait(_WAV_STALL_CHECK_INTERVAL_SEC):
-            if time.monotonic() - started < _WAV_STALL_WARMUP_SEC:
-                continue
-            current_size = wav_out.stat().st_size if wav_out.exists() else 0
-            if current_size > last_size:
-                last_size = current_size
-                last_growth_time = time.monotonic()
-            elif time.monotonic() - last_growth_time > _WAV_STALL_KILL_AFTER_SEC:
-                logger.error(
-                    "[audio_extract] STALL detected — WAV not growing for %.0fs, killing ffmpeg",
-                    _WAV_STALL_KILL_AFTER_SEC,
-                )
-                _stall_reason.append(
-                    f"WAV output stalled (no growth for {_WAV_STALL_KILL_AFTER_SEC:.0f}s)"
-                )
-                try:
-                    from clip_engine.job_control import request_cancel
-                    request_cancel()
-                except Exception:
-                    pass
-                break
-
-    monitor = threading.Thread(target=_stall_monitor, daemon=True, name="ffmpeg_stall_monitor")
-    monitor.start()
-
     try:
         run_subprocess(
             cmd,
@@ -161,12 +124,6 @@ def extract_audio_wav(
             check=True,
             capture_output=False,
         )
-    except JobCancelledError:
-        if _stall_reason:
-            msg = f"[audio_extract] ffmpeg stall: {_stall_reason[0]}"
-            logger.error("[audio_extract] ERROR: %s", msg)
-            raise TimeoutError(msg) from None
-        raise
     except subprocess.TimeoutExpired:
         logger.error(
             "[audio_extract] ERROR: ffmpeg timed out after %.0fs (AUDIO_EXTRACT_TIMEOUT)", timeout
@@ -183,9 +140,6 @@ def extract_audio_wav(
             f"Output path used: {wav_out.resolve()}\n"
             f"{stderr[-2000:]}"
         ) from exc
-    finally:
-        _stall_stop.set()
-        monitor.join(timeout=2.0)
 
     elapsed = time.perf_counter() - t_start
     wav_size = os.path.getsize(wav_out) if wav_out.exists() else 0
