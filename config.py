@@ -82,11 +82,13 @@ RESOLVE_SCRIPT_MODULE_PATHS: tuple[str, ...] = (
 
 
 def ensure_directories() -> None:
-    """Create transcripts/ and logs/ if they are missing."""
+    """Create transcripts/, logs/, and Clip Studio runtime folders if missing."""
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     CLIP_STUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (CLIP_STUDIO_OUTPUT_DIR / "_work").mkdir(parents=True, exist_ok=True)
+    (CLIP_STUDIO_OUTPUT_DIR / "previews").mkdir(parents=True, exist_ok=True)
     ANALYSIS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 

@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 # Configurable via AUDIO_EXTRACT_TIMEOUT env var; default 900s (15 min).
 _DEFAULT_EXTRACT_TIMEOUT_SEC = 900.0
 _WAV_STALL_CHECK_INTERVAL_SEC = 30.0
-_WAV_STALL_KILL_AFTER_SEC = 60.0
+_WAV_STALL_WARMUP_SEC = 120.0  # large 4K MP4 may not flush WAV bytes immediately
+_WAV_STALL_KILL_AFTER_SEC = 180.0
 
 
 def _get_extract_timeout() -> float:
@@ -47,8 +48,8 @@ def whisper_input_wav_path(outputs_dir: Path | str | None = None) -> Path:
         from config import CLIP_STUDIO_OUTPUT_DIR
 
         outputs_dir = CLIP_STUDIO_OUTPUT_DIR
-    work_dir = os.path.join(os.fspath(outputs_dir), _WORK_SUBDIR)
-    return Path(os.path.join(work_dir, _WHISPER_INPUT_WAV))
+    base = Path(outputs_dir)
+    return base / _WORK_SUBDIR / _WHISPER_INPUT_WAV
 
 
 def _resolve_wav_out(
@@ -80,7 +81,7 @@ def extract_audio_wav(
     ensure_ffmpeg_on_path()
     exe = get_ffmpeg_executable()
     wav_out = _resolve_wav_out(wav_out, outputs_dir=outputs_dir)
-    os.makedirs(os.fspath(wav_out.parent), exist_ok=True)
+    wav_out.parent.mkdir(parents=True, exist_ok=True)
     logger.info("[audio_extract] START video=%s -> wav=%s", video_path.resolve(), wav_out.resolve())
 
     if is_slow_drive(video_path):
@@ -98,6 +99,8 @@ def extract_audio_wav(
         "50M",
         "-i",
         str(video_path.resolve()),
+        "-map",
+        "0:a:0",
         "-vn",
         "-threads",
         "0",
@@ -122,9 +125,12 @@ def extract_audio_wav(
     _stall_reason: list[str] = []
 
     def _stall_monitor() -> None:
+        started = time.monotonic()
         last_size = -1
         last_growth_time = time.monotonic()
         while not _stall_stop.wait(_WAV_STALL_CHECK_INTERVAL_SEC):
+            if time.monotonic() - started < _WAV_STALL_WARMUP_SEC:
+                continue
             current_size = wav_out.stat().st_size if wav_out.exists() else 0
             if current_size > last_size:
                 last_size = current_size
@@ -153,6 +159,7 @@ def extract_audio_wav(
             timeout=timeout,
             label="ffmpeg_audio_extract",
             check=True,
+            capture_output=False,
         )
     except JobCancelledError:
         if _stall_reason:

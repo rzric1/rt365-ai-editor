@@ -286,6 +286,7 @@ def run_subprocess(
     check: bool = False,
     text: bool = True,
     cwd: str | None = None,
+    capture_output: bool = True,
 ) -> subprocess.CompletedProcess:
     """
     Run a command with tracking, timeout, and cancel support.
@@ -299,8 +300,12 @@ def run_subprocess(
     cmd_line = " ".join(str(x) for x in cmd)
     logger.info("[%s] start: %s", label, cmd_line[:500])
 
-    stdout_opt: int | IO = subprocess.PIPE if text else subprocess.DEVNULL
-    stderr_opt: int | IO = subprocess.PIPE if text else subprocess.DEVNULL
+    if capture_output:
+        stdout_opt: int | IO = subprocess.PIPE if text else subprocess.DEVNULL
+        stderr_opt: int | IO = subprocess.PIPE if text else subprocess.DEVNULL
+    else:
+        stdout_opt = subprocess.DEVNULL
+        stderr_opt = subprocess.DEVNULL
 
     proc = subprocess.Popen(
         cmd,
@@ -311,6 +316,24 @@ def run_subprocess(
         **_subprocess_kw(),
     )
     _register(proc, label=label, cmd_line=cmd_line)
+    stderr_tail: list[str] = []
+
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                stderr_tail.append(line)
+                if len(stderr_tail) > 200:
+                    stderr_tail.pop(0)
+        except Exception:
+            pass
+
+    drain_thread: threading.Thread | None = None
+    if capture_output and proc.stderr is not None:
+        drain_thread = threading.Thread(target=_drain_stderr, daemon=True, name=f"{label}_stderr")
+        drain_thread.start()
+
     try:
         deadline = time.time() + timeout if timeout is not None else None
         while proc.poll() is None:
@@ -322,7 +345,16 @@ def run_subprocess(
                 raise subprocess.TimeoutExpired(cmd, timeout)
             time.sleep(0.25)
 
-        out, err = proc.communicate()
+        if capture_output and proc.stdout is not None:
+            out, _ = proc.communicate()
+            err = "".join(stderr_tail)
+            if drain_thread is not None:
+                drain_thread.join(timeout=2.0)
+        else:
+            out, err = "", ""
+            if drain_thread is not None:
+                drain_thread.join(timeout=2.0)
+                err = "".join(stderr_tail)
         result = subprocess.CompletedProcess(
             cmd, proc.returncode, stdout=out, stderr=err
         )
