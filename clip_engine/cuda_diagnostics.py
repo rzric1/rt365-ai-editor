@@ -519,14 +519,20 @@ def gpu_pid_check(*, context: str = "") -> tuple[bool, str]:
         logger.debug("%s full smi parse error: %s", prefix, exc)
 
     exe_norm = sys.executable.replace("\\", "/")
-    venv311 = ".venv311" in exe_norm.lower()
+    in_project_venv = False
+    try:
+        from clip_engine.environment_check import is_project_venv_executable
+
+        in_project_venv = is_project_venv_executable(sys.executable)
+    except Exception:
+        in_project_venv = ".venv" in exe_norm.lower() or ".venv311" in exe_norm.lower()
     windows_note = (
         "On Windows, nvidia-smi compute-apps often lists the base Python311 install path "
         "while sys.executable is authoritative for this process."
     )
     if python_rows:
         others = ", ".join(python_rows)
-        if venv311:
+        if in_project_venv:
             msg = (
                 f"{prefix} NOTE pid={pid} not in nvidia-smi compute-apps (expected on Windows venv). "
                 f"sys.executable={sys.executable}. Other python GPU PIDs: {others}. "
@@ -540,10 +546,10 @@ def gpu_pid_check(*, context: str = "") -> tuple[bool, str]:
             )
             logger.warning(msg)
     else:
-        if venv311:
+        if in_project_venv:
             msg = (
                 f"{prefix} NOTE pid={pid} not listed in nvidia-smi compute-apps yet. "
-                f"sys.executable={sys.executable} (.venv311). {windows_note} "
+                f"sys.executable={sys.executable} (project venv). {windows_note} "
                 "Whisper may not be transcribing yet — verify actual_device=cuda in transcribe logs."
             )
             logger.info(msg)
@@ -607,7 +613,7 @@ def get_startup_cuda_log_lines() -> list[str]:
         lines.append(f"[ai-accel] cuBLAS collect failed: {exc}")
     lines.append(
         "Windows venv note: nvidia-smi may list the base python.exe path while "
-        "sys.executable / logs/rt365_app.lock show .venv311\\Scripts\\python.exe."
+        "sys.executable / logs/rt365_app.lock show .venv\\Scripts\\python.exe or .venv311\\Scripts\\python.exe."
     )
     return lines
 
@@ -635,12 +641,18 @@ def evaluate_gpu_transcription_checks(
     Does not use torch.cuda.memory_allocated() or WhisperModel.device.
     """
     exe = sys_executable or sys.executable
-    venv_ok = ".venv311" in exe.replace("\\", "/")
+    try:
+        from clip_engine.environment_check import is_project_venv_executable
+
+        venv_ok = is_project_venv_executable(exe)
+    except Exception:
+        exe_norm = exe.replace("\\", "/").lower()
+        venv_ok = "/.venv/" in exe_norm or "/.venv311/" in exe_norm
     checks: list[GpuTranscriptionCheck] = []
 
     checks.append(
         GpuTranscriptionCheck(
-            "sys.executable uses .venv311",
+            "sys.executable uses project venv",
             venv_ok,
             exe,
         )

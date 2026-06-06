@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Startup dependency validation for RT365 AI Clip Studio (Python 3.11 venv only)."""
+"""Startup dependency validation for RT365 AI Clip Studio (project .venv / .venv311)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,24 @@ REQUIRED_PYTHON_MAJOR = 3
 REQUIRED_PYTHON_MINOR = 11
 BLOCKED_PYTHON_MINORS = frozenset({14})  # 3.14 — known crash risk with mixed stacks
 EXPECTED_VENV_DIR = PROJECT_ROOT / ".venv311"
+# RT365-GPU-FIX 2026-06-05: accept `.venv` launch path (user command) and `.venv311`.
+PROJECT_VENV_DIRS: tuple[Path, ...] = (
+    PROJECT_ROOT / ".venv",
+    PROJECT_ROOT / ".venv311",
+)
+
+
+def is_project_venv_executable(exe: str | Path | None = None) -> bool:
+    """True when executable lives under project .venv or .venv311 (not system Python)."""
+    path = Path(exe or sys.executable).resolve()
+    for venv_root in PROJECT_VENV_DIRS:
+        try:
+            if str(path).lower().startswith(str(venv_root.resolve()).lower()):
+                return True
+        except OSError:
+            pass
+    exe_norm = str(path).replace("\\", "/").lower()
+    return "/.venv/" in exe_norm or "/.venv311/" in exe_norm
 
 
 @dataclass
@@ -53,12 +71,7 @@ class EnvironmentStatus:
 
 
 def _in_expected_venv() -> bool:
-    exe = Path(sys.executable).resolve()
-    try:
-        venv_root = EXPECTED_VENV_DIR.resolve()
-        return str(exe).lower().startswith(str(venv_root).lower())
-    except OSError:
-        return ".venv311" in str(exe).lower()
+    return is_project_venv_executable(sys.executable)
 
 
 def _check_python_version() -> DependencyCheck:
@@ -72,10 +85,18 @@ def _check_python_version() -> DependencyCheck:
             f"{ver} — need Python {REQUIRED_PYTHON_MAJOR}.{REQUIRED_PYTHON_MINOR}.x",
         )
     if minor in BLOCKED_PYTHON_MINORS:
+        if _in_expected_venv():
+            # RT365-GPU-FIX 2026-06-05: allow `.venv` launch; warn instead of hard block.
+            return DependencyCheck(
+                "Python version",
+                False,
+                f"{ver} — Python 3.14 in project venv (warn): prefer 3.11 (.venv311) for stability.",
+                critical=False,
+            )
         return DependencyCheck(
             "Python version",
             False,
-            f"{ver} — Python 3.14 is blocked (use .venv311 with Python 3.11).",
+            f"{ver} — Python 3.14 is blocked (use .venv or .venv311 with Python 3.11).",
         )
     if minor != REQUIRED_PYTHON_MINOR:
         return DependencyCheck(
@@ -230,23 +251,32 @@ def validate_startup_environment(*, require_gpu_stack: bool = True) -> Environme
         )
     )
     checks.append(_check_python_version())
+    venv_ok = _in_expected_venv()
+    venv_detail = (
+        f"project venv (.venv or .venv311) — got {sys.prefix}"
+        if venv_ok
+        else f"expected {PROJECT_VENV_DIRS[0]} or {PROJECT_VENV_DIRS[1]} — got {sys.prefix}"
+    )
     checks.append(
         DependencyCheck(
             "Virtual environment",
-            _in_expected_venv(),
-            f"expected {EXPECTED_VENV_DIR} — got {sys.prefix}",
+            venv_ok,
+            venv_detail,
         )
     )
-    if not EXPECTED_VENV_DIR.is_dir():
+    existing_venvs = [str(p) for p in PROJECT_VENV_DIRS if p.is_dir()]
+    if not existing_venvs:
         checks.append(
             DependencyCheck(
-                ".venv311 exists",
+                "project venv exists",
                 False,
-                f"Run setup_windows.bat or scripts\\setup_python311_ai_env.ps1",
+                "Run setup_windows.bat or scripts\\setup_python311_ai_env.ps1",
             )
         )
     else:
-        checks.append(DependencyCheck(".venv311 exists", True, str(EXPECTED_VENV_DIR)))
+        checks.append(
+            DependencyCheck("project venv exists", True, ", ".join(existing_venvs))
+        )
 
     checks.append(_import_check("streamlit", "streamlit"))
     checks.append(_import_check("openai", "openai"))
@@ -309,8 +339,9 @@ def write_environment_check_log(status: EnvironmentStatus | None = None) -> Path
     if not status.ok:
         lines.append("")
         lines.append(
-            "Fix: Run setup_windows.bat, then launch only via launch_ai_clip_studio.ps1 "
-            "(Python 3.11 .venv311). Do not use system Python 3.14."
+            "Fix: Run setup_windows.bat, then launch via "
+            ".venv\\Scripts\\python.exe -m streamlit run clip_studio_app.py "
+            "or launch_ai_clip_studio.ps1 (.venv311). Do not use bare system Python."
         )
 
     text = "\n".join(lines)
@@ -324,8 +355,10 @@ def format_streamlit_error(status: EnvironmentStatus) -> str:
     parts = [
         "**Environment check failed.** Clip Studio cannot start safely.",
         "",
-        "Use **launch_ai_clip_studio.ps1** (Python 3.11 virtual env `.venv311`). "
-        "Do **not** run with Python 3.14 or system Python.",
+        "Launch from the project virtual env: "
+        "`.venv\\Scripts\\python.exe -m streamlit run clip_studio_app.py` "
+        "or **launch_ai_clip_studio.ps1** (`.venv311`). "
+        "Do **not** use bare system Python.",
         "",
     ]
     parts.extend(f"- {e}" for e in status.errors[:12])

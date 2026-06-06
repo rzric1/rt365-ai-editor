@@ -83,7 +83,7 @@ def test_gpu_transcription_pass_criteria():
         gpu_util_after_pct=45,
     )
     by_name = {c.name: c for c in checks}
-    assert by_name["sys.executable uses .venv311"].passed
+    assert by_name["sys.executable uses project venv"].passed
     assert by_name["whisper actual_device=cuda"].passed
     assert by_name["transcription segments > 0"].passed
     assert by_name["nvidia-smi GPU utilization during/after transcribe"].passed

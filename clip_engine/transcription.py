@@ -93,25 +93,48 @@ def transcribe_with_faster_whisper_cuda(
             f"executable={sys.executable}"
         )
         if allow_cpu_fallback():
-            logger.warning("[whisper] CUDA unavailable (%s) — ALLOW_CPU_FALLBACK enabled, trying CPU", detail)
+            logger.warning(
+                "[GPU FALLBACK] CUDA unavailable (%s) — ALLOW_CPU_FALLBACK enabled, trying CPU",
+                detail,
+            )
         else:
             raise RuntimeError(
                 "GPU transcription requested but CUDA is not available for faster-whisper. "
-                f"{detail}. Launch via launch_ai_clip_studio.ps1 (.venv311), verify cublas64_12.dll "
-                "on PATH, or set ALLOW_CPU_FALLBACK=1 to permit CPU (slow)."
+                f"{detail}. Launch via .venv\\Scripts\\python.exe or launch_ai_clip_studio.ps1, "
+                "verify cublas64_12.dll on PATH, or set ALLOW_CPU_FALLBACK=1 to permit CPU (slow)."
             )
 
     if n_cuda > 0 and cuda_ok and faster_whisper_cuda_available():
         set_pipeline_step("whisper_cuda_float16")
+        device = "cuda"
+        compute_type = "float16"
+        fallback_occurred = False
+        logger.info(
+            "[TRANSCRIPTION START] device=%s compute_type=%s model=%s executable=%s",
+            device,
+            compute_type,
+            model_size,
+            sys.executable,
+        )
         try:
             segs, txt, _info = transcribe_wav(
                 wav_path,
                 language=language,
                 model_size=model_size,
-                device="cuda",
-                compute_type="float16",
+                device=device,
+                compute_type=compute_type,
             )
             gpu_pid_check(context="after_cuda_transcribe")
+            from clip_engine.whisper_runtime import get_whisper_cache_state
+
+            cache = get_whisper_cache_state()
+            device_used = cache.get("inner_device") or device
+            logger.info(
+                "[TRANSCRIPTION DONE] device_used=%s fallback_occurred=%s segments=%s",
+                device_used,
+                fallback_occurred,
+                len(segs),
+            )
             return segs, txt, "cuda"
         except Exception as exc:
             logger.error("[whisper] CUDA float16 transcription failed: %s", exc)
@@ -124,22 +147,44 @@ def transcribe_with_faster_whisper_cuda(
                     f"faster-whisper CUDA transcription failed: {exc}. "
                     "Set ALLOW_CPU_FALLBACK=1 to try CPU int8 (slow)."
                 ) from exc
-            logger.warning("[whisper] ALLOW_CPU_FALLBACK — retrying on CPU after CUDA failure")
+            logger.warning(
+                "[GPU FALLBACK] CUDA transcription init failed: %r. Falling back to CPU.",
+                exc,
+            )
 
     if allow_cpu_fallback():
         for comp in ("int8", "float32"):
             try:
                 set_pipeline_step(f"whisper_cpu_{comp}")
+                device = "cpu"
+                compute_type = comp
+                logger.info(
+                    "[TRANSCRIPTION START] device=%s compute_type=%s model=%s (CPU fallback)",
+                    device,
+                    compute_type,
+                    model_size,
+                )
                 segs, txt, _info = transcribe_wav(
                     wav_path,
                     language=language,
                     model_size=model_size,
-                    device="cpu",
+                    device=device,
                     compute_type=comp,
+                )
+                from clip_engine.whisper_runtime import get_whisper_cache_state
+
+                cache = get_whisper_cache_state()
+                device_used = cache.get("inner_device") or device
+                logger.info(
+                    "[TRANSCRIPTION DONE] device_used=%s fallback_occurred=True segments=%s",
+                    device_used,
+                    len(segs),
                 )
                 return segs, txt, "cpu"
             except Exception as exc:  # noqa: BLE001
-                logger.warning("faster-whisper CPU compute_type=%s failed: %s", comp, exc)
+                logger.warning(
+                    "[GPU FALLBACK] faster-whisper CPU compute_type=%s failed: %s", comp, exc
+                )
 
     return None
 

@@ -10,9 +10,23 @@ def test_blocks_python_314_minor():
     from clip_engine.environment_check import _check_python_version
 
     with patch("sys.version_info", (3, 14, 0, "final", 0)):
-        c = _check_python_version()
-        assert not c.ok
-        assert "3.14" in c.detail
+        with patch("clip_engine.environment_check._in_expected_venv", return_value=True):
+            c = _check_python_version()
+            assert not c.ok
+            assert "3.14" in c.detail
+            assert not c.critical
+        with patch("clip_engine.environment_check._in_expected_venv", return_value=False):
+            c = _check_python_version()
+            assert not c.ok
+            assert c.critical
+
+
+def test_project_venv_paths():
+    from clip_engine.environment_check import is_project_venv_executable
+
+    assert is_project_venv_executable(r"C:\dev\rt365-ai-editor\.venv\Scripts\python.exe")
+    assert is_project_venv_executable(r"C:\dev\rt365-ai-editor\.venv311\Scripts\python.exe")
+    assert not is_project_venv_executable(r"C:\Python311\python.exe")
 
 
 def test_detects_missing_faster_whisper(monkeypatch):
