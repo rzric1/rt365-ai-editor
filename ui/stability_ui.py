@@ -45,10 +45,10 @@ def render_stability_controls() -> None:
 
     if st.button("Refresh resource snapshot", key="cs_resource_snap"):
         snap = log_resource_snapshot(label="manual")
-        st.session_state.cs_resource_snap = snap
+        st.session_state["_cs_resource_snap_data"] = snap
         st.caption(f"Logged snapshot (RSS {snap.get('process_rss_mb', '?')} MB).")
 
-    snap = st.session_state.get("cs_resource_snap")
+    snap = st.session_state.get("_cs_resource_snap_data")
     if snap:
         st.caption(
             f"Last snapshot: CPU {snap.get('cpu_percent', '?')}% | "

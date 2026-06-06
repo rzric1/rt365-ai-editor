@@ -66,6 +66,7 @@ def init_session_state() -> None:
         "cs_title_style": "Curiosity",
         SESSION_CLIP_EDITS: {},
         SESSION_ANALYSIS_DIAGNOSTICS: {},
+        "_cs_resource_snap_data": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
