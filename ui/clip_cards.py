@@ -953,6 +953,7 @@ def render_clips_section() -> None:
             _status_placeholder = st.empty()
             _progress_bar = st.progress(0.0)
             _completed_stages: list[str] = []
+            _status_placeholder.info("⏳ **Analyzing clips with AI...**")
 
             _STAGE_PROGRESS: dict[str, float] = {
                 "upload": 0.05, "transcrib": 0.15, "analys": 0.40,

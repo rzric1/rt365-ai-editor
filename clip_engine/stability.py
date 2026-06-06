@@ -234,6 +234,10 @@ def append_gpu_transcription_session_result(
     gpu_mem_after_mib: int | None,
     gpu_util_before_pct: int | None,
     gpu_util_after_pct: int | None,
+    gpu_peak_util_pct: int | None = None,
+    gpu_peak_mem_mib: int | None = None,
+    model_size: str | None = None,
+    compute_type: str | None = None,
 ) -> None:
     """Append post-transcription GPU pass/fail block (diagnostics only)."""
     from clip_engine.cuda_diagnostics import (
@@ -250,9 +254,18 @@ def append_gpu_transcription_session_result(
         gpu_util_before_pct=gpu_util_before_pct,
         gpu_util_after_pct=gpu_util_after_pct,
     )
+    meta = (
+        f"segments={segment_count} model={model_size or '?'} "
+        f"requested_device={requested_device} actual_device={actual_device} "
+        f"compute_type={compute_type or '?'}"
+    )
+    peak_line = (
+        f"peak_during_gpu_util_pct={gpu_peak_util_pct} peak_during_gpu_mem_mib={gpu_peak_mem_mib}"
+    )
     block = [
         f"=== GPU Transcription Session @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
-        f"segments={segment_count} requested_device={requested_device} actual_device={actual_device}",
+        meta,
+        peak_line,
         format_gpu_transcription_check_report(checks),
         "",
     ]

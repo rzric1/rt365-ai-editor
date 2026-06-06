@@ -199,8 +199,85 @@ def _validate_cuda_or_raise() -> None:
 
 def _whisper_model_kwargs(*, device: str, compute_type: str) -> dict[str, Any]:
     if device == "cuda":
-        return {"num_workers": 4, "cpu_threads": 0}
+        # RTX 4090: parallel workers for preprocessing; cpu_threads=0 avoids CPU decode bottleneck.
+        workers = int(os.environ.get("WHISPER_NUM_WORKERS", "4"))
+        return {"num_workers": max(1, workers), "cpu_threads": 0}
     return {"num_workers": 1}
+
+
+def _get_inner_device(model: Any) -> str:
+    inner = getattr(model, "model", None)
+    dev = getattr(inner, "device", None) if inner is not None else None
+    if dev is not None:
+        return str(dev)
+    return "unknown"
+
+
+def _audio_duration_sec(wav_path: Path) -> float | None:
+    try:
+        import wave
+
+        with wave.open(os.fspath(wav_path), "rb") as wf:
+            rate = wf.getframerate()
+            if rate <= 0:
+                return None
+            return wf.getnframes() / float(rate)
+    except Exception:
+        return None
+
+
+def _transcribe_call_kwargs(*, device: str) -> dict[str, Any]:
+    """faster-whisper transcribe options tuned for RTX 4090 CUDA."""
+    beam = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
+    kwargs: dict[str, Any] = {
+        "beam_size": max(1, beam),
+        "vad_filter": True,
+        "vad_parameters": {"threshold": 0.5, "min_silence_duration_ms": 500},
+    }
+    if device == "cuda":
+        batch = int(os.environ.get("WHISPER_BATCH_SIZE", "16"))
+        kwargs["batch_size"] = max(1, batch)
+    return kwargs
+
+
+def _invoke_transcribe(
+    model: Any,
+    wav_path: Path,
+    *,
+    language: str | None,
+    device: str,
+    transcribe_kwargs: dict[str, Any],
+) -> tuple[Any, Any]:
+    """Use BatchedInferencePipeline on CUDA (batch_size); plain WhisperModel on CPU."""
+    path = os.fspath(wav_path)
+    if device == "cuda" and transcribe_kwargs.get("batch_size"):
+        from faster_whisper import BatchedInferencePipeline
+
+        pipeline = BatchedInferencePipeline(model)
+        return pipeline.transcribe(path, language=language, **transcribe_kwargs)
+    plain_kwargs = {k: v for k, v in transcribe_kwargs.items() if k != "batch_size"}
+    return model.transcribe(path, language=language, **plain_kwargs)
+
+
+def _gpu_poll_worker(stop: threading.Event, interval_sec: float, samples: list[tuple[float, int | None, int | None]]) -> None:
+    from clip_engine.cuda_diagnostics import query_nvidia_gpu_memory_and_util
+
+    while not stop.wait(interval_sec):
+        mem, util = query_nvidia_gpu_memory_and_util()
+        samples.append((time.monotonic(), mem, util))
+
+
+def _peak_gpu_from_samples(
+    samples: list[tuple[float, int | None, int | None]],
+) -> tuple[int | None, int | None]:
+    peak_mem: int | None = None
+    peak_util: int | None = None
+    for _ts, mem, util in samples:
+        if mem is not None:
+            peak_mem = mem if peak_mem is None else max(peak_mem, mem)
+        if util is not None:
+            peak_util = util if peak_util is None else max(peak_util, util)
+    return peak_mem, peak_util
 
 
 def _release_model() -> None:
@@ -315,20 +392,38 @@ def _collect_transcription(
     wav_path: Path,
     *,
     language: str | None,
+    model_size: str,
+    device: str,
+    compute_type: str,
+    transcribe_kwargs: dict[str, Any],
 ) -> tuple[list[dict], str, Any]:
     """Run model.transcribe and drain segments (runs in worker thread for timeout)."""
     from clip_engine.job_control import check_cancelled
 
     t_start = time.perf_counter()
     ts_start = datetime.now(timezone.utc).isoformat()
-    logger.info("[whisper] transcribe START pid=%s ts=%s wav=%s", os.getpid(), ts_start, wav_path)
+    actual_device = _get_inner_device(model)
+    audio_sec = _audio_duration_sec(wav_path)
+    logger.info(
+        "[whisper] transcribe START pid=%s ts=%s wav=%s audio_sec=%s model=%s "
+        "requested_device=%s actual_device=%s compute_type=%s transcribe_kwargs=%s",
+        os.getpid(),
+        ts_start,
+        wav_path,
+        f"{audio_sec:.1f}" if audio_sec is not None else "?",
+        model_size,
+        device,
+        actual_device,
+        compute_type,
+        transcribe_kwargs,
+    )
 
-    segs_iter, info = model.transcribe(
-        str(wav_path),
+    segs_iter, info = _invoke_transcribe(
+        model,
+        wav_path,
         language=language,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 500},
+        device=device,
+        transcribe_kwargs=transcribe_kwargs,
     )
 
     first_seg = None
@@ -356,12 +451,18 @@ def _collect_transcription(
 
     elapsed = time.perf_counter() - t_start
     ts_end = datetime.now(timezone.utc).isoformat()
+    duration = float(getattr(info, "duration", 0) or 0) or (audio_sec or 0.0)
+    rtf = (elapsed / duration) if duration > 0 else None
     logger.info(
-        "[whisper] transcribe END pid=%s ts=%s elapsed_sec=%.2f segments=%s",
+        "[whisper] transcribe END pid=%s ts=%s elapsed_sec=%.2f segments=%s "
+        "audio_sec=%.2f real_time_factor=%s actual_device=%s",
         os.getpid(),
         ts_end,
         elapsed,
         len(segments),
+        duration,
+        f"{rtf:.3f}" if rtf is not None else "n/a",
+        actual_device,
     )
     return segments, full_text, info
 
@@ -406,52 +507,92 @@ def transcribe_wav(
     from clip_engine.cuda_diagnostics import query_nvidia_gpu_memory_and_util
 
     mem_before, util_before = query_nvidia_gpu_memory_and_util()
+    logger.info(
+        "[whisper] pre-transcribe nvidia-smi memory_mib=%s util_pct=%s",
+        mem_before,
+        util_before,
+    )
 
     model = get_whisper_model(
         model_size=model_size, device=device, compute_type=compute_type
     )
     check_cancelled()
 
-    cache = get_whisper_cache_state()
-    actual_device = cache.get("device") or device
+    actual_device = _get_inner_device(model)
+    transcribe_kwargs = _transcribe_call_kwargs(device=device)
+    use_batched = device == "cuda" and bool(transcribe_kwargs.get("batch_size"))
+    logger.info(
+        "[whisper] transcribe_wav READY model=%s requested_device=%s actual_device=%s "
+        "compute_type=%s pipeline=%s batch_size=%s beam_size=%s vad_filter=%s",
+        model_size,
+        device,
+        actual_device,
+        compute_type,
+        "BatchedInferencePipeline" if use_batched else "WhisperModel",
+        transcribe_kwargs.get("batch_size", "n/a"),
+        transcribe_kwargs.get("beam_size"),
+        transcribe_kwargs.get("vad_filter"),
+    )
 
-    try:
-        smi = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info("[whisper] mid-transcription nvidia-smi: %s", smi.stdout.strip())
-    except Exception:
-        pass
+    gpu_samples: list[tuple[float, int | None, int | None]] = []
+    poll_stop = threading.Event()
+    poll_thread = threading.Thread(
+        target=_gpu_poll_worker,
+        args=(poll_stop, 5.0, gpu_samples),
+        daemon=True,
+        name="whisper_gpu_poll",
+    )
+    poll_thread.start()
 
     try:
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_xcribe") as pool:
-            future = pool.submit(_collect_transcription, model, wav_path, language=language)
+            future = pool.submit(
+                _collect_transcription,
+                model,
+                wav_path,
+                language=language,
+                model_size=model_size,
+                device=device,
+                compute_type=compute_type,
+                transcribe_kwargs=transcribe_kwargs,
+            )
             try:
                 segments, full_text, info = future.result(timeout=timeout)
+                poll_stop.set()
+                poll_thread.join(timeout=2.0)
                 mem_after, util_after = query_nvidia_gpu_memory_and_util()
+                peak_mem, peak_util = _peak_gpu_from_samples(gpu_samples)
+                logger.info(
+                    "[whisper] post-transcribe nvidia-smi memory_mib=%s util_pct=%s "
+                    "peak_during_memory_mib=%s peak_during_util_pct=%s actual_device=%s",
+                    mem_after,
+                    util_after,
+                    peak_mem,
+                    peak_util,
+                    actual_device,
+                )
                 try:
                     from clip_engine.stability import append_gpu_transcription_session_result
 
                     append_gpu_transcription_session_result(
                         segment_count=len(segments),
                         requested_device=device,
-                        actual_device=str(actual_device),
+                        actual_device=actual_device,
                         gpu_mem_before_mib=mem_before,
                         gpu_mem_after_mib=mem_after,
                         gpu_util_before_pct=util_before,
                         gpu_util_after_pct=util_after,
+                        gpu_peak_util_pct=peak_util,
+                        gpu_peak_mem_mib=peak_mem,
+                        model_size=model_size,
+                        compute_type=compute_type,
                     )
                 except Exception as exc:
                     logger.debug("GPU transcription session diagnostics skipped: %s", exc)
                 return segments, full_text, info
             except FuturesTimeoutError as exc:
+                poll_stop.set()
+                poll_thread.join(timeout=2.0)
                 logger.error(
                     "[whisper] transcribe TIMEOUT pid=%s after %.0fs wav=%s",
                     pid,
@@ -464,6 +605,8 @@ def transcribe_wav(
                     "Try a shorter clip, increase WHISPER_TRANSCRIBE_TIMEOUT, or cancel and retry."
                 ) from exc
     except Exception:
+        poll_stop.set()
+        poll_thread.join(timeout=2.0)
         logger.error("[whisper] transcribe failed pid=%s\n%s", pid, traceback.format_exc())
         _cleanup_on_transcribe_failure()
         raise

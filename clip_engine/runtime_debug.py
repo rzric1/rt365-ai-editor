@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -74,6 +75,11 @@ def render_runtime_debug_panel() -> None:
         st.markdown(f"**Python executable:** `{sys.executable}`")
         st.markdown(f"**PID:** `{os.getpid()}`")
         st.markdown(f"**sys.prefix:** `{sys.prefix}`")
+        if ".venv311" in sys.executable.replace("\\", "/").lower():
+            st.caption(
+                "Windows note: nvidia-smi may show base Python311\\python.exe for this PID; "
+                "sys.executable above is authoritative."
+            )
         st.markdown(f"**ALLOW_CPU_FALLBACK:** `{os.environ.get('ALLOW_CPU_FALLBACK', '(unset → False)')}`")
 
         if torch_i["installed"]:
@@ -119,5 +125,34 @@ def render_runtime_debug_panel() -> None:
             on_gpu, detail = gpu_pid_check(context="debug_panel")
             if on_gpu:
                 st.success(detail)
+            elif ".venv311" in sys.executable.replace("\\", "/").lower():
+                st.info(detail)
             else:
                 st.warning(detail)
+
+        st.caption(
+            "Benchmark (CLI): "
+            f"`{sys.executable} -m clip_engine.transcription_benchmark`"
+        )
+        if st.button("Run 60s transcription benchmark", key="cs_runtime_debug_benchmark"):
+            import subprocess
+
+            with st.spinner("Running 60s CUDA transcription benchmark..."):
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, "-m", "clip_engine.transcription_benchmark"],
+                        capture_output=True,
+                        text=True,
+                        timeout=900,
+                        cwd=str(Path(__file__).resolve().parent.parent),
+                    )
+                    out = (proc.stdout or "") + (proc.stderr or "")
+                    if proc.returncode == 0:
+                        st.success("Benchmark complete")
+                    else:
+                        st.error(f"Benchmark exit {proc.returncode}")
+                    st.code(out[-8000:] if len(out) > 8000 else out)
+                except subprocess.TimeoutExpired:
+                    st.error("Benchmark timed out after 900s")
+                except Exception as exc:
+                    st.error(f"Benchmark failed: {exc}")

@@ -81,6 +81,7 @@ def extract_audio_wav(
     exe = get_ffmpeg_executable()
     wav_out = _resolve_wav_out(wav_out, outputs_dir=outputs_dir)
     os.makedirs(os.fspath(wav_out.parent), exist_ok=True)
+    logger.info("[audio_extract] START video=%s -> wav=%s", video_path.resolve(), wav_out.resolve())
 
     if is_slow_drive(video_path):
         drive = os.path.splitdrive(str(video_path))[0].upper()

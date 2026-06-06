@@ -518,18 +518,42 @@ def gpu_pid_check(*, context: str = "") -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug("%s full smi parse error: %s", prefix, exc)
 
+    exe_norm = sys.executable.replace("\\", "/")
+    venv311 = ".venv311" in exe_norm.lower()
+    windows_note = (
+        "On Windows, nvidia-smi compute-apps often lists the base Python311 install path "
+        "while sys.executable is authoritative for this process."
+    )
     if python_rows:
         others = ", ".join(python_rows)
-        msg = (
-            f"{prefix} WARN pid={pid} NOT in nvidia-smi python compute list; "
-            f"other python GPU PIDs: {others}"
-        )
+        if venv311:
+            msg = (
+                f"{prefix} NOTE pid={pid} not in nvidia-smi compute-apps (expected on Windows venv). "
+                f"sys.executable={sys.executable}. Other python GPU PIDs: {others}. "
+                f"{windows_note} Check Whisper logs for actual_device=cuda and VRAM during transcribe."
+            )
+            logger.info(msg)
+        else:
+            msg = (
+                f"{prefix} WARN pid={pid} NOT in nvidia-smi python compute list; "
+                f"other python GPU PIDs: {others}. sys.executable={sys.executable}"
+            )
+            logger.warning(msg)
     else:
-        msg = (
-            f"{prefix} WARN pid={pid} NOT using GPU compute (no python.exe in nvidia-smi). "
-            "Whisper may be on CPU, not loaded yet, or launched from wrong python.exe."
-        )
-    logger.warning(msg)
+        if venv311:
+            msg = (
+                f"{prefix} NOTE pid={pid} not listed in nvidia-smi compute-apps yet. "
+                f"sys.executable={sys.executable} (.venv311). {windows_note} "
+                "Whisper may not be transcribing yet — verify actual_device=cuda in transcribe logs."
+            )
+            logger.info(msg)
+        else:
+            msg = (
+                f"{prefix} WARN pid={pid} NOT using GPU compute (no python.exe in nvidia-smi). "
+                f"sys.executable={sys.executable}. Whisper may be on CPU, not loaded yet, "
+                "or launched from wrong interpreter."
+            )
+            logger.warning(msg)
     return False, msg
 
 
