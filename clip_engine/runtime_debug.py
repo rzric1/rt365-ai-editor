@@ -50,6 +50,11 @@ def show_env_diagnostics() -> dict[str, Any]:
 def render_env_diagnostics_panel() -> None:
     """Environment & GPU Diagnostics — runs once per Streamlit session."""
     with st.sidebar.expander("Environment & GPU Diagnostics", expanded=False):
+        # RT365-CLEANUP 2026-06-05: clarify Windows nvidia-smi vs sys.executable ground truth
+        st.caption(
+            "ℹ️ nvidia-smi may show the base Python path on Windows — "
+            "trust sys.executable and transcription logs for ground truth."
+        )
         try:
             diag = show_env_diagnostics()
             for key, val in diag.items():

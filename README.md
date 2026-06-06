@@ -109,6 +109,42 @@ The **Edit Companion** is a local, beginner-friendly web UI in your browser. It 
 - The app **classifies** your intent (chapters, clip idea, quotes, possible cuts, audio hints, full marker pass, or general advice), shows results in **cards**, and saves each AI response as JSON under `logs\` (`companion_*.json`).
 - When you see **Add markers to Resolve** (or **Add START / END markers** for a clip idea), click it only after Resolve is ready — the tool still **only calls AddMarker**; it never cuts, ripple-deletes, or changes the media pool.
 
+## RT365 AI Clip Studio
+
+Local Streamlit app for podcast/video clip discovery, GPU Whisper transcription, and vertical export. Entry point: `clip_studio_app.py`.
+
+## Launching the App
+
+### Recommended (Production GPU Transcription)
+
+Use `.venv311` — Python 3.11.9, fully configured with all GPU dependencies:
+
+```bat
+cd C:\dev\rt365-ai-editor
+.venv311\Scripts\python.exe -m streamlit run clip_studio_app.py
+```
+
+### Alternate Launch
+
+`.venv` is accepted but may be Python 3.14.x and may be missing optional dependencies (psutil, opencv). Use it for development or if `.venv311` is unavailable:
+
+```bat
+cd C:\dev\rt365-ai-editor
+.venv\Scripts\python.exe -m streamlit run clip_studio_app.py
+```
+
+### Verifying GPU Transcription
+
+Do **NOT** rely solely on the process path shown in `nvidia-smi` to verify GPU usage.
+
+On Windows (WDDM), `nvidia-smi` may display the base Python interpreter path (e.g. `C:\...\Python311\python.exe`) even when the app's venv process is the one using the GPU. This is expected OS behavior and is not evidence of incorrect execution.
+
+**Ground truth indicators (trust these instead):**
+
+- App sidebar: **Environment & GPU Diagnostics** panel shows `sys.executable` pointing to your project venv and CUDA device name.
+- Transcription logs: `actual_device=cuda`, `fallback_occurred=False`
+- VRAM delta: ~4–6 GB increase during transcription with `large-v3 float16`
+
 ## Transcript formats
 
 ### SRT

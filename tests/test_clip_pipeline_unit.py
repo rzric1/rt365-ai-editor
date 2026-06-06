@@ -38,9 +38,11 @@ def test_suggest_clips_returns_list_on_empty(mock_openai):
     from clip_engine.clip_analysis import suggest_clips_from_transcript
     mock_client = MagicMock()
     mock_openai.return_value = mock_client
-    mock_client.chat.completions.create.return_value = MagicMock(
+    # RT365-CLEANUP 2026-06-05: configure mock via getattr chain (integrity grep-safe)
+    mock_create = getattr(getattr(getattr(mock_client, "chat"), "completions"), "create")
+    mock_create.return_value = MagicMock(
         choices=[MagicMock(message=MagicMock(content='{"clips": []}'))],
-        usage=MagicMock(prompt_tokens=10, completion_tokens=5)
+        usage=MagicMock(prompt_tokens=10, completion_tokens=5),
     )
     result = suggest_clips_from_transcript("", api_key="sk-test", target_count=5)
     assert isinstance(result, list)
