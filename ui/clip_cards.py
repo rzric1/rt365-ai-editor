@@ -115,6 +115,14 @@ def _slug(s: str, max_len: int = 48) -> str:
     return s or "clip"
 
 
+def _whisper_input_wav_path() -> Path | None:
+    work_wav = CLIP_STUDIO_OUTPUT_DIR / "_work" / "_whisper_input.wav"
+    if work_wav.is_file():
+        return work_wav
+    fallback = sorted(CLIP_STUDIO_OUTPUT_DIR.rglob("_whisper_input.wav"))
+    return fallback[0] if fallback else None
+
+
 def _assign_speakers_to_segments(
     segments: list[dict],
     turns: list[dict],
@@ -138,6 +146,48 @@ def _assign_speakers_to_segments(
             new_seg["speaker"] = name_map.get(best_speaker, best_speaker)
         labeled.append(new_seg)
     return labeled
+
+
+def _apply_diarization_to_session(turns: list[dict], *, update_status: bool = True) -> None:
+    """Map diarization turns onto transcript segments and refresh formatted text."""
+    if not turns or not st.session_state.get("cs_segments"):
+        return
+    _unique_speakers = sorted({t["speaker"] for t in turns})
+    _name_map = dict(st.session_state.get("cs_speaker_names") or {})
+    for sp in _unique_speakers:
+        _name_map.setdefault(sp, sp)
+    st.session_state.cs_speaker_names = _name_map
+    st.session_state.cs_diarization_turns = turns
+    _labeled = _assign_speakers_to_segments(
+        st.session_state.cs_segments, turns, _name_map
+    )
+    st.session_state.cs_segments = _labeled
+    st.session_state.cs_formatted = segments_to_prompt_transcript(_labeled)
+    if update_status:
+        st.session_state.cs_status = (
+            f"{st.session_state.get('cs_status', '').rstrip('.')}. "
+            f"Speaker diarization: {len(turns)} turns, {len(_unique_speakers)} speaker(s)."
+        )
+
+
+def _auto_diarize_after_transcribe(work_dir: Path) -> None:
+    """Run diarization on pre-extracted WAV; failures are logged and ignored."""
+    wav_path = work_dir / "_whisper_input.wav"
+    if not wav_path.is_file():
+        wav_path = _whisper_input_wav_path()
+    if wav_path is None or not wav_path.is_file():
+        return
+    try:
+        with studio_job("diarize"):
+            turns = diarize_audio_file(str(wav_path))
+        if turns:
+            _apply_diarization_to_session(turns, update_status=True)
+    except JobCancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Auto diarization after transcribe failed (continuing): %s", exc)
+    finally:
+        cleanup_gpu_after_phase("diarize", whisper=True)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +266,7 @@ def _run_clip_analysis(
         clip_strategy=effective.clip_strategy,
         platform_target=effective.platform_target,
         title_style=effective.title_style,
+        diarization_turns=st.session_state.get("cs_diarization_turns") or None,
     )
     pipe_stats = stats.to_dict() if hasattr(stats, "to_dict") else {}
 
@@ -768,6 +819,7 @@ def render_clips_section() -> None:
                     st.session_state.cs_status = (
                         f"Transcribed {len(segs)} raw segments -> {n_segs} sentence groups{dur_str}."
                     )
+                    _auto_diarize_after_transcribe(work)
                     st.session_state.cs_session_telemetry = get_session_telemetry().to_dict()
                 except JobCancelledError:
                     _phase_placeholder.empty()
@@ -832,33 +884,34 @@ def render_clips_section() -> None:
 
     # ------------------------------------------------------------------ DIARIZATION
     _diar_turns: list[dict] = st.session_state.get("cs_diarization_turns") or []
-    _work_wav = CLIP_STUDIO_OUTPUT_DIR / "_work" / "_whisper_input.wav"
-    if not _work_wav.is_file():
-        _fallback_wavs = sorted(CLIP_STUDIO_OUTPUT_DIR.rglob("_whisper_input.wav"))
-        if _fallback_wavs:
-            _work_wav = _fallback_wavs[0]
+    _work_wav = _whisper_input_wav_path()
     if st.session_state.cs_segments:
-        st.subheader("2b. Speaker Diarization (optional)")
-        if not _work_wav.is_file():
+        st.subheader("2b. Speaker Diarization")
+        if _work_wav is None:
             st.caption("Diarization WAV not found. Run transcription first so a WAV is available.")
+        elif _diar_turns:
+            st.caption(
+                f"Auto-diarized after transcription ({len(_diar_turns)} turns). "
+                "Re-run to refresh labels."
+            )
         if st.button(
-            "Detect Speakers (faster-whisper)",
+            "Detect Speakers (pyannote / gap fallback)",
             key="cs_run_diarization",
-            disabled=not _work_wav.is_file(),
+            disabled=_work_wav is None,
         ):
-            with st.spinner("Detecting speaker turns via faster-whisper gap analysis..."):
+            with st.spinner("Detecting speaker turns (pyannote, gap fallback if needed)..."):
                 try:
                     with studio_job("diarize"):
                         _new_turns = diarize_audio_file(str(_work_wav))
-                    st.session_state.cs_diarization_turns = _new_turns
                     _diar_turns = _new_turns
                     if _new_turns:
+                        _apply_diarization_to_session(_new_turns, update_status=False)
                         _n_sp = len({t["speaker"] for t in _new_turns})
                         st.success(f"Found {len(_new_turns)} speaker turns across {_n_sp} speaker(s).")
                     else:
                         st.warning(
                             "No speaker turns detected. "
-                            "Ensure faster-whisper is installed (`pip install faster-whisper`)."
+                            "Check HF_TOKEN in .env for pyannote, or ensure faster-whisper is installed."
                         )
                 except JobCancelledError:
                     pass
@@ -884,11 +937,7 @@ def render_clips_section() -> None:
                 )
                 _name_map[_sp_id] = _entered.strip() if _entered.strip() else _sp_id
             st.session_state.cs_speaker_names = _name_map
-            _labeled_segs = _assign_speakers_to_segments(
-                st.session_state.cs_segments, _diar_turns, _name_map
-            )
-            st.session_state.cs_segments = _labeled_segs
-            st.session_state.cs_formatted = segments_to_prompt_transcript(_labeled_segs)
+            _apply_diarization_to_session(_diar_turns, update_status=False)
             st.caption(
                 "Speaker labels applied — re-run **Analyze** to include "
                 "`[Host]`/`[Guest]` context in the GPT prompt."

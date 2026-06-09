@@ -372,6 +372,7 @@ def run_full_clip_pipeline(
     clip_strategy: str = "Balanced",
     platform_target: str = "TikTok/Reels/Shorts",
     title_style: str = "Curiosity",
+    diarization_turns: list[dict] | None = None,
 ) -> tuple[list[dict], PipelineStats, TokenTracker]:
     """
     Full clip pipeline:
@@ -619,6 +620,7 @@ def run_full_clip_pipeline(
                 ai_profile=ai_prof,
                 discovery_mode=discovery_mode,
                 forensics=forensics,
+                diarization_turns=diarization_turns,
                 )
             log_gpu_memory("after_embeddings")
             stats.gpu_local_candidates = int(gpu_stats.get("local_prefilter_count", 0))

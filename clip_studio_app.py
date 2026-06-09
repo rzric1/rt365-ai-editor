@@ -202,5 +202,59 @@ def main() -> None:
         logger.debug("[lifecycle] Streamlit render cycle complete")
 
 
+from clip_engine.license_check import LICENSE_ENFORCEMENT_ENABLED, load_cache, validate_license_key
+
+
+def _show_license_gate() -> None:
+    """Full-screen activation UI shown on first launch (or after cache expiry)."""
+    st.set_page_config(
+        page_title="RT365 AI Clip Studio — Activate",
+        page_icon="🔑",
+        layout="centered",
+    )
+    st.title("RT365 AI Clip Studio")
+    st.subheader("License Activation Required")
+    st.markdown(
+        "Enter the license key from your purchase confirmation email to activate this copy."
+    )
+
+    key_input = st.text_input(
+        "License Key",
+        placeholder="RT365-XXXX-XXXX-XXXX-XXXX",
+        max_chars=25,
+        label_visibility="collapsed",
+    )
+
+    col_btn, col_help = st.columns([2, 3])
+    with col_btn:
+        activate_clicked = st.button("Activate", type="primary", use_container_width=True)
+
+    if activate_clicked:
+        raw = key_input.strip().upper()
+        if not raw:
+            st.error("Please enter your license key.")
+        else:
+            with st.spinner("Validating…"):
+                valid, message = validate_license_key(raw)
+            if valid:
+                st.session_state["license_valid"] = True
+                st.success("Activated successfully! Loading app…")
+                st.rerun()
+            else:
+                st.error(message)
+                purchase_url = os.environ.get("APP_DOWNLOAD_URL", "")
+                support = os.environ.get("SUPPORT_EMAIL", "support@rt365.ai")
+                parts = []
+                if purchase_url:
+                    parts.append(f"[Purchase a license]({purchase_url})")
+                parts.append(f"contact [{support}](mailto:{support}) for help")
+                st.markdown("  ·  ".join(parts))
+
+
 if __name__ == "__main__":
+    if LICENSE_ENFORCEMENT_ENABLED:
+        # Skip gate if the session is already validated or a valid cache exists
+        if not st.session_state.get("license_valid") and not load_cache():
+            _show_license_gate()
+            st.stop()
     main()

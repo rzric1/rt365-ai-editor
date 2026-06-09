@@ -1,0 +1,13 @@
+﻿.venv
+.venv311
+venv
+__pycache__
+*.mp4
+*.zip
+uploads/
+outputs/
+logs/
+*.bak
+.pytest_cache
+rt365-review.zip
+compressed.mp4

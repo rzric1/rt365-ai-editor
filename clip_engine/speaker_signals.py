@@ -2,7 +2,7 @@
 """
 clip_engine/speaker_signals.py
 Speaker energy, interruption, and debate detection.
-Transcript-based fallback; pyannote.audio diarization reserved for future use.
+Transcript-based scoring with pyannote speaker labels when present.
 """
 
 from __future__ import annotations
@@ -66,6 +66,54 @@ def _detect_speaker_alternation(segments: list[dict]) -> tuple[int, int]:
     return alternations, len(set(speakers))
 
 
+def _detect_monologue(segments: list[dict]) -> tuple[int, float]:
+    """
+    Score uninterrupted single-speaker stretches (expert/doctor monologue).
+    Returns (monologue_score 0-100, dominant_share 0-1).
+    """
+    speakers: list[str] = []
+    durations: list[float] = []
+    for seg in segments:
+        sp = _extract_speaker(seg)
+        if not sp:
+            continue
+        dur = max(0.0, float(seg.get("end", 0)) - float(seg.get("start", 0)))
+        if dur <= 0:
+            continue
+        speakers.append(sp)
+        durations.append(dur)
+
+    if not speakers:
+        return 0, 0.0
+
+    total = sum(durations)
+    if total <= 0:
+        return 0, 0.0
+
+    by_speaker: dict[str, float] = {}
+    for sp, dur in zip(speakers, durations):
+        by_speaker[sp] = by_speaker.get(sp, 0.0) + dur
+    dominant_share = max(by_speaker.values()) / total
+
+    alternations, unique_speakers = _detect_speaker_alternation(
+        [s for s in segments if _extract_speaker(s)]
+    )
+    score = 20.0
+    if dominant_share >= 0.92:
+        score += 55
+    elif dominant_share >= 0.82:
+        score += 40
+    elif dominant_share >= 0.7:
+        score += 25
+    if unique_speakers == 1:
+        score += 15
+    if alternations <= 1:
+        score += 10
+    elif alternations >= 4:
+        score -= 15
+    return int(min(100.0, max(0.0, score))), dominant_share
+
+
 def _detect_short_exchanges(segments: list[dict]) -> int:
     """Count rapid short back-and-forth segments (proxy for interruption)."""
     if len(segments) < 3:
@@ -100,6 +148,7 @@ def analyze_speaker_signals(
         }
 
     alternations, unique_speakers = _detect_speaker_alternation(window)
+    monologue_score, dominant_share = _detect_monologue(window)
     short_exchanges = _detect_short_exchanges(window)
     interruption_markers = len(INTERRUPTION_MARKERS.findall(text))
     debate_hits = sum(1 for kw in DEBATE_KEYWORDS if kw in text)
@@ -136,18 +185,26 @@ def analyze_speaker_signals(
         reasons.append("rapid exchanges")
     if debate_hits:
         reasons.append("debate keywords")
+    if monologue_score >= 70:
+        reasons.append("expert monologue")
     reason = "; ".join(reasons) if reasons else "Single-speaker / low tension"
 
     return {
         "speaker_energy": int(round(speaker_energy)),
         "interruption_score": int(round(interruption_score)),
         "debate_score": int(round(debate_score)),
+        "monologue_score": monologue_score,
+        "dominant_speaker_share": round(dominant_share, 3),
+        "speaker_alternation_score": min(100, alternations * 12),
         "reason": reason,
     }
 
 
 def compute_speaker_boost(speaker_signals: dict[str, Any]) -> float:
-    """Return 0-8 point additive boost from speaker/debate signals."""
+    """Return 0-10 point additive boost from speaker/debate/monologue signals."""
+    mono = float(speaker_signals.get("monologue_score", 0) or 0)
+    if mono >= 75:
+        return 10.0
     avg = (
         speaker_signals.get("speaker_energy", 0)
         + speaker_signals.get("interruption_score", 0)
@@ -157,6 +214,8 @@ def compute_speaker_boost(speaker_signals: dict[str, Any]) -> float:
         return 8.0
     if avg >= 55:
         return 5.0
+    if mono >= 60:
+        return 4.0
     if avg >= 40:
         return 2.0
     return 0.0

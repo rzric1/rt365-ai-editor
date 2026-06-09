@@ -49,6 +49,8 @@ from clip_engine.semantic_ranking import (
 
 from clip_engine.speaker_analysis import (
 
+    boost_candidates_from_diarization,
+
     boost_candidates_from_transcript_speakers,
 
     speaker_pipeline_status,
@@ -196,6 +198,7 @@ def run_gpu_prefilter_pipeline(
 
     discovery_mode: bool = False,
     forensics: DiscoveryForensics | None = None,
+    diarization_turns: list[dict] | None = None,
 
 ) -> tuple[list[dict], dict[str, Any]]:
 
@@ -286,6 +289,8 @@ def run_gpu_prefilter_pipeline(
         logger.info("[GPU PREFILTER] raw_candidates=%d", raw_count)
 
         local = boost_candidates_from_transcript_speakers(local, segments)
+        if diarization_turns:
+            local = boost_candidates_from_diarization(local, diarization_turns)
         sem_status = semantic_pipeline_status()
         stats["embeddings_on_gpu"] = sem_status.get("device") == "cuda"
 

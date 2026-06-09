@@ -42,6 +42,8 @@ ENV_OPENAI_MODEL_JSON_FALLBACK: str = "OPENAI_MODEL_JSON_FALLBACK"
 
 # Optional absolute path to ffmpeg (or ffmpeg.exe on Windows). Loaded via .env / process env.
 ENV_FFMPEG_BINARY: str = "FFMPEG_BINARY"
+ENV_HF_TOKEN: str = "HF_TOKEN"
+ENV_HUGGINGFACE_TOKEN: str = "HUGGINGFACE_TOKEN"
 DEFAULT_OPENAI_MODEL: str = "gpt-4o"
 DEFAULT_OPENAI_MODEL_JSON_FALLBACK: str = "gpt-4o-mini"
 

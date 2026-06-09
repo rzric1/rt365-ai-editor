@@ -1,5 +1,5 @@
 {
-  "name": "tactical-claims-ai",
+  "name": "rt365-ai-editor",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -11,10 +11,10 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
-    "pdf-parse": "^1.1.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-router-dom": "^7.6.0"
+    "resend": "^6.12.4",
+    "stripe": "^22.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.4.1",

@@ -1,7 +1,13 @@
 {
   "functions": {
-    "api/claims-intelligence.js": {
+    "api/editor-intelligence.js": {
       "maxDuration": 60
+    },
+    "api/stripe-webhook.js": {
+      "maxDuration": 30
+    },
+    "api/validate-license.js": {
+      "maxDuration": 15
     }
   }
 }
