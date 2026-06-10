@@ -1,15 +1,17 @@
 :root {
-  --color-bg: #f4f6f8;
-  --color-surface: #ffffff;
-  --color-border: #d8dee6;
-  --color-text: #1a2332;
-  --color-text-muted: #5a6573;
-  --color-primary: #1e4d7a;
-  --color-primary-hover: #163a5c;
-  --color-accent: #c45c26;
-  --color-accent-soft: #fdf4ef;
+  --color-bg: #0a0a0f;
+  --color-surface: #12121a;
+  --color-surface-elevated: #1a1a24;
+  --color-border: rgba(201, 168, 76, 0.22);
+  --color-text: #ffffff;
+  --color-text-muted: rgba(255, 255, 255, 0.62);
+  --color-gold: #c9a84c;
+  --color-gold-soft: rgba(201, 168, 76, 0.14);
+  --color-gold-hover: #dfc06a;
+  --color-primary: #c9a84c;
+  --color-primary-hover: #dfc06a;
   --radius: 10px;
-  --shadow: 0 1px 3px rgba(26, 35, 50, 0.08);
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.45);
   --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
   --space-1: 0.35rem;
   --space-2: 0.65rem;
@@ -40,28 +42,29 @@ body {
 }
 
 a {
-  color: var(--color-primary);
+  color: var(--color-gold);
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
 }
 
 a:hover {
-  color: var(--color-primary-hover);
+  color: var(--color-gold-hover);
 }
 
 .landing {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  background: var(--color-bg);
 }
 
 .landing-header {
   position: sticky;
   top: 0;
   z-index: 10;
-  background: rgba(255, 255, 255, 0.95);
+  background: rgba(10, 10, 15, 0.92);
   border-bottom: 1px solid var(--color-border);
-  backdrop-filter: blur(8px);
+  backdrop-filter: blur(12px);
 }
 
 .landing-header__inner {
@@ -70,12 +73,22 @@ a:hover {
   padding: var(--space-3);
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
 .landing-logo {
   font-weight: 700;
-  color: var(--color-primary);
+  color: var(--color-text);
+  letter-spacing: 0.02em;
+}
+
+.landing-logo__edition {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-gold);
   margin-right: auto;
 }
 
@@ -88,54 +101,102 @@ a:hover {
   font-weight: 600;
   font-size: 0.9rem;
   text-decoration: none;
+  color: var(--color-text-muted);
+}
+
+.landing-nav a:hover {
+  color: var(--color-gold);
 }
 
 .landing-header__cta {
   font-size: 0.85rem;
+  margin-left: auto;
 }
 
 @media (min-width: 720px) {
   .landing-nav {
     display: flex;
+    margin-left: auto;
+    margin-right: var(--space-3);
   }
 
   .landing-header__cta {
     display: none;
   }
+
+  .landing-logo__edition {
+    margin-right: 0;
+  }
 }
 
 .hero {
-  background: linear-gradient(160deg, #1e4d7a 0%, #163a5c 55%, #0f2840 100%);
-  color: #fff;
-  padding: var(--space-6) var(--space-3);
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(201, 168, 76, 0.18), transparent 60%),
+    linear-gradient(180deg, #0f0f16 0%, #0a0a0f 100%);
+  color: var(--color-text);
+  padding: calc(var(--space-6) + 1rem) var(--space-3) var(--space-6);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.hero__rays {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+.hero__rays svg {
+  width: min(900px, 120%);
+  height: auto;
+  margin-top: -2rem;
 }
 
 .hero__content {
+  position: relative;
+  z-index: 1;
   max-width: var(--max-width);
   margin: 0 auto;
 }
 
 .hero__eyebrow {
   margin: 0 0 var(--space-2);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #b8d0e8;
+  letter-spacing: 0.14em;
+  color: var(--color-gold);
 }
 
 .hero h1 {
-  margin: 0 0 var(--space-3);
-  font-size: clamp(1.85rem, 4vw, 2.75rem);
-  line-height: 1.15;
+  margin: 0 0 var(--space-2);
+  font-size: clamp(1.85rem, 4vw, 2.85rem);
+  line-height: 1.12;
   letter-spacing: -0.02em;
-  max-width: 18ch;
+  max-width: 22ch;
+  background: linear-gradient(135deg, #ffffff 0%, #c9a84c 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hero__tagline {
+  margin: 0 0 var(--space-3);
+  font-size: clamp(1.05rem, 2.5vw, 1.35rem);
+  font-weight: 600;
+  font-style: italic;
+  color: var(--color-gold);
+  letter-spacing: 0.02em;
 }
 
 .hero__lede {
   margin: 0 0 var(--space-4);
   max-width: 52ch;
-  color: #d8e6f2;
+  color: var(--color-text-muted);
   font-size: 1.05rem;
 }
 
@@ -144,7 +205,7 @@ a:hover {
 }
 
 .section--alt {
-  background: #eef2f6;
+  background: var(--color-surface);
 }
 
 .section__inner {
@@ -160,6 +221,7 @@ a:hover {
   margin: 0 0 var(--space-4);
   font-size: clamp(1.4rem, 3vw, 2rem);
   letter-spacing: -0.02em;
+  color: var(--color-text);
 }
 
 .section__lede {
@@ -172,8 +234,8 @@ a:hover {
   font-size: 0.75rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--color-primary);
+  letter-spacing: 0.1em;
+  color: var(--color-gold);
   margin: 0 0 var(--space-2);
 }
 
@@ -189,55 +251,58 @@ a:hover {
   border-radius: 8px;
   border: 1px solid transparent;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
   text-decoration: none;
 }
 
 .btn-lg {
-  padding: 0.75rem 1.25rem;
+  padding: 0.75rem 1.35rem;
   font-size: 1rem;
 }
 
 .btn-primary {
-  background: var(--color-primary);
-  color: #fff;
+  background: linear-gradient(135deg, #c9a84c 0%, #a8883a 100%);
+  color: #0a0a0f;
+  box-shadow: 0 2px 16px rgba(201, 168, 76, 0.25);
 }
 
 .btn-primary:hover {
-  background: var(--color-primary-hover);
-  color: #fff;
+  background: linear-gradient(135deg, #dfc06a 0%, #c9a84c 100%);
+  color: #0a0a0f;
+  box-shadow: 0 4px 24px rgba(201, 168, 76, 0.35);
 }
 
 .hero .btn-primary {
-  background: #fff;
-  color: var(--color-primary);
+  background: linear-gradient(135deg, #c9a84c 0%, #a8883a 100%);
+  color: #0a0a0f;
 }
 
 .hero .btn-primary:hover {
-  background: #eef2f6;
-  color: var(--color-primary-hover);
+  background: linear-gradient(135deg, #dfc06a 0%, #c9a84c 100%);
+  color: #0a0a0f;
 }
 
 .btn-secondary {
-  background: var(--color-surface);
+  background: transparent;
   color: var(--color-text);
-  border-color: var(--color-border);
+  border-color: rgba(255, 255, 255, 0.28);
 }
 
 .btn-secondary:hover {
-  border-color: var(--color-primary);
-  color: var(--color-primary);
+  border-color: var(--color-gold);
+  color: var(--color-gold);
 }
 
 .hero .btn-secondary {
-  background: transparent;
+  background: rgba(255, 255, 255, 0.04);
   color: #fff;
-  border-color: rgba(255, 255, 255, 0.45);
+  border-color: rgba(201, 168, 76, 0.45);
 }
 
 .hero .btn-secondary:hover {
-  border-color: #fff;
-  color: #fff;
+  border-color: var(--color-gold);
+  color: var(--color-gold);
+  background: rgba(201, 168, 76, 0.08);
 }
 
 .btn-group {
@@ -264,17 +329,23 @@ a:hover {
 }
 
 .feature-card {
-  background: var(--color-surface);
+  background: var(--color-surface-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: var(--space-4);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.feature-card:hover {
+  border-color: rgba(201, 168, 76, 0.45);
+  box-shadow: 0 8px 32px rgba(201, 168, 76, 0.08);
 }
 
 .feature-card h3 {
   margin: 0 0 var(--space-2);
   font-size: 1.05rem;
-  color: var(--color-primary);
+  color: var(--color-gold);
 }
 
 .feature-card p {
@@ -295,7 +366,7 @@ a:hover {
 }
 
 .pricing-card {
-  background: var(--color-surface);
+  background: var(--color-surface-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   padding: var(--space-4);
@@ -305,19 +376,20 @@ a:hover {
 }
 
 .pricing-card--featured {
-  border-color: var(--color-primary);
-  box-shadow: 0 4px 20px rgba(30, 77, 122, 0.12);
+  border-color: var(--color-gold);
+  box-shadow: 0 8px 40px rgba(201, 168, 76, 0.15);
 }
 
 .pricing-card h3 {
   margin: 0;
+  color: var(--color-text);
 }
 
 .pricing-card__price {
   margin: 0;
   font-size: 2rem;
   font-weight: 700;
-  color: var(--color-primary);
+  color: var(--color-gold);
 }
 
 .pricing-card__detail {
@@ -327,7 +399,7 @@ a:hover {
 }
 
 .card {
-  background: var(--color-surface);
+  background: var(--color-surface-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -338,21 +410,29 @@ a:hover {
   display: block;
   font-weight: 600;
   margin-bottom: var(--space-2);
+  color: var(--color-text);
 }
 
 .text-input {
   width: 100%;
   padding: 0.75rem var(--space-3);
   font: inherit;
+  color: var(--color-text);
+  background: var(--color-bg);
   border: 1px solid var(--color-border);
   border-radius: 8px;
   margin-bottom: var(--space-3);
   letter-spacing: 0.04em;
 }
 
+.text-input::placeholder {
+  color: rgba(255, 255, 255, 0.28);
+}
+
 .text-input:focus {
-  outline: 2px solid var(--color-primary);
+  outline: 2px solid var(--color-gold);
   outline-offset: 1px;
+  border-color: var(--color-gold);
 }
 
 .license-status {
@@ -363,29 +443,32 @@ a:hover {
 }
 
 .license-status--ok {
-  background: #e8f2ec;
-  color: #1e5c3a;
+  background: rgba(201, 168, 76, 0.12);
+  color: var(--color-gold-hover);
+  border: 1px solid rgba(201, 168, 76, 0.3);
 }
 
 .license-status--error {
-  background: #fdeaea;
-  color: #8b1a1a;
+  background: rgba(180, 60, 60, 0.12);
+  color: #f0a0a0;
+  border: 1px solid rgba(180, 60, 60, 0.3);
 }
 
 .landing-footer {
   margin-top: auto;
-  background: #1a2332;
-  color: #d8dee6;
+  background: #060609;
+  color: var(--color-text-muted);
   padding: var(--space-5) var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
 }
 
 .landing-footer a {
-  color: #b8d0e8;
+  color: var(--color-gold);
   text-decoration: none;
 }
 
 .landing-footer a:hover {
-  color: #fff;
+  color: var(--color-gold-hover);
 }
 
 .landing-footer__inner {
@@ -394,6 +477,12 @@ a:hover {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
+}
+
+.landing-footer__inner strong {
+  color: var(--color-text);
+  display: block;
+  margin-bottom: var(--space-1);
 }
 
 @media (min-width: 640px) {
@@ -406,7 +495,7 @@ a:hover {
 
 .landing-footer__inner p {
   margin: var(--space-1) 0 0;
-  color: #9aa5b3;
+  color: var(--color-text-muted);
   font-size: 0.9rem;
 }
 
@@ -421,5 +510,5 @@ a:hover {
   max-width: var(--max-width);
   margin: 0 auto;
   font-size: 0.8rem;
-  color: #7a8796;
+  color: rgba(255, 255, 255, 0.35);
 }

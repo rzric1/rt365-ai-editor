@@ -11,7 +11,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 
-const KEY_PATTERN = /^RT365-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
+const KEY_PATTERN = /^SERAPH-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
 
 async function readJsonBody(req) {
   const buffers = [];
@@ -66,7 +66,7 @@ export default async function handler(req, res) {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey);
-  const supportEmail = process.env.SUPPORT_EMAIL || 'support@rt365.ai';
+  const supportEmail = process.env.SUPPORT_EMAIL || 'support@aiclipstudio.com';
 
   try {
     const { data: row, error: queryError } = await supabase

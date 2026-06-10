@@ -8,7 +8,7 @@
  *   SUPABASE_URL             — Supabase project URL
  *   SUPABASE_SERVICE_ROLE_KEY — Supabase service role key (bypasses RLS)
  *   RESEND_API_KEY           — Resend API key
- *   RESEND_FROM_EMAIL        — Verified sender address, e.g. "RT365 <licenses@yourdomain.com>"
+ *   RESEND_FROM_EMAIL        — Verified sender address, e.g. "AI Clip Studio <licenses@yourdomain.com>"
  *   SUPPORT_EMAIL            — Support address shown in the email body
  *   APP_DOWNLOAD_URL         — (optional) Download link included in the email
  */
@@ -38,7 +38,7 @@ function generateLicenseKey() {
     }
     groups.push(g);
   }
-  return `RT365-${groups.join('-')}`;
+  return `SERAPH-${groups.join('-')}`;
 }
 
 function readRawBody(req) {
@@ -52,39 +52,39 @@ function readRawBody(req) {
 
 function buildEmailHtml(licenseKey, supportEmail, downloadUrl) {
   const downloadSection = downloadUrl
-    ? `<li><a href="${downloadUrl}" style="color:#1e4d7a;">Download RT365 AI Editor</a></li>`
+    ? `<li><a href="${downloadUrl}" style="color:#c9a84c;">Download AI Clip Studio — Seraph Edition</a></li>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>Your License Key</title></head>
-<body style="margin:0;padding:0;background:#f4f6f8;font-family:'Segoe UI',system-ui,sans-serif;">
-  <div style="max-width:600px;margin:40px auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #d8dee6;">
-    <div style="background:#1e4d7a;padding:28px 32px;">
-      <h1 style="margin:0;color:#fff;font-size:1.4rem;font-weight:700;">RT365 AI Editor</h1>
-      <p style="margin:4px 0 0;color:#b8d0e8;font-size:0.95rem;">License confirmation</p>
+<head><meta charset="UTF-8"><title>Your Seraph Edition License Key</title></head>
+<body style="margin:0;padding:0;background:#0a0a0f;font-family:'Segoe UI',system-ui,sans-serif;">
+  <div style="max-width:600px;margin:40px auto;background:#12121a;border-radius:10px;overflow:hidden;border:1px solid rgba(201,168,76,0.25);">
+    <div style="background:linear-gradient(135deg,#1a1a24 0%,#0a0a0f 100%);padding:28px 32px;border-bottom:1px solid rgba(201,168,76,0.25);">
+      <h1 style="margin:0;color:#ffffff;font-size:1.4rem;font-weight:700;">AI Clip Studio — Seraph Edition</h1>
+      <p style="margin:4px 0 0;color:#c9a84c;font-size:0.95rem;font-style:italic;">Unleash Divine Precision in Every Cut</p>
     </div>
     <div style="padding:32px;">
-      <p style="margin:0 0 20px;color:#1a2332;">Thank you for your purchase! Your license key is ready to activate.</p>
+      <p style="margin:0 0 20px;color:rgba(255,255,255,0.85);">Thank you for your purchase! Your Seraph Edition license key is ready to activate.</p>
 
-      <div style="background:#f0f4f8;border:2px solid #1e4d7a;border-radius:8px;padding:24px;text-align:center;margin:0 0 28px;">
-        <p style="margin:0 0 8px;font-size:0.8rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#5a6573;">Your License Key</p>
-        <code style="font-size:1.6rem;font-weight:700;letter-spacing:0.12em;color:#1e4d7a;word-break:break-all;">${licenseKey}</code>
+      <div style="background:#0a0a0f;border:2px solid #c9a84c;border-radius:8px;padding:24px;text-align:center;margin:0 0 28px;">
+        <p style="margin:0 0 8px;font-size:0.8rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.55);">Your License Key</p>
+        <code style="font-size:1.6rem;font-weight:700;letter-spacing:0.12em;color:#c9a84c;word-break:break-all;">${licenseKey}</code>
       </div>
 
-      <h2 style="font-size:1rem;font-weight:700;color:#1a2332;margin:0 0 12px;">How to activate</h2>
-      <ol style="margin:0 0 24px;padding-left:1.2rem;color:#1a2332;line-height:1.7;">
+      <h2 style="font-size:1rem;font-weight:700;color:#ffffff;margin:0 0 12px;">How to activate</h2>
+      <ol style="margin:0 0 24px;padding-left:1.2rem;color:rgba(255,255,255,0.85);line-height:1.7;">
         ${downloadSection}
-        <li>Launch RT365 AI Editor</li>
+        <li>Launch AI Clip Studio — Seraph Edition</li>
         <li>Enter the key above when the activation screen appears</li>
         <li>Click <strong>Activate</strong> — your app is ready</li>
       </ol>
 
-      <p style="margin:0;font-size:0.9rem;color:#5a6573;">
-        Questions? Email <a href="mailto:${supportEmail}" style="color:#1e4d7a;">${supportEmail}</a> and we will get back to you promptly.
+      <p style="margin:0;font-size:0.9rem;color:rgba(255,255,255,0.55);">
+        Questions? Email <a href="mailto:${supportEmail}" style="color:#c9a84c;">${supportEmail}</a> and we will get back to you promptly.
       </p>
     </div>
-    <div style="background:#f4f6f8;padding:16px 32px;border-top:1px solid #d8dee6;">
-      <p style="margin:0;font-size:0.75rem;color:#5a6573;">This key is for a single computer. If you need to transfer it to a new machine, contact support.</p>
+    <div style="background:#060609;padding:16px 32px;border-top:1px solid rgba(201,168,76,0.15);">
+      <p style="margin:0;font-size:0.75rem;color:rgba(255,255,255,0.45);">This key is for a single computer. If you need to transfer it to a new machine, contact support.</p>
     </div>
   </div>
 </body>
@@ -199,8 +199,8 @@ export default async function handler(req, res) {
 
   // Send email async (do not await — Stripe already got its 200)
   const resendKey = process.env.RESEND_API_KEY;
-  const fromEmail = process.env.RESEND_FROM_EMAIL || 'RT365 <licenses@rt365.ai>';
-  const supportEmail = process.env.SUPPORT_EMAIL || 'support@rt365.ai';
+  const fromEmail = process.env.RESEND_FROM_EMAIL || 'AI Clip Studio <licenses@aiclipstudio.com>';
+  const supportEmail = process.env.SUPPORT_EMAIL || 'support@aiclipstudio.com';
   const downloadUrl = process.env.APP_DOWNLOAD_URL || '';
 
   if (!resendKey) {
@@ -213,7 +213,7 @@ export default async function handler(req, res) {
     .send({
       from: fromEmail,
       to: customerEmail,
-      subject: 'Your RT365 AI Editor License Key',
+      subject: 'Your AI Clip Studio — Seraph Edition License Key',
       html: buildEmailHtml(licenseKey, supportEmail, downloadUrl),
     })
     .then(() => {

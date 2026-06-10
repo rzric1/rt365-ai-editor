@@ -1,4 +1,6 @@
-# RT365 AI Editor (DaVinci Resolve Studio)
+# AI Clip Studio — Seraph Edition (DaVinci Resolve Studio)
+
+**AI Clip Studio — Seraph Edition** — *Unleash Divine Precision in Every Cut*
 
 Safe **v1** helper for **YouTube podcasts and reaction-style edits**: it reads a transcript, asks OpenAI (Responses API) for editorial marker suggestions, and **only adds timeline markers** in DaVinci Resolve Studio.
 
@@ -77,7 +79,7 @@ You get a numbered menu: test Resolve, debug transcript parsing, dry-run AI, app
 
 All non-interactive commands (`--test-marker`, `--dry-run`, transcript path only, etc.) still work the same as before.
 
-## RT365 AI Edit Companion (Streamlit)
+## AI Clip Studio — Edit Companion (Streamlit)
 
 The **Edit Companion** is a local, beginner-friendly web UI in your browser. It uses the same transcript loading, Resolve connection, marker placement, and OpenAI model settings as the CLI (`OPENAI_MODEL` from `.env`, default `gpt-5-mini`).
 
@@ -109,7 +111,7 @@ The **Edit Companion** is a local, beginner-friendly web UI in your browser. It 
 - The app **classifies** your intent (chapters, clip idea, quotes, possible cuts, audio hints, full marker pass, or general advice), shows results in **cards**, and saves each AI response as JSON under `logs\` (`companion_*.json`).
 - When you see **Add markers to Resolve** (or **Add START / END markers** for a clip idea), click it only after Resolve is ready — the tool still **only calls AddMarker**; it never cuts, ripple-deletes, or changes the media pool.
 
-## RT365 AI Clip Studio
+## AI Clip Studio — Seraph Edition (Desktop)
 
 Local Streamlit app for podcast/video clip discovery, GPU Whisper transcription, and vertical export. Entry point: `clip_studio_app.py`.
 
@@ -207,7 +209,7 @@ Transcript timestamps are treated as **seconds from the start of the recording**
 
 When you place the podcast (or reaction) **after** some leader space, bars, or other clips, markers must land on the **main clip**, not at the timeline origin.
 
-RT365 therefore:
+AI Clip Studio therefore:
 
 1. Reads **project timeline frame rate** (`timelineFrameRate`) for seconds → frame conversion.
 2. Scans **all video and all audio tracks** and finds the **earliest** `GetStart()` among every timeline item (smallest frame where any clip begins).

@@ -1,5 +1,6 @@
 {
-  "name": "rt365-ai-editor",
+  "name": "ai-clip-studio-seraph",
+  "description": "AI Clip Studio — Seraph Edition",
   "private": true,
   "version": "0.0.0",
   "type": "module",

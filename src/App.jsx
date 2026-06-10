@@ -1,28 +1,37 @@
 import { useState } from 'react';
 
+const PRODUCT_FULL = 'AI Clip Studio — Seraph Edition';
+const PRODUCT_SHORT = 'AI Clip Studio';
+const TAGLINE = 'Unleash Divine Precision in Every Cut';
+
 const CHECKOUT_ONETIME =
   import.meta.env.VITE_STRIPE_CHECKOUT_ONETIME || '#pricing';
 const CHECKOUT_SUBSCRIPTION =
   import.meta.env.VITE_STRIPE_CHECKOUT_SUBSCRIPTION || '#pricing';
-const SUPPORT_EMAIL = import.meta.env.VITE_SUPPORT_EMAIL || 'support@rt365.ai';
+const SUPPORT_EMAIL =
+  import.meta.env.VITE_SUPPORT_EMAIL || 'support@aiclipstudio.com';
 const DOWNLOAD_URL = import.meta.env.VITE_APP_DOWNLOAD_URL || '';
 
 const FEATURES = [
   {
     title: 'AI transcription',
-    description: 'GPU-accelerated Whisper transcription with speaker-aware timestamps.',
+    description:
+      'GPU-accelerated Whisper transcription with speaker-aware timestamps for divine clarity.',
   },
   {
     title: 'Auto-cut',
-    description: 'Find highlight moments and export ready-to-edit clips automatically.',
+    description:
+      'Find highlight moments and export ready-to-edit clips with precision-guided selection.',
   },
   {
     title: 'GPU-accelerated editing',
-    description: 'CUDA-backed pipelines for faster transcoding and analysis on NVIDIA GPUs.',
+    description:
+      'CUDA-backed pipelines for faster transcoding and analysis on NVIDIA GPUs.',
   },
   {
-    title: 'Clip Studio integration',
-    description: 'Streamlit dashboard for reviewing, refining, and exporting clips in one place.',
+    title: 'AI Clip Studio integration',
+    description:
+      'Streamlit dashboard for reviewing, refining, and exporting clips in one cinematic workspace.',
   },
   {
     title: 'DaVinci Resolve EDL export',
@@ -30,25 +39,26 @@ const FEATURES = [
   },
   {
     title: 'Streamlit dashboard',
-    description: 'Visual session controls, stability tools, and export management built in.',
+    description:
+      'Visual session controls, stability tools, and export management built in.',
   },
 ];
 
 const PRICING = [
   {
     id: 'onetime',
-    name: 'One-time purchase',
+    name: 'Seraph Edition — Lifetime',
     price: '$149',
-    detail: 'Lifetime license for one machine. Includes all current features and updates.',
+    detail: `One-time purchase. Lifetime ${PRODUCT_SHORT} license for one machine — all features and updates included.`,
     cta: 'Buy now',
     href: CHECKOUT_ONETIME,
     featured: true,
   },
   {
     id: 'subscription',
-    name: 'Subscription',
+    name: 'Seraph Edition — Subscription',
     price: '$19/mo',
-    detail: 'Monthly access with priority updates and ongoing AI feature releases.',
+    detail: `Monthly access to ${PRODUCT_SHORT} with priority updates and ongoing AI feature releases.`,
     cta: 'Subscribe',
     href: CHECKOUT_SUBSCRIPTION,
     featured: false,
@@ -86,14 +96,17 @@ export default function App() {
         setLicenseStatus({
           ok: true,
           message: data.email
-            ? `License key verified for ${data.email}. Download RT365 AI Editor and activate on your machine.`
-            : 'License key verified. Download RT365 AI Editor and activate on your machine.',
+            ? `License key verified for ${data.email}. Download ${PRODUCT_FULL} and activate on your machine.`
+            : `License key verified. Download ${PRODUCT_FULL} and activate on your machine.`,
         });
       } else {
         setLicenseStatus({ ok: false, message: data.error || 'Invalid license key.' });
       }
     } catch {
-      setLicenseStatus({ ok: false, message: 'Could not reach the license server. Try again later.' });
+      setLicenseStatus({
+        ok: false,
+        message: 'Could not reach the license server. Try again later.',
+      });
     } finally {
       setChecking(false);
     }
@@ -103,7 +116,8 @@ export default function App() {
     <div className="landing">
       <header className="landing-header">
         <div className="landing-header__inner">
-          <span className="landing-logo">RT365 AI Editor</span>
+          <span className="landing-logo">{PRODUCT_SHORT}</span>
+          <span className="landing-logo__edition">Seraph Edition</span>
           <nav className="landing-nav" aria-label="Page sections">
             <a href="#features">Features</a>
             <a href="#pricing">Pricing</a>
@@ -118,12 +132,27 @@ export default function App() {
 
       <main>
         <section className="hero">
+          <div className="hero__rays" aria-hidden="true">
+            <svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="rayGrad" x1="50%" y1="0%" x2="50%" y2="100%">
+                  <stop offset="0%" stopColor="#c9a84c" stopOpacity="0.35" />
+                  <stop offset="100%" stopColor="#c9a84c" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              <path d="M400 40 L320 560 L400 480 Z" fill="url(#rayGrad)" />
+              <path d="M400 40 L480 560 L400 480 Z" fill="url(#rayGrad)" />
+              <path d="M400 60 L250 520 L380 460 Z" fill="url(#rayGrad)" opacity="0.5" />
+              <path d="M400 60 L550 520 L420 460 Z" fill="url(#rayGrad)" opacity="0.5" />
+            </svg>
+          </div>
           <div className="hero__content">
-            <p className="hero__eyebrow">Clip Studio for creators</p>
-            <h1>RT365 AI Editor — AI-Powered Clip Editing for Creators</h1>
+            <p className="hero__eyebrow">{PRODUCT_SHORT}</p>
+            <h1>{PRODUCT_FULL}</h1>
+            <p className="hero__tagline">{TAGLINE}</p>
             <p className="hero__lede">
-              Transcribe long-form video, find your best moments, and export clips to DaVinci Resolve —
-              all from a desktop app built for podcasters, YouTubers, and editors.
+              Transcribe long-form video, find your best moments, and export clips to DaVinci
+              Resolve — a premium desktop suite for podcasters, YouTubers, and editors.
             </p>
             <div className="btn-group">
               <a href="#pricing" className="btn btn-primary btn-lg">
@@ -141,7 +170,7 @@ export default function App() {
         <section id="features" className="section">
           <div className="section__inner">
             <p className="section-label">Features</p>
-            <h2>Everything you need to go from raw footage to publish-ready clips</h2>
+            <h2>From raw footage to publish-ready clips — with divine precision</h2>
             <div className="feature-grid">
               {FEATURES.map((feature) => (
                 <article key={feature.title} className="feature-card">
@@ -156,7 +185,7 @@ export default function App() {
         <section id="pricing" className="section section--alt">
           <div className="section__inner">
             <p className="section-label">Pricing</p>
-            <h2>Choose how you want to own RT365</h2>
+            <h2>Own {PRODUCT_FULL}</h2>
             <div className="pricing-grid">
               {PRICING.map((tier) => (
                 <article
@@ -183,10 +212,10 @@ export default function App() {
         <section id="activate" className="section">
           <div className="section__inner section__inner--narrow">
             <p className="section-label">License activation</p>
-            <h2>Verify your license key</h2>
+            <h2>Verify your Seraph Edition key</h2>
             <p className="section__lede">
-              Enter the key from your purchase confirmation email. Activation on your computer happens
-              inside the RT365 AI Editor desktop app.
+              Enter the key from your purchase confirmation email. Activation on your computer
+              happens inside the {PRODUCT_FULL} desktop app.
             </p>
             <form className="license-form card" onSubmit={handleLicenseCheck}>
               <label htmlFor="license-key">License key</label>
@@ -194,7 +223,7 @@ export default function App() {
                 id="license-key"
                 type="text"
                 className="text-input"
-                placeholder="RT365-XXXX-XXXX-XXXX-XXXX"
+                placeholder="SERAPH-XXXX-XXXX-XXXX-XXXX"
                 value={licenseKey}
                 onChange={(e) => setLicenseKey(e.target.value)}
                 autoComplete="off"
@@ -220,17 +249,21 @@ export default function App() {
       <footer id="support" className="landing-footer">
         <div className="landing-footer__inner">
           <div>
-            <strong>RT365 AI Editor</strong>
-            <p>AI-powered clip editing for creators.</p>
+            <strong>{PRODUCT_FULL}</strong>
+            <p>{TAGLINE}</p>
           </div>
           <div className="landing-footer__links">
             <a href={`mailto:${SUPPORT_EMAIL}`}>Contact support</a>
-            <a href={`mailto:${SUPPORT_EMAIL}?subject=RT365%20license%20help`}>License help</a>
+            <a
+              href={`mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(`${PRODUCT_SHORT} license help`)}`}
+            >
+              License help
+            </a>
             {DOWNLOAD_URL ? <a href={DOWNLOAD_URL}>Download app</a> : null}
           </div>
         </div>
         <p className="landing-footer__copy">
-          © {new Date().getFullYear()} RT365. All rights reserved.
+          © {new Date().getFullYear()} {PRODUCT_SHORT}. All rights reserved.
         </p>
       </footer>
     </div>

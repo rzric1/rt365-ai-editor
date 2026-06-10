@@ -1,5 +1,5 @@
 /**
- * RT365 AI Editor — consolidated intelligence API (single Vercel function).
+ * AI Clip Studio — Seraph Edition — consolidated intelligence API (single Vercel function).
  * POST JSON: { mode: "clip-suggestions", transcript?: string }
  */
 const MAX_TEXT_CHARS = 28000;
@@ -40,7 +40,7 @@ function truncate(str, max) {
   return `${str.slice(0, max)}\n\n[…truncated for length]`;
 }
 
-const SYSTEM_PROMPT = `You are RT365 AI Editor's clip intelligence assistant for video creators and podcast editors.
+const SYSTEM_PROMPT = `You are AI Clip Studio — Seraph Edition's clip intelligence assistant for video creators and podcast editors.
 
 Rules:
 - Suggest concrete clip ideas with approximate timestamps when the transcript includes them.
