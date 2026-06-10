@@ -4,10 +4,11 @@ clip_engine/license_check.py
 License validation for RT365 AI Clip Studio.
 
 Flow:
-  1. If LICENSE_ENFORCEMENT_ENABLED is False → always valid (dev mode).
-  2. If RT365_MASTER_KEY env var is set → always valid (internal override).
-  3. If a valid local cache exists (not expired) → valid without network call.
-  4. Otherwise → POST to /api/validate-license, cache a successful result for
+  1. If running from the developer workspace (C:\\dev\\rt365-ai-editor) → always valid.
+  2. If LICENSE_ENFORCEMENT_ENABLED is False → always valid (dev mode).
+  3. If RT365_MASTER_KEY env var is set → always valid (internal override).
+  4. If a valid local cache exists (not expired) → valid without network call.
+  5. Otherwise → POST to /api/validate-license, cache a successful result for
      CACHE_DAYS days so the user can work offline.
 """
 
@@ -27,7 +28,24 @@ import requests
 
 logger = logging.getLogger("clip_engine.license_check")
 
-LICENSE_ENFORCEMENT_ENABLED: bool = True
+_DEV_WORKSPACE_ROOT = Path(r"C:\dev\rt365-ai-editor")
+
+
+def _running_from_dev_workspace() -> bool:
+    """True when this checkout is running from the owner's local dev tree."""
+    try:
+        root = _DEV_WORKSPACE_ROOT.resolve()
+        sources = (Path(__file__).resolve(), Path.cwd().resolve())
+        return any(p == root or root in p.parents for p in sources)
+    except Exception:
+        return False
+
+
+_LICENSE_ENFORCEMENT_DEFAULT = not _running_from_dev_workspace()
+if not _LICENSE_ENFORCEMENT_DEFAULT:
+    logger.info("[license] Dev workspace detected — license enforcement disabled")
+
+LICENSE_ENFORCEMENT_ENABLED: bool = _LICENSE_ENFORCEMENT_DEFAULT
 CACHE_PATH: Path = Path.home() / ".rt365" / "license.cache"
 CACHE_DAYS: int = 30
 TRIAL_EXPORT_LIMIT: int = 3
