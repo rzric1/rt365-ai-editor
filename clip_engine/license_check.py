@@ -30,6 +30,7 @@ logger = logging.getLogger("clip_engine.license_check")
 LICENSE_ENFORCEMENT_ENABLED: bool = True
 CACHE_PATH: Path = Path.home() / ".rt365" / "license.cache"
 CACHE_DAYS: int = 30
+TRIAL_EXPORT_LIMIT: int = 3
 _KEY_PATTERN = re.compile(r"^RT365-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 
 
